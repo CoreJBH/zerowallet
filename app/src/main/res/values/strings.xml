@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PUREWALLET</string>
+    <string name="node_service_channel_name">Node service</string>
+    <string name="node_service_title">PUREWALLET node is running</string>
+    <string name="node_service_text">Syncing chain data and listening for Lightning payments</string>
+</resources>
