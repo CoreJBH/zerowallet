@@ -140,7 +140,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.2`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.3`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
