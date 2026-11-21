@@ -15,6 +15,8 @@ enum class ChainNetwork(
     val detail: String,
     val ldk: Network,
     val defaultEsploraUrl: String,
+    /** Other public Esplora servers this chain can be read from, tried after the default. */
+    val publicEsploraFallbacks: List<String>,
     val explorerTxUrl: String,
     val ticker: String
 ) {
@@ -26,6 +28,10 @@ enum class ChainNetwork(
         // Blockstream's Esplora answers chain scans and address lookups without the rate
         // limiting that made mempool.space return 429 during the wallet's full scan.
         defaultEsploraUrl = "https://blockstream.info/api",
+        publicEsploraFallbacks = listOf(
+            "https://mempool.space/api",
+            "https://mempool.emzy.de/api"
+        ),
         explorerTxUrl = "https://mempool.space/tx/",
         ticker = "BTC"
     ),
@@ -35,6 +41,9 @@ enum class ChainNetwork(
         detail = "Test coins from a signet faucet. Safe for experiments.",
         ldk = Network.SIGNET,
         defaultEsploraUrl = "https://mempool.space/signet/api",
+        publicEsploraFallbacks = listOf(
+            "https://blockstream.info/signet/api"
+        ),
         explorerTxUrl = "https://mempool.space/signet/tx/",
         ticker = "SIGBTC"
     ),
@@ -44,11 +53,18 @@ enum class ChainNetwork(
         detail = "Legacy test network. Test coins have no value.",
         ldk = Network.TESTNET,
         defaultEsploraUrl = "https://blockstream.info/testnet/api",
+        publicEsploraFallbacks = listOf(
+            "https://mempool.space/testnet/api"
+        ),
         explorerTxUrl = "https://blockstream.info/testnet/tx/",
         ticker = "TBTC"
     );
 
     val isMainnet: Boolean get() = this == MAINNET
+
+    /** The chain's built-in endpoints, default first, with no repeats. */
+    val publicEsploraUrls: List<String>
+        get() = (listOf(defaultEsploraUrl) + publicEsploraFallbacks).distinct()
 
     companion object {
         fun fromId(id: String?): ChainNetwork = values().firstOrNull { it.id == id } ?: MAINNET

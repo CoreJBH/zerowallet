@@ -1,6 +1,7 @@
 package com.jbitmstr.purewallet
 
 import com.jbitmstr.purewallet.core.DEFAULT_LISTENING_ADDRESS
+import com.jbitmstr.purewallet.core.ForegroundAction
 import com.jbitmstr.purewallet.core.NodeLifecycle
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -18,6 +19,77 @@ import org.junit.Test
 class NodeLifecycleTest {
 
     // ------------------------------------------------------- coming back to the foreground
+
+    @Test
+    fun comingBackQuietlySyncsANodeThatSurvived() {
+        // There is no foreground service, so a node that is still up when the wallet returns
+        // may have missed blocks or payments while the screen was elsewhere.
+        val lifecycle = NodeLifecycle()
+        assertEquals(
+            ForegroundAction.REFRESH,
+            lifecycle.foregroundAction(seedPresent = true, running = true, starting = false)
+        )
+    }
+
+    @Test
+    fun comingBackStartsANodeTheSystemKilled() {
+        val lifecycle = NodeLifecycle()
+        assertEquals(
+            ForegroundAction.START,
+            lifecycle.foregroundAction(seedPresent = true, running = false, starting = false)
+        )
+    }
+
+    @Test
+    fun comingBackDoesNothingWhileAStartIsOnItsWay() {
+        val lifecycle = NodeLifecycle()
+        assertEquals(
+            ForegroundAction.NONE,
+            lifecycle.foregroundAction(seedPresent = true, running = false, starting = true)
+        )
+    }
+
+    @Test
+    fun comingBackLeavesANodeTheUserStoppedDown() {
+        val lifecycle = NodeLifecycle()
+        lifecycle.onUserStop()
+        assertEquals(
+            ForegroundAction.NONE,
+            lifecycle.foregroundAction(seedPresent = true, running = false, starting = false)
+        )
+    }
+
+    @Test
+    fun comingBackWithoutAPhraseHasNothingToStart() {
+        val lifecycle = NodeLifecycle()
+        assertEquals(
+            ForegroundAction.NONE,
+            lifecycle.foregroundAction(seedPresent = false, running = false, starting = false)
+        )
+    }
+
+    @Test
+    fun aStopTheUserAskedForSurvivesTheProcessBeingKilled() {
+        // The stop is remembered on disk: Android killing the app must not undo the choice.
+        val lifecycle = NodeLifecycle()
+        lifecycle.restoreManualStop(true)
+        assertTrue(lifecycle.manuallyStopped)
+        assertEquals(
+            ForegroundAction.NONE,
+            lifecycle.foregroundAction(seedPresent = true, running = false, starting = false)
+        )
+    }
+
+    @Test
+    fun anExplicitStartClearsARestoredStop() {
+        val lifecycle = NodeLifecycle()
+        lifecycle.restoreManualStop(true)
+        lifecycle.onUserStart()
+        assertEquals(
+            ForegroundAction.START,
+            lifecycle.foregroundAction(seedPresent = true, running = false, starting = false)
+        )
+    }
 
     @Test
     fun comingBackStartsANodeThatIsDown() {

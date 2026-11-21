@@ -294,6 +294,17 @@ fun SettingsSheet(
             Spacer(Modifier.height(8.dp))
             Text(esploraError ?: "", color = Pal.Danger, fontSize = 12.sp, lineHeight = 16.sp)
         } else {
+            val active = state.activeEsploraUrl
+            if (state.running && active != null && active != state.esploraUrl) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "In use now: $active. The endpoint above did not answer, so the node is " +
+                        "reading this one instead.",
+                    color = Pal.TextSecondary,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
+                )
+            }
             Spacer(Modifier.height(8.dp))
             Text(
                 "Only https:// endpoints are accepted. Plain http:// is allowed just for a node " +

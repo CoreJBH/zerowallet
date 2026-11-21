@@ -5,10 +5,6 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <uses-feature
         android:name="android.hardware.camera.any"
@@ -44,10 +40,9 @@
             </intent-filter>
         </activity>
 
-        <service
-            android:name=".core.NodeService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
+        <!-- No foreground service and no notification: the user asked that nothing appear in
+             the notification bar. The node lives only while the app process does, and it is
+             brought back and resynced when the wallet returns to the screen. -->
 
         <!-- Shares the sealed channel backup with the system share sheet (Google Drive). -->
         <provider

@@ -1,7 +1,3 @@
-<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">ZeroWallet</string>
-    <string name="node_service_channel_name">Node service</string>
-    <string name="node_service_title">ZeroWallet node is running</string>
-    <string name="node_service_text">Syncing chain data and listening for Lightning payments</string>
 </resources>

@@ -5,7 +5,8 @@ import com.jbitmstr.purewallet.core.NodeManager
 
 /**
  * Holds the process-wide node manager so the Lightning node keeps running across
- * Activity recreation and while the foreground service holds the process.
+ * Activity recreation. There is no foreground service: the node lives while the app process
+ * does, and the wallet brings it back and resyncs when it returns to the screen.
  */
 class PureWalletApp : Application() {
 

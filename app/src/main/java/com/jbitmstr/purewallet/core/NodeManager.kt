@@ -85,6 +85,11 @@ data class PeerRow(
 data class WalletState(
     val network: ChainNetwork = ChainNetwork.MAINNET,
     val esploraUrl: String = ChainNetwork.MAINNET.defaultEsploraUrl,
+    /**
+     * The Esplora endpoint the running node is actually reading from. It differs from
+     * [esploraUrl] when the saved endpoint did not answer and a public fallback took over.
+     */
+    val activeEsploraUrl: String? = null,
     val rgsEnabled: Boolean = false,
     val lockOnOpen: Boolean = false,
     val screenProtection: Boolean = true,
@@ -164,6 +169,9 @@ class NodeManager(context: Context) {
     private var fiatJob: Job? = null
     private var bootstrapped = false
 
+    /** The chain source the running node was built with, when it is not the saved one. */
+    private var activeEsploraUrl: String? = null
+
     /**
      * Serialises every start and stop. Building a node takes seconds, and a restart, a
      * settings change or a return to the foreground can all ask for one in that window; the
@@ -190,17 +198,22 @@ class NodeManager(context: Context) {
     /**
      * Called when the wallet comes back to the screen.
      *
-     * Android freezes or kills the node while the app is in the background, and a start that
-     * failed leaves nothing running. If the wallet still has its phrase and the user did not
-     * ask for the node to stay down, it is brought back instead of sitting on "Stopped".
+     * Android freezes or kills the process while the app is in the background, and a start
+     * that failed leaves nothing running. There is no foreground service (the wallet shows
+     * nothing in the notification bar), so coming back either brings a dead node back — as
+     * long as the user did not stop it themselves — or, when it survived, quietly syncs it
+     * instead of leaving the numbers from before the screen changed.
      */
     fun onAppForeground() {
         val snapshot = _state.value
-        if (!lifecycle.shouldStartOnForeground(snapshot.seedPresent, snapshot.running, snapshot.starting)) {
-            return
+        when (lifecycle.foregroundAction(snapshot.seedPresent, snapshot.running, snapshot.starting)) {
+            ForegroundAction.REFRESH -> scope.launch { refreshInternal(userInitiated = false) }
+            ForegroundAction.START -> {
+                val seed = secureStore.loadSeed() ?: return
+                requestStart(seed)
+            }
+            ForegroundAction.NONE -> Unit
         }
-        val seed = secureStore.loadSeed() ?: return
-        requestStart(seed)
     }
 
     fun bootstrap() {
@@ -210,6 +223,8 @@ class NodeManager(context: Context) {
         }
         prefs.migrateLegacyEsploraDefault()
         val network = prefs.network
+        // A node the user stopped stays stopped even after Android killed the process.
+        lifecycle.restoreManualStop(prefs.nodeStoppedByUser)
         val seed = secureStore.loadSeed()
         if (seed == null && secureStore.hasSeed()) {
             // A wallet exists but the Keystore key could not decrypt it. Never overwrite it:
@@ -244,6 +259,9 @@ class NodeManager(context: Context) {
             )
         }
         if (seed != null) {
+            // Show the numbers this wallet had on its last sync while the node comes up, so
+            // opening it never reads ₿0. The first real sync replaces them.
+            _state.update { WalletCache.applyTo(it, prefs.cachedWallet(network)) }
             startNode(seed)
         } else {
             startFiatLoop()
@@ -257,6 +275,8 @@ class NodeManager(context: Context) {
         secureStore.saveSeed(mnemonic)
         prefs.seedBackedUp = false
         prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
+        // A new wallet starts with nothing; an older snapshot must not show through.
+        prefs.clearCachedWallet(prefs.network)
         _state.update {
             it.copy(seedPresent = true, backedUp = false, setupRequired = false)
         }
@@ -277,6 +297,8 @@ class NodeManager(context: Context) {
         secureStore.saveSeed(normalized)
         prefs.seedBackedUp = true
         prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
+        // The phrase may belong to another wallet than the one this snapshot was taken from.
+        prefs.clearCachedWallet(prefs.network)
         _state.update { it.copy(seedPresent = true, backedUp = true, setupRequired = false) }
         startNode(normalized)
         return Result.success(Unit)
@@ -416,21 +438,26 @@ class NodeManager(context: Context) {
             _state.update { it.copy(starting = true, busy = "Starting node", error = null) }
 
             val network = prefs.network
+            val savedEsplora = prefs.esploraUrl(network)
             val dir = networkDir(network).apply { mkdirs() }
             val logFile = NodeLog.file(appContext).apply { parentFile?.mkdirs() }
             // Keep the on-device log bounded. The node is stopped here, so the file is
             // not being written while it is renamed.
             runCatching { NodeLog.rotateIfNeeded(logFile) }
 
-            val built = startWithListeningFallback(mnemonic, network, dir, logFile)
+            val started = startWithFallback(mnemonic, network, dir, logFile)
+            val built = started.node
             node = built
+            activeEsploraUrl = started.esploraUrl
+            prefs.setLastWorkingEsplora(network, started.esploraUrl)
 
             val status = runCatching { built.status() }.getOrNull()
             val listening = runCatching { built.listeningAddresses() }.getOrNull()
             _state.update {
                 it.copy(
                     network = network,
-                    esploraUrl = prefs.esploraUrl(network),
+                    esploraUrl = savedEsplora,
+                    activeEsploraUrl = started.esploraUrl,
                     running = true,
                     starting = false,
                     busy = null,
@@ -439,7 +466,11 @@ class NodeManager(context: Context) {
                     alias = runCatching { built.nodeAlias() }.getOrNull() ?: NODE_ALIAS,
                     listeningAddresses = listening ?: emptyList(),
                     bestHeight = status?.currentBestBlock?.height?.toInt()
+                        ?.takeIf { height -> height > 0 } ?: it.bestHeight
                 )
+            }
+            if (started.esploraUrl != savedEsplora) {
+                _messages.tryEmit(EsploraFallback.switchedMessage(savedEsplora, started.esploraUrl))
             }
             startEventLoop(built)
             startFiatLoop()
@@ -451,11 +482,13 @@ class NodeManager(context: Context) {
             runCatching { node?.stop() }
             runCatching { node?.destroy() }
             node = null
+            activeEsploraUrl = null
             _state.update {
                 it.copy(
                     running = false,
                     starting = false,
                     busy = null,
+                    activeEsploraUrl = null,
                     error = describe(t)
                 )
             }
@@ -467,42 +500,68 @@ class NodeManager(context: Context) {
     }
 
     /**
-     * Starts the node, binding the Lightning port first and falling back to a start without
-     * it.
+     * Starts the node on the first endpoint and listening setup that works.
      *
-     * Port 9735 is what makes inbound Lightning reachable, but it is also the one thing a
-     * phone can refuse: another node may hold it, or the OS may not allow the bind. Rather
-     * than leaving the wallet on "Stopped" with ₿0, the same node is built again without a
-     * listening address — on-chain sync, sending and already-open channels keep working.
+     * Two things can refuse a start and both are retried rather than reported as a dead
+     * wallet:
+     *
+     * - **The chain source.** A feerate update that times out (`FeerateEstimationUpdateTimeout`)
+     *   fails the whole start even though another public Esplora is a second away, so the
+     *   saved endpoint is followed by the one that last worked here and the chain's other
+     *   public endpoints. Endpoints the user entered themselves are never swapped for public
+     *   ones; that start fails with a message instead of moving their addresses elsewhere.
+     * - **The Lightning port.** Port 9735 is what makes inbound Lightning reachable, but it is
+     *   also the one thing a phone can refuse: another node may hold it, or the OS may not
+     *   allow the bind. The same endpoint is then tried once more without a listening address,
+     *   so on-chain sync, sending and already-open channels keep working.
+     *
+     * A chain-source failure is not cured by dropping the port, so when another endpoint is
+     * left to try it is tried next with the port rather than twice without it.
      */
-    private fun startWithListeningFallback(
+    private fun startWithFallback(
         mnemonic: String,
         network: ChainNetwork,
         dir: File,
         logFile: File
-    ): Node {
+    ): StartedNode {
+        val saved = prefs.esploraUrl(network)
+        val candidates = EsploraFallback.candidates(
+            configured = saved,
+            lastWorking = prefs.lastWorkingEsplora(network),
+            fallbacks = network.publicEsploraUrls,
+            allowFallbacks = EsploraFallback.isPublicEndpoint(saved, network.publicEsploraUrls)
+        )
         var lastFailure: Throwable? = null
-        for ((index, address) in lifecycle.startAttempts().withIndex()) {
-            try {
-                val built = buildAndStart(mnemonic, network, dir, logFile, address)
-                if (index > 0) {
-                    Log.w(TAG, "Node started without a listening address")
-                    _messages.tryEmit(
-                        "Port 9735 is not available, so the node is running without a public " +
-                            "listening address. Sending and receiving over open channels still work."
-                    )
+        for ((candidateIndex, esploraUrl) in candidates.withIndex()) {
+            for ((index, address) in lifecycle.startAttempts().withIndex()) {
+                try {
+                    val built = buildAndStart(mnemonic, network, dir, logFile, address, esploraUrl)
+                    if (index > 0) {
+                        Log.w(TAG, "Node started without a listening address")
+                        _messages.tryEmit(
+                            "Port 9735 is not available, so the node is running without a public " +
+                                "listening address. Sending and receiving over open channels still work."
+                        )
+                    }
+                    return StartedNode(built, esploraUrl)
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    lastFailure = t
+                    Log.w(TAG, "Node start on $esploraUrl (${address ?: "no listening address"}) failed", t)
+                    val moreEndpoints = candidateIndex < candidates.lastIndex
+                    // A chain source that will not answer is not fixed by dropping the port.
+                    if (moreEndpoints && EsploraFallback.isChainSourceFailure(t)) break
+                    if (!lifecycle.shouldRetryWithoutListening(address)) break
                 }
-                return built
-            } catch (c: CancellationException) {
-                throw c
-            } catch (t: Throwable) {
-                lastFailure = t
-                Log.w(TAG, "Node start on ${address ?: "no listening address"} failed", t)
-                if (!lifecycle.shouldRetryWithoutListening(address)) break
             }
         }
-        val failure = lastFailure
-        throw failure ?: IllegalStateException("The node could not be started")
+        val failure = lastFailure ?: IllegalStateException("The node could not be started")
+        throw if (EsploraFallback.isChainSourceFailure(failure)) {
+            NodeStartFailure(EsploraFallback.exhaustedMessage(candidates, failure))
+        } else {
+            failure
+        }
     }
 
     /** Builds one node and starts it, or leaves nothing behind when it cannot start. */
@@ -511,13 +570,14 @@ class NodeManager(context: Context) {
         network: ChainNetwork,
         dir: File,
         logFile: File,
-        listeningAddress: String?
+        listeningAddress: String?,
+        esploraUrl: String
     ): Node {
         val builder = Builder()
         builder.setStorageDirPath(dir.absolutePath)
         builder.setNetwork(network.ldk)
         builder.setChainSourceEsplora(
-            prefs.esploraUrl(network),
+            esploraUrl,
             EsploraSyncConfig(BackgroundSyncConfig(30uL, 20uL, 300uL))
         )
         builder.setEntropyBip39Mnemonic(Bip39.normalize(mnemonic), null)
@@ -610,6 +670,7 @@ class NodeManager(context: Context) {
 
     fun stopNode() {
         lifecycle.onUserStop()
+        prefs.nodeStoppedByUser = true
         scope.launch { stopNodeInternal(keepState = true) }
     }
 
@@ -624,6 +685,7 @@ class NodeManager(context: Context) {
      */
     private fun requestStart(mnemonic: String) {
         lifecycle.onUserStart()
+        prefs.nodeStoppedByUser = false
         if (queuedStarts.incrementAndGet() > 1) {
             queuedStarts.decrementAndGet()
             return
@@ -670,10 +732,12 @@ class NodeManager(context: Context) {
                 starting = nextStarting,
                 syncing = false,
                 busy = null,
+                activeEsploraUrl = if (nextStarting) it.activeEsploraUrl else null,
                 onchainTotalSats = if (keepState) it.onchainTotalSats else 0L,
                 lightningBalanceSats = if (keepState) it.lightningBalanceSats else 0L
             )
         }
+        if (!nextStarting) activeEsploraUrl = null
     }
 
     fun wipeWallet() {
@@ -711,14 +775,21 @@ class NodeManager(context: Context) {
                     it.copy(
                         network = network,
                         esploraUrl = prefs.esploraUrl(network),
+                        activeEsploraUrl = null,
                         payments = emptyList(),
                         channels = emptyList(),
                         peers = emptyList(),
+                        onchainTotalSats = 0L,
+                        onchainSpendableSats = 0L,
+                        onchainPendingSats = 0L,
+                        lightningBalanceSats = 0L,
                         nodeId = "",
                         bestHeight = null,
                         lastSyncEpochSecs = null
                     )
                 }
+                // Show what this chain last looked like, if it was used before.
+                _state.update { WalletCache.applyTo(it, prefs.cachedWallet(network)) }
             }
             _messages.tryEmit("Switched to ${network.title}")
             if (seed != null) requestStart(seed)
@@ -787,6 +858,7 @@ class NodeManager(context: Context) {
         val n = node ?: return
         if (_state.value.syncing) return
         _state.update { it.copy(syncing = true) }
+        val network = prefs.network
         try {
             val syncError = runCatching { n.syncWallets() }.exceptionOrNull()
             if (syncError != null && userInitiated) {
@@ -794,13 +866,16 @@ class NodeManager(context: Context) {
             }
 
             val balances = runCatching { n.listBalances() }.getOrNull()
-            val payments = runCatching { n.listPayments() }.getOrDefault(emptyList())
+            // A read that failed is not an empty history: keep the rows the wallet already
+            // shows instead of blanking them until the next successful read.
+            val paymentsRead = runCatching { n.listPayments() }
             val channels = runCatching { n.listChannels() }.getOrDefault(emptyList())
             val peers = runCatching { n.listPeers() }.getOrDefault(emptyList())
             val status = runCatching { n.status() }.getOrNull()
 
             val pendingOnchain = balances?.pendingBalancesFromChannelClosures
                 ?.sumOf { describePendingSweep(it) } ?: 0L
+            val rows = paymentsRead.getOrNull()?.map { toRow(it) }?.sortedByDescending { it.timestampSecs }
 
             _state.update { previous ->
                 previous.copy(
@@ -808,14 +883,19 @@ class NodeManager(context: Context) {
                     onchainSpendableSats = balances?.spendableOnchainBalanceSats?.toLong() ?: previous.onchainSpendableSats,
                     onchainPendingSats = pendingOnchain,
                     lightningBalanceSats = balances?.totalLightningBalanceSats?.toLong() ?: previous.lightningBalanceSats,
-                    payments = payments.map { toRow(it) }.sortedByDescending { it.timestampSecs },
+                    payments = rows ?: previous.payments,
                     channels = channels.map { toChannelRow(it) },
                     peers = peers.map { PeerRow(it.nodeId, it.address, it.isConnected, it.isPersisted) },
-                    bestHeight = status?.currentBestBlock?.height?.toInt() ?: previous.bestHeight,
+                    bestHeight = status?.currentBestBlock?.height?.toInt()
+                        ?.takeIf { height -> height > 0 } ?: previous.bestHeight,
                     lastSyncEpochSecs = System.currentTimeMillis() / 1000L,
                     running = true,
                     error = null
                 )
+            }
+            if (balances != null) {
+                // Real numbers from a sync: they are what the next open shows while it waits.
+                prefs.saveCachedWallet(network, WalletCache.snapshotOf(_state.value))
             }
         } finally {
             _state.update { it.copy(syncing = false) }
@@ -988,7 +1068,7 @@ class NodeManager(context: Context) {
     ): Result<String> = runCatching {
         val n = requireNode()
         if (sendAll) {
-            val rates = Market.fetchFeeRates(prefs.esploraUrl(prefs.network))
+            val rates = Market.fetchFeeRates(currentEsploraUrl(prefs.network))
             val feeRate = FeeRate.fromSatPerVbUnchecked(priority.satPerVb(rates).toULong())
             n.onchainPayment().sendAllToAddress(address, true, feeRate)
         } else {
@@ -1003,14 +1083,14 @@ class NodeManager(context: Context) {
         amountSats: Long,
         priority: FeePriority
     ): String {
-        val rates = Market.fetchFeeRates(prefs.esploraUrl(prefs.network))
+        val rates = Market.fetchFeeRates(currentEsploraUrl(prefs.network))
         val feeRate = FeeRate.fromSatPerVbUnchecked(priority.satPerVb(rates).toULong())
         return n.onchainPayment().sendToAddress(address, amountSats.toULong(), feeRate)
     }
 
     suspend fun estimateFeeRate(priority: FeePriority): Long =
         withContext(Dispatchers.IO) {
-            priority.satPerVb(Market.fetchFeeRates(prefs.esploraUrl(prefs.network)))
+            priority.satPerVb(Market.fetchFeeRates(currentEsploraUrl(prefs.network)))
         }
 
     // ------------------------------------------------------------- channels
@@ -1057,6 +1137,13 @@ class NodeManager(context: Context) {
     fun requireNode(): Node = node ?: throw IllegalStateException(
         "The node is not running. Wait for it to start and try again."
     )
+
+    /**
+     * The endpoint fee estimates are read from: the one the node is running on, which is the
+     * saved one unless a public fallback took over.
+     */
+    private fun currentEsploraUrl(network: ChainNetwork): String =
+        activeEsploraUrl ?: prefs.esploraUrl(network)
 
     private fun networkDir(network: ChainNetwork): File =
         File(appContext.filesDir, "ldk-node/${network.id}")
@@ -1151,6 +1238,7 @@ class NodeManager(context: Context) {
         }
 
     private fun describe(t: Throwable): String {
+        if (t is NodeStartFailure) return t.message ?: "The node could not be started"
         val message = t.message?.takeIf { it.isNotBlank() }
         val name = t::class.simpleName ?: "Error"
         return if (message != null) "$name: $message" else name
@@ -1175,3 +1263,9 @@ internal fun esploraChangeNeedsRestart(
     nodeRunning: Boolean,
     seedAvailable: Boolean
 ): Boolean = before != after && nodeRunning && seedAvailable
+
+/** A node that came up, and the chain source it came up on. */
+private class StartedNode(val node: Node, val esploraUrl: String)
+
+/** A start that failed for a reason the wallet can explain in its own words. */
+internal class NodeStartFailure(message: String) : Exception(message)

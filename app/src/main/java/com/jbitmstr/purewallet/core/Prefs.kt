@@ -42,6 +42,14 @@ class Prefs(context: Context) {
         set(value) = prefs.edit().putLong(KEY_CREATED_AT, value).apply()
 
     /**
+     * True when the user pressed "Stop node". Kept on disk because Android may kill the
+     * process: without it, the next open would quietly start a node the user had stopped.
+     */
+    var nodeStoppedByUser: Boolean
+        get() = prefs.getBoolean(KEY_NODE_STOPPED, false)
+        set(value) = prefs.edit().putBoolean(KEY_NODE_STOPPED, value).apply()
+
+    /**
      * Custom Esplora endpoint for [network], or its built-in default. A stored value that
      * no longer passes validation (an old plain-http entry, for example) is ignored, so
      * the node never starts against an endpoint the user did not mean to trust.
@@ -61,17 +69,91 @@ class Prefs(context: Context) {
         val editor = prefs.edit()
         if (trimmed.isEmpty() || trimmed == network.defaultEsploraUrl) {
             editor.remove(KEY_ESPLORA + network.id).apply()
+            setLastWorkingEsplora(network, null)
             return Result.success(Unit)
         }
         val validated = EsploraUrl.validate(trimmed)
         validated.onSuccess { clean ->
             editor.putString(KEY_ESPLORA + network.id, clean).apply()
+            // A new endpoint is a new choice: stop putting the old working one in front of
+            // the fallback list.
+            setLastWorkingEsplora(network, null)
         }
         return validated.map { }
     }
 
     fun isCustomEsplora(network: ChainNetwork): Boolean =
         esploraUrl(network) != network.defaultEsploraUrl
+
+    /**
+     * The endpoint this chain last started on when it was not the saved one.
+     *
+     * A phone that cannot reach the built-in default is not made to wait for the same timeout
+     * on every open: the endpoint that worked last is tried right after the saved one. Saving
+     * an endpoint in Settings is a fresh choice, so it forgets this.
+     */
+    fun lastWorkingEsplora(network: ChainNetwork): String? {
+        val stored = prefs.getString(KEY_ESPLORA_WORKING + network.id, null)
+        if (stored.isNullOrBlank()) return null
+        return EsploraUrl.validate(stored).getOrNull()
+    }
+
+    fun setLastWorkingEsplora(network: ChainNetwork, url: String?) {
+        val editor = prefs.edit()
+        if (url.isNullOrBlank() || url == esploraUrl(network)) {
+            editor.remove(KEY_ESPLORA_WORKING + network.id)
+        } else {
+            editor.putString(KEY_ESPLORA_WORKING + network.id, url.trimEnd('/'))
+        }
+        editor.apply()
+    }
+
+    // ------------------------------------------------------- last known wallet numbers
+
+    /**
+     * The totals, height and history from this chain's last successful sync, or null when
+     * nothing has been synced on it yet.
+     */
+    fun cachedWallet(network: ChainNetwork): CachedWallet? {
+        val savedAt = prefs.getLong(KEY_CACHE_SAVED + network.id, 0L)
+        if (savedAt <= 0L) return null
+        return CachedWallet(
+            onchainSats = prefs.getLong(KEY_CACHE_ONCHAIN + network.id, 0L),
+            onchainSpendableSats = prefs.getLong(KEY_CACHE_SPENDABLE + network.id, 0L),
+            lightningSats = prefs.getLong(KEY_CACHE_LIGHTNING + network.id, 0L),
+            bestHeight = prefs.getInt(KEY_CACHE_HEIGHT + network.id, 0).takeIf { it > 0 },
+            lastSyncEpochSecs = prefs.getLong(KEY_CACHE_SYNC + network.id, 0L)
+                .takeIf { it > 0L },
+            payments = WalletCache.decodePayments(
+                prefs.getString(KEY_CACHE_PAYMENTS + network.id, null)
+            )
+        )
+    }
+
+    fun saveCachedWallet(network: ChainNetwork, cached: CachedWallet) {
+        prefs.edit()
+            .putLong(KEY_CACHE_SAVED + network.id, System.currentTimeMillis())
+            .putLong(KEY_CACHE_ONCHAIN + network.id, cached.onchainSats)
+            .putLong(KEY_CACHE_SPENDABLE + network.id, cached.onchainSpendableSats)
+            .putLong(KEY_CACHE_LIGHTNING + network.id, cached.lightningSats)
+            .putInt(KEY_CACHE_HEIGHT + network.id, cached.bestHeight ?: 0)
+            .putLong(KEY_CACHE_SYNC + network.id, cached.lastSyncEpochSecs ?: 0L)
+            .putString(KEY_CACHE_PAYMENTS + network.id, WalletCache.encodePayments(cached.payments))
+            .apply()
+    }
+
+    /** Forgets a chain's snapshot: a different wallet, or a wipe, must not inherit it. */
+    fun clearCachedWallet(network: ChainNetwork) {
+        prefs.edit()
+            .remove(KEY_CACHE_SAVED + network.id)
+            .remove(KEY_CACHE_ONCHAIN + network.id)
+            .remove(KEY_CACHE_SPENDABLE + network.id)
+            .remove(KEY_CACHE_LIGHTNING + network.id)
+            .remove(KEY_CACHE_HEIGHT + network.id)
+            .remove(KEY_CACHE_SYNC + network.id)
+            .remove(KEY_CACHE_PAYMENTS + network.id)
+            .apply()
+    }
 
     /**
      * One-time cleanup for the 1.1.4 default.
@@ -105,8 +187,17 @@ class Prefs(context: Context) {
         private const val KEY_LOCK_ON_OPEN = "lock_on_open"
         private const val KEY_SCREEN_PROTECTION = "screen_protection"
         private const val KEY_CREATED_AT = "wallet_created_at"
+        private const val KEY_NODE_STOPPED = "node_stopped_by_user"
         private const val KEY_ESPLORA = "esplora_url_"
+        private const val KEY_ESPLORA_WORKING = "esplora_working_"
         private const val KEY_ESPLORA_MIGRATED = "esplora_default_migrated_1_1_5"
+        private const val KEY_CACHE_SAVED = "cache_saved_at_"
+        private const val KEY_CACHE_ONCHAIN = "cache_onchain_"
+        private const val KEY_CACHE_SPENDABLE = "cache_spendable_"
+        private const val KEY_CACHE_LIGHTNING = "cache_lightning_"
+        private const val KEY_CACHE_HEIGHT = "cache_height_"
+        private const val KEY_CACHE_SYNC = "cache_sync_"
+        private const val KEY_CACHE_PAYMENTS = "cache_payments_"
 
         /** The mainnet endpoint that shipped up to 1.1.4. */
         private const val LEGACY_MAINNET_ESPLORA = "https://mempool.space/api"

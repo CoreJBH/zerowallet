@@ -1,11 +1,6 @@
 package com.jbitmstr.purewallet.ui
 
-import android.Manifest
-import android.content.pm.PackageManager
-import android.os.Build
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -24,7 +19,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -32,7 +26,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.AppLock
-import com.jbitmstr.purewallet.core.NodeService
 import com.jbitmstr.purewallet.core.ScreenSecurity
 import com.jbitmstr.purewallet.ui.screens.LockedScreen
 import com.jbitmstr.purewallet.ui.screens.ScannerScreen
@@ -154,11 +147,8 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
         activity?.let { ScreenSecurity.apply(it, secureScreen) }
     }
 
-    // The node keeps running and stays in the foreground while the app is locked: only the
-    // UI is gated, not the Lightning node.
-    LaunchedEffect(state.running) {
-        if (state.running) NodeService.start(context) else NodeService.stop(context)
-    }
+    // The node keeps running while the app is locked: only the UI is gated, not the Lightning
+    // node. Nothing is ever shown in the notification bar, by the user's request.
 
     if (openLockEnabled && !unlocked) {
         LockedScreen(
@@ -171,19 +161,6 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     LaunchedEffect(Unit) {
         vm.messages.collect { message ->
             snackbarHostState.showSnackbar(message)
-        }
-    }
-
-    val notificationPermission = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { }
-
-    LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
