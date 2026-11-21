@@ -38,6 +38,7 @@ import org.lightningdevkit.ldknode.PaymentDirection
 import org.lightningdevkit.ldknode.PaymentKind
 import org.lightningdevkit.ldknode.PaymentStatus
 import org.lightningdevkit.ldknode.QrPaymentResult
+import com.jbitmstr.purewallet.BuildConfig
 import java.io.File
 
 /** One row of the history list. */
@@ -112,6 +113,15 @@ data class WalletState(
 }
 
 data class InvoiceResult(val invoice: String, val paymentHash: String)
+
+/** A ready-to-save channel backup: sealed bytes, a suggested name and what went into it. */
+class ChannelBackupExport(
+    val bytes: ByteArray,
+    val fileName: String,
+    val manifest: BackupManifest,
+    val fileCount: Int,
+    val sizeBytes: Long
+)
 
 /** A payment request after the node has resolved its amount and description. */
 data class ResolvedTarget(
@@ -248,79 +258,188 @@ class NodeManager(context: Context) {
         _state.update { it.copy(backedUp = true) }
     }
 
-    private fun startNode(mnemonic: String) {
-        if (starting) return
-        starting = true
-        scope.launch {
-            _state.update { it.copy(starting = true, busy = "Starting node", error = null) }
+    // ------------------------------------------------------- channel backup
+
+    /**
+     * Packs this device's node store into an encrypted `.zwbackup`, sealed with the recovery
+     * phrase, ready for the file picker (Google Drive is one of its destinations).
+     *
+     * The node is stopped only while its files are copied: a running node keeps rewriting
+     * channel state, and a half-written monitor is worse than no backup. It is started again
+     * before this returns, so the picker does not leave the wallet offline.
+     */
+    suspend fun exportChannelBackup(): Result<ChannelBackupExport> = withContext(Dispatchers.IO) {
+        runCatching {
+            val mnemonic = secureStore.loadSeed()
+                ?: throw IllegalStateException("This device has no recovery phrase to seal a backup with")
+            val network = prefs.network
+            val wasRunning = node != null
+            _state.update { it.copy(busy = "Packing channel backup") }
             try {
                 stopNodeInternal(keepState = true)
-                val network = prefs.network
-                val dir = networkDir(network).apply { mkdirs() }
-                val logFile = NodeLog.file(appContext).apply { parentFile?.mkdirs() }
-                // Keep the on-device log bounded. The node is stopped here, so the file is
-                // not being written while it is renamed.
-                runCatching { NodeLog.rotateIfNeeded(logFile) }
-
-                val builder = Builder()
-                builder.setStorageDirPath(dir.absolutePath)
-                builder.setNetwork(network.ldk)
-                builder.setChainSourceEsplora(
-                    prefs.esploraUrl(network),
-                    EsploraSyncConfig(BackgroundSyncConfig(30uL, 20uL, 300uL))
+                val files = ChannelBackup.collectFiles(networkDir(network))
+                if (files.isEmpty()) {
+                    throw IllegalStateException("There is no node data to back up yet")
+                }
+                val manifest = BackupManifest(
+                    network = network.id,
+                    createdAtEpochSecs = System.currentTimeMillis() / 1000L,
+                    nodeId = _state.value.nodeId,
+                    channelCount = _state.value.channels.size,
+                    appVersion = BuildConfig.VERSION_NAME,
+                    wordCount = Bip39.wordCount(mnemonic)
                 )
-                builder.setEntropyBip39Mnemonic(Bip39.normalize(mnemonic), null)
-                builder.setNodeAlias(NODE_ALIAS)
-                if (prefs.rapidGossipSync) {
-                    builder.setGossipSourceRgs(RGS_URL)
-                } else {
-                    builder.setGossipSourceP2p()
-                }
-                runCatching { builder.setListeningAddresses(listOf(DEFAULT_LISTENING_ADDRESS)) }
-                runCatching { builder.setFilesystemLogger(logFile.absolutePath, LogLevel.INFO) }
-
-                val built = builder.build()
-                built.start()
-                node = built
-
-                val status = runCatching { built.status() }.getOrNull()
-                val listening = runCatching { built.listeningAddresses() }.getOrNull()
-                _state.update {
-                    it.copy(
-                        network = network,
-                        esploraUrl = prefs.esploraUrl(network),
-                        running = true,
-                        starting = false,
-                        busy = null,
-                        error = null,
-                        nodeId = runCatching { built.nodeId() }.getOrDefault(""),
-                        alias = runCatching { built.nodeAlias() }.getOrNull() ?: NODE_ALIAS,
-                        listeningAddresses = listening ?: emptyList(),
-                        bestHeight = status?.currentBestBlock?.height?.toInt()
-                    )
-                }
-                startEventLoop(built)
-                startFiatLoop()
-                refreshInternal(userInitiated = false)
-            } catch (t: Throwable) {
-                Log.e(TAG, "Node start failed", t)
-                runCatching { node?.stop() }
-                runCatching { node?.destroy() }
-                node = null
-                _state.update {
-                    it.copy(
-                        running = false,
-                        starting = false,
-                        busy = null,
-                        error = describe(t)
-                    )
-                }
+                val archive = ChannelBackup.buildArchive(manifest, files)
+                val sealed = ChannelBackup.encrypt(mnemonic, archive)
+                ChannelBackupExport(
+                    bytes = sealed,
+                    fileName = ChannelBackup.suggestedFileName(network.id, manifest.createdAtEpochSecs),
+                    manifest = manifest,
+                    fileCount = files.size,
+                    sizeBytes = sealed.size.toLong()
+                )
             } finally {
-                starting = false
+                _state.update { it.copy(busy = null) }
+                if (wasRunning) startNodeInternal(mnemonic)
             }
         }
     }
 
+    /**
+     * Replaces this device's node store with the one inside [bytes].
+     *
+     * The file is opened with the recovery phrase already on this device, so a backup made
+     * from a different phrase fails here before anything is touched. The old store is moved
+     * aside rather than deleted and is put back if the node cannot start from the backup.
+     */
+    suspend fun importChannelBackup(bytes: ByteArray): Result<BackupManifest> = withContext(Dispatchers.IO) {
+        runCatching {
+            val mnemonic = secureStore.loadSeed()
+                ?: throw IllegalStateException("Restore your recovery phrase first, then import the backup")
+            _state.update { it.copy(busy = "Opening channel backup") }
+            val payload = try {
+                ChannelBackup.readArchive(ChannelBackup.decrypt(mnemonic, bytes))
+            } finally {
+                _state.update { it.copy(busy = null) }
+            }
+            val network = ChainNetwork.fromId(payload.manifest.network)
+            if (network != prefs.network) {
+                throw IllegalStateException(
+                    "This backup was saved on ${network.title}. Switch to ${network.title} in Settings first."
+                )
+            }
+
+            stopNodeInternal(keepState = false)
+            val dir = networkDir(network)
+            val stamp = System.currentTimeMillis()
+            val incoming = File(appContext.filesDir, "ldk-node/incoming-$stamp").apply { mkdirs() }
+            val previous = File(appContext.filesDir, "ldk-node/previous-$stamp")
+            try {
+                ChannelBackup.writeFiles(incoming, payload.files)
+                if (dir.exists() && !dir.renameTo(previous)) {
+                    throw IllegalStateException("The current node data could not be moved aside")
+                }
+                if (!incoming.renameTo(dir)) {
+                    throw IllegalStateException("The backup could not be put in place")
+                }
+            } catch (t: Throwable) {
+                incoming.deleteRecursively()
+                if (!dir.exists() && previous.exists()) previous.renameTo(dir)
+                throw t
+            }
+
+            startNodeInternal(mnemonic)
+            if (!_state.value.running) {
+                // The backup did not come up. Put the store that was here back and restart.
+                stopNodeInternal(keepState = false)
+                dir.deleteRecursively()
+                if (previous.exists()) previous.renameTo(dir)
+                startNodeInternal(mnemonic)
+                throw IllegalStateException(
+                    "The node could not start from this backup. The data that was on this phone was kept."
+                )
+            }
+            previous.deleteRecursively()
+            _messages.tryEmit("Channel backup restored")
+            payload.manifest
+        }
+    }
+
+    private fun startNode(mnemonic: String) {
+        scope.launch { startNodeInternal(mnemonic) }
+    }
+
+    /** Builds and starts the node; returns once it is running or has failed. */
+    private suspend fun startNodeInternal(mnemonic: String) {
+        if (starting) return
+        starting = true
+        _state.update { it.copy(starting = true, busy = "Starting node", error = null) }
+        try {
+            stopNodeInternal(keepState = true)
+            val network = prefs.network
+            val dir = networkDir(network).apply { mkdirs() }
+            val logFile = NodeLog.file(appContext).apply { parentFile?.mkdirs() }
+            // Keep the on-device log bounded. The node is stopped here, so the file is
+            // not being written while it is renamed.
+            runCatching { NodeLog.rotateIfNeeded(logFile) }
+
+            val builder = Builder()
+            builder.setStorageDirPath(dir.absolutePath)
+            builder.setNetwork(network.ldk)
+            builder.setChainSourceEsplora(
+                prefs.esploraUrl(network),
+                EsploraSyncConfig(BackgroundSyncConfig(30uL, 20uL, 300uL))
+            )
+            builder.setEntropyBip39Mnemonic(Bip39.normalize(mnemonic), null)
+            builder.setNodeAlias(NODE_ALIAS)
+            if (prefs.rapidGossipSync) {
+                builder.setGossipSourceRgs(RGS_URL)
+            } else {
+                builder.setGossipSourceP2p()
+            }
+            runCatching { builder.setListeningAddresses(listOf(DEFAULT_LISTENING_ADDRESS)) }
+            runCatching { builder.setFilesystemLogger(logFile.absolutePath, LogLevel.INFO) }
+
+            val built = builder.build()
+            built.start()
+            node = built
+
+            val status = runCatching { built.status() }.getOrNull()
+            val listening = runCatching { built.listeningAddresses() }.getOrNull()
+            _state.update {
+                it.copy(
+                    network = network,
+                    esploraUrl = prefs.esploraUrl(network),
+                    running = true,
+                    starting = false,
+                    busy = null,
+                    error = null,
+                    nodeId = runCatching { built.nodeId() }.getOrDefault(""),
+                    alias = runCatching { built.nodeAlias() }.getOrNull() ?: NODE_ALIAS,
+                    listeningAddresses = listening ?: emptyList(),
+                    bestHeight = status?.currentBestBlock?.height?.toInt()
+                )
+            }
+            startEventLoop(built)
+            startFiatLoop()
+            refreshInternal(userInitiated = false)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Node start failed", t)
+            runCatching { node?.stop() }
+            runCatching { node?.destroy() }
+            node = null
+            _state.update {
+                it.copy(
+                    running = false,
+                    starting = false,
+                    busy = null,
+                    error = describe(t)
+                )
+            }
+        } finally {
+            starting = false
+        }
+    }
     private fun startEventLoop(n: Node) {
         eventJob?.cancel()
         eventJob = scope.launch {

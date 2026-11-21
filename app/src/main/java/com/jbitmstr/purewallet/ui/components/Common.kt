@@ -170,20 +170,20 @@ fun PrimaryButton(
             .fillMaxWidth()
             .height(52.dp)
             .clip(RoundedCornerShape(16.dp))
-            .background(if (enabled && !loading) Color.White else Pal.SurfaceElevated)
+            .background(if (enabled && !loading) Pal.Accent else Pal.SurfaceElevated)
             .clickable(enabled = enabled && !loading, onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
         if (loading) {
             CircularProgressIndicator(
                 modifier = Modifier.size(18.dp),
-                color = Pal.TextPrimary,
+                color = Pal.OnAccent,
                 strokeWidth = 2.dp
             )
         } else {
             Text(
                 text,
-                color = if (enabled) Color.Black else Pal.TextTertiary,
+                color = if (enabled) Pal.OnAccent else Pal.TextTertiary,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.SemiBold,
                 textAlign = TextAlign.Center

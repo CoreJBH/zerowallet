@@ -3,7 +3,9 @@ package com.jbitmstr.purewallet
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import com.jbitmstr.purewallet.core.ChainNetwork
+import com.jbitmstr.purewallet.core.ChannelBackupExport
 import com.jbitmstr.purewallet.core.ChannelRow
+import com.jbitmstr.purewallet.core.BackupManifest
 import com.jbitmstr.purewallet.core.FeePriority
 import com.jbitmstr.purewallet.core.InvoiceResult
 import com.jbitmstr.purewallet.core.PaymentInput
@@ -29,6 +31,11 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     fun revealSeed(): String? = manager.revealSeed()
 
     fun confirmBackup() = manager.confirmSeedBackedUp()
+
+    suspend fun exportChannelBackup(): Result<ChannelBackupExport> = manager.exportChannelBackup()
+
+    suspend fun importChannelBackup(bytes: ByteArray): Result<BackupManifest> =
+        manager.importChannelBackup(bytes)
 
     fun refresh() = manager.refresh()
 

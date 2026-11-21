@@ -6,27 +6,53 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
-/** True Black palette: pure black canvas, near-black elevated surfaces, crisp white type. */
+/**
+ * Deep navy palette: a Prussian blue canvas, a slightly lighter navy for cards, cobalt
+ * accents and ice-blue type. Deep enough to stay dark at night, blue enough to feel like a
+ * wallet.
+ */
 object Pal {
-    val Background = Color(0xFF000000)
-    val Surface = Color(0xFF121417)
-    val SurfaceElevated = Color(0xFF181A1F)
-    val Border = Color(0xFF23272F)
-    val TextPrimary = Color(0xFFFFFFFF)
-    val TextSecondary = Color(0xFF8A8F98)
-    val TextTertiary = Color(0xFF5C626D)
-    val Positive = Color(0xFF3DD68C)
-    val Warning = Color(0xFFF5A524)
-    val Danger = Color(0xFFFF6B6B)
+    /** Page canvas. */
+    val Background = Color(0xFF060D24)
+
+    /** Cards and fields that sit on the canvas. */
+    val Surface = Color(0xFF0A1535)
+
+    /** Raised surfaces: chips, selected rows, caption cards. */
+    val SurfaceElevated = Color(0xFF0E1C47)
+
+    /** Hairline borders around cards, fields and chips. */
+    val Border = Color(0xFF1C2F66)
+
+    val TextPrimary = Color(0xFFF1F5FF)
+    val TextSecondary = Color(0xFF93A8D6)
+    val TextTertiary = Color(0xFF5F73A6)
+
+    /** Royal blue for primary actions and active highlights. */
+    val Accent = Color(0xFF3B82F6)
+
+    /** Cobalt for accents on top of the accent: focus rings, dots, links. */
+    val AccentBright = Color(0xFF60A5FA)
+
+    val Positive = Color(0xFF4ADE80)
+    val Warning = Color(0xFFFBBF24)
+    val Danger = Color(0xFFFF7A7A)
+
+    /** Type on top of [Accent]. */
+    val OnAccent = Color(0xFFF8FBFF)
 }
 
 private val DarkScheme = darkColorScheme(
-    primary = Color(0xFFFFFFFF),
-    onPrimary = Color(0xFF000000),
+    primary = Pal.Accent,
+    onPrimary = Pal.OnAccent,
     primaryContainer = Pal.SurfaceElevated,
     onPrimaryContainer = Pal.TextPrimary,
-    secondary = Pal.TextSecondary,
-    onSecondary = Color(0xFF000000),
+    secondary = Pal.AccentBright,
+    onSecondary = Pal.Background,
+    secondaryContainer = Pal.SurfaceElevated,
+    onSecondaryContainer = Pal.TextPrimary,
+    tertiary = Pal.TextSecondary,
+    onTertiary = Pal.Background,
     background = Pal.Background,
     onBackground = Pal.TextPrimary,
     surface = Pal.Surface,
@@ -36,7 +62,7 @@ private val DarkScheme = darkColorScheme(
     outline = Pal.Border,
     outlineVariant = Pal.Border,
     error = Pal.Danger,
-    onError = Color(0xFF000000)
+    onError = Pal.Background
 )
 
 @Composable

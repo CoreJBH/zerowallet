@@ -1,6 +1,7 @@
 package com.jbitmstr.purewallet
 
 import com.jbitmstr.purewallet.core.Bip39
+import com.jbitmstr.purewallet.core.Bip39Wordlist
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -118,6 +119,101 @@ class Bip39Test {
         assertFalse(Bip39.isValidMnemonic(words.joinToString(" ")))
         assertNotNull(Bip39.firstUnknownWord(words.joinToString(" ")))
         assertEquals("notaword", Bip39.firstUnknownWord(words.joinToString(" ")))
+    }
+
+    @Test
+    fun suggestWordsMatchesAPrefixInWordlistOrder() {
+        assertEquals(listOf("abandon"), Bip39.suggestWords("aban"))
+        assertEquals(listOf("abandon"), Bip39.suggestWords("ABANDON"))
+        assertEquals(listOf("abandon"), Bip39.suggestWords("  abando  "))
+        assertEquals(
+            listOf("absent", "absorb", "abstract", "absurd"),
+            Bip39.suggestWords("abs")
+        )
+    }
+
+    @Test
+    fun suggestWordsStaysWithinTheLimit() {
+        assertEquals(listOf("abandon", "ability", "able"), Bip39.suggestWords("ab", limit = 3))
+        val default = Bip39.suggestWords("a")
+        assertEquals(6, default.size)
+        assertTrue(default.all { it.startsWith("a") })
+        assertEquals(default, default.sorted())
+    }
+
+    @Test
+    fun fourLetterPrefixIdentifiesEveryWordUniquely() {
+        for (word in Bip39Wordlist.ENGLISH) {
+            val prefix = word.take(4)
+            val suggestions = Bip39.suggestWords(prefix, limit = 6)
+            if (prefix.length == 4) {
+                assertEquals("prefix \"$prefix\" should only match \"$word\"", listOf(word), suggestions)
+            } else {
+                // A three-letter word is also the prefix of longer words such as act -> action.
+                assertEquals(word, suggestions.first())
+            }
+        }
+    }
+
+    @Test
+    fun everyWordIsReachableFromItsFullText() {
+        for (word in listOf("abandon", "acid", "zoo", "wrong", "yellow")) {
+            assertEquals(listOf(word), Bip39.suggestWords(word))
+        }
+    }
+
+    @Test
+    fun invalidOrEmptyPrefixReturnsNothing() {
+        assertTrue(Bip39.suggestWords("").isEmpty())
+        assertTrue(Bip39.suggestWords("   ").isEmpty())
+        assertTrue(Bip39.suggestWords("zzzz").isEmpty())
+        assertTrue(Bip39.suggestWords("x").isEmpty())
+        assertTrue(Bip39.suggestWords("abc1").isEmpty())
+        assertTrue(Bip39.suggestWords("ab-an").isEmpty())
+        assertTrue(Bip39.suggestWords("abandon }").isEmpty())
+    }
+
+    @Test
+    fun nonPositiveLimitReturnsNothing() {
+        assertTrue(Bip39.suggestWords("ab", limit = 0).isEmpty())
+        assertTrue(Bip39.suggestWords("ab", limit = -3).isEmpty())
+    }
+
+    @Test
+    fun currentWordIsTheHalfTypedLastToken() {
+        assertEquals("", Bip39.currentWord(""))
+        assertEquals("", Bip39.currentWord("abandon "))
+        assertEquals("ab", Bip39.currentWord("abandon ab"))
+        assertEquals("ab", Bip39.currentWord("abandon\n  ab"))
+        assertEquals("AB", Bip39.currentWord("abandon AB").uppercase())
+    }
+
+    @Test
+    fun pickingASuggestionFinishesTheWordAndLeavesATrailingSpace() {
+        assertEquals("abandon ", Bip39.withCompletedWord("", "abandon"))
+        assertEquals("abandon abandon ", Bip39.withCompletedWord("abandon aban", "abandon"))
+        assertEquals("zoo zoo wrong ", Bip39.withCompletedWord("zoo zoo wro", "wrong"))
+        assertEquals("abandon\nzoo ", Bip39.withCompletedWord("abandon\nzo", "zoo"))
+    }
+
+    @Test
+    fun completedWordPhraseStaysValid() {
+        var text = ""
+        val words = Bip39.mnemonicFromEntropy(ByteArray(16)).split(" ")
+        for (word in words) {
+            text = Bip39.withCompletedWord(text, word)
+        }
+        assertTrue(Bip39.isValidMnemonic(text))
+        assertEquals(12, Bip39.wordCount(text))
+    }
+
+    @Test
+    fun pastedPhraseOffersNothingOnceItEndsWithWhitespace() {
+        val phrase = Bip39.randomMnemonic(24)
+        assertTrue(Bip39.isValidMnemonic(phrase))
+        assertEquals("", Bip39.currentWord("$phrase\n"))
+        assertTrue(Bip39.suggestWords(Bip39.currentWord("$phrase\n")).isEmpty())
+        assertEquals("ab", Bip39.currentWord("$phrase ab"))
     }
 
     @Test

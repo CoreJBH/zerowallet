@@ -27,8 +27,9 @@ reachable while it is off screen.
 
 The name is the design rule: zero LSPs, zero servers, zero telemetry.
 
-The look is deliberate True Black: `#000000` canvas, `#121417` / `#181A1F` elevated surfaces,
-hairline `#23272F` borders, white type and green incoming amounts.
+The look is deep navy (Prussian blue): a `#060D24` canvas, `#0A1535` cards,
+`#0E1C47` raised surfaces, hairline `#1C2F66` borders, royal-blue `#3B82F6` actions with
+`#60A5FA` highlights, ice-white `#F1F5FF` type and green incoming amounts.
 
 **Download.** Grab the APK from [Releases](https://github.com/CoreJBH/zerowallet/releases/latest)
 and install it (allow "install unknown apps" for the app you open it with). Debug-signed,
@@ -55,6 +56,14 @@ so a reinstall needs the previous build removed first.
   stay on the device.
 - **12 or 24 words.** A new wallet can be created from 128-bit (12 words) or 256-bit
   (24 words) entropy; both restore the same way.
+- **Word suggestions while restoring.** Typing one to four letters of a word shows tappable
+  BIP-39 suggestions for that word; four letters already identify a single word, so one tap
+  finishes it and leaves a space for the next. Pasting a whole phrase still works as before.
+- **Encrypted channel backup.** The node store (channel manager and monitors, on-chain wallet,
+  node keys) is packed into one `.zwbackup` file sealed with AES-256-GCM under a key derived
+  from the recovery phrase. Android's own file picker saves it to Google Drive or anywhere
+  else, or the share sheet does, with no Google Play Services and no OAuth. Restoring it on a
+  replacement phone after entering the phrase brings the open channels back.
 
 ## Security
 
@@ -118,9 +127,12 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
 ## Known limits
 
 - **A recovery phrase restores on-chain bitcoin, not open channels.** Channel state lives on
-  this phone (`ldk-node` storage) and there is no SCB or VSS cloud backup. A lost or wiped
-  phone loses the funds that are in open channels. The app says so before showing the
-  phrase and at the top of the channel screen; keep channel amounts small.
+  this phone (`ldk-node` storage). There is no hosted SCB or VSS service: the phone only
+  writes a channel backup when the user saves one (Settings, encrypted with the phrase), and
+  nobody recovers it for them. Without such a file a lost phone loses the funds in open
+  channels. A backup is a snapshot too, so a channel that changed after it was saved may close
+  when restored. The app says so before showing the phrase and at the top of the channel
+  screen; keep channel amounts small.
 - Channel funds need an on-chain reserve (about 1% of channel size) plus funding fees, and
   closing a channel costs an on-chain transaction.
 - Testnet4 is not exposed by ldk-node 0.7.0, so Testnet3 is the test network offered.
@@ -128,7 +140,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.1`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.2`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -156,7 +168,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 40 tests: BIP-39 vectors, endpoint rules, log rotation, lock lifecycle |
+| Unit tests | `./gradlew testDebugUnitTest` | 68 tests: BIP-39 vectors and word suggestions, backup encryption round trip and refusals, endpoint rules, log rotation, lock lifecycle |
 | Android lint | `./gradlew lintDebug` | no errors |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
 | Package / label | `aapt2 dump badging app-debug.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |
@@ -168,9 +180,9 @@ app/src/main/java/com/jbitmstr/purewallet/
   MainActivity.kt            single activity host, screenshot blocking
   PureWalletApp.kt           application graph
   WalletViewModel.kt         UI bridge
-  core/                      node, seed, app lock, endpoint rules, log rotation, market data
+  core/                      node, seed, app lock, channel backup, endpoint rules, log rotation, market data
   ui/                        home screen, lock screen, sheets, setup and scanner
-app/src/test/                BIP-39, endpoint, log rotation and lock lifecycle tests
+app/src/test/                BIP-39, channel backup, endpoint, log rotation and lock lifecycle tests
 docs/icon.png                launcher icon artwork
 docs/preview.jpg             the screenshot above
 .github/workflows/apk.yml    CI build

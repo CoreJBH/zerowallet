@@ -22,6 +22,7 @@ object Bip39 {
 
     private val VALID_WORD_COUNTS = setOf(12, 15, 18, 21, 24)
     private val VALID_ENTROPY_SIZES = setOf(16, 20, 24, 28, 32)
+    private val LAST_TOKEN = Regex("(\\S+)\\z")
 
     /** Collapses whitespace, trims and lowercases, so pasted seeds compare reliably. */
     fun normalize(mnemonic: String): String =
@@ -119,6 +120,51 @@ object Bip39 {
     /** Returns the first word that is not part of the wordlist, or null. */
     fun firstUnknownWord(mnemonic: String): String? =
         normalize(mnemonic).split(" ").firstOrNull { it.isNotEmpty() && !WORD_INDEX.containsKey(it) }
+
+    /**
+     * The word currently being typed: the last whitespace-separated token of [text], lowercased.
+     * Returns an empty string when the text is blank or ends with whitespace, because at that
+     * point no word is half-typed.
+     */
+    fun currentWord(text: String): String =
+        LAST_TOKEN.find(text)?.groupValues?.get(1)?.lowercase() ?: ""
+
+    /**
+     * BIP-39 wordlist entries that start with [prefix], in wordlist (alphabetical) order.
+     *
+     * The match is case-insensitive and the prefix is trimmed. An empty prefix, a prefix with
+     * characters outside `a`-`z`, or one no word starts with returns an empty list. Four letters
+     * already identify a single word in the English list, so a helper can complete it with one tap.
+     *
+     * @param limit maximum number of suggestions to return.
+     */
+    fun suggestWords(prefix: String, limit: Int = 6): List<String> {
+        val cleaned = prefix.trim().lowercase()
+        if (cleaned.isEmpty() || limit <= 0) return emptyList()
+        if (cleaned.any { it < 'a' || it > 'z' }) return emptyList()
+        val matches = ArrayList<String>(limit)
+        for (word in WORDLIST) {
+            if (word.startsWith(cleaned)) {
+                matches.add(word)
+                if (matches.size == limit) break
+            }
+        }
+        return matches
+    }
+
+    /**
+     * Replaces the half-typed last word of [text] with the complete [word], keeping everything the
+     * user typed before it, and leaves a trailing space so the next word can be typed right away.
+     */
+    fun withCompletedWord(text: String, word: String): String {
+        if (word.isEmpty()) return text
+        val match = LAST_TOKEN.find(text)
+        return if (match == null) {
+            "$text$word "
+        } else {
+            text.substring(0, match.range.first) + word + " "
+        }
+    }
 
     private fun bitAt(entropy: ByteArray, checksum: ByteArray, position: Int): Int {
         val byteIndex = position / 8

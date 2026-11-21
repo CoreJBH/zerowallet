@@ -1,8 +1,15 @@
 package com.jbitmstr.purewallet.ui.screens
 
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -14,10 +21,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -25,11 +35,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.jbitmstr.purewallet.core.Bip39
 import com.jbitmstr.purewallet.ui.components.Banner
 import com.jbitmstr.purewallet.ui.components.BoltGlyph
 import com.jbitmstr.purewallet.ui.components.GhostButton
@@ -42,6 +54,7 @@ import com.jbitmstr.purewallet.ui.theme.Pal
  * First run: create a wallet with one tap, or restore an existing recovery phrase.
  * Nothing else is asked, in the spirit of the reference wallet.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun SetupScreen(
     unlockError: Boolean = false,
@@ -145,6 +158,36 @@ fun SetupScreen(
                 singleLine = false,
                 minLines = 4
             )
+
+            // BIP-39 suggestions for the word being typed. A four-letter prefix already
+            // identifies one word, so a single tap finishes it and moves on to the next.
+            val typedWord = Bip39.currentWord(phrase)
+            val suggestions = Bip39.suggestWords(typedWord)
+            val chipRequester = remember { BringIntoViewRequester() }
+            LaunchedEffect(suggestions) {
+                // Keep the chips above the keyboard while the phrase is being typed.
+                if (suggestions.isNotEmpty()) chipRequester.bringIntoView()
+            }
+            if (suggestions.isNotEmpty()) {
+                val wordIndex = if (phrase.isBlank()) 1 else Bip39.wordCount(phrase)
+                Column(Modifier.bringIntoViewRequester(chipRequester)) {
+                    Text(
+                        "Word $wordIndex: tap to complete",
+                        color = Pal.TextTertiary,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(start = 4.dp, top = 10.dp, bottom = 8.dp)
+                    )
+                    WordSuggestions(
+                        words = suggestions,
+                        unique = suggestions.size == 1,
+                        onPick = { word ->
+                            phrase = Bip39.withCompletedWord(phrase, word)
+                            error = null
+                        }
+                    )
+                }
+            }
+
             if (error != null) {
                 Spacer(Modifier.height(10.dp))
                 Text(error ?: "", color = Pal.Danger, fontSize = 12.sp)
@@ -158,6 +201,14 @@ fun SetupScreen(
                 },
                 enabled = phrase.isNotBlank()
             )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "Open channels are not part of the phrase. If you saved a channel backup, pick the " +
+                    "file in Settings, under Lightning channel backup, once the wallet is open.",
+                color = Pal.TextTertiary,
+                fontSize = 11.sp,
+                lineHeight = 15.sp
+            )
         }
 
         Spacer(Modifier.height(28.dp))
@@ -167,5 +218,42 @@ fun SetupScreen(
             fontSize = 11.sp,
             textAlign = TextAlign.Start
         )
+    }
+}
+
+/** Wrapping row of tappable BIP-39 words that complete the half-typed word. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun WordSuggestions(
+    words: List<String>,
+    unique: Boolean,
+    onPick: (String) -> Unit
+) {
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        words.forEach { word ->
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(if (unique) Pal.SurfaceElevated else Pal.Surface)
+                    .border(
+                        BorderStroke(1.dp, if (unique) Pal.TextTertiary else Pal.Border),
+                        RoundedCornerShape(10.dp)
+                    )
+                    .clickable { onPick(word) }
+                    .padding(horizontal = 13.dp, vertical = 9.dp)
+            ) {
+                Text(
+                    word,
+                    color = Pal.TextPrimary,
+                    fontSize = 13.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = if (unique) FontWeight.SemiBold else FontWeight.Normal
+                )
+            }
+        }
     }
 }

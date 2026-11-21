@@ -1,5 +1,7 @@
 package com.jbitmstr.purewallet.ui.sheets
 
+import android.content.Context
+import android.content.Intent
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -22,9 +24,11 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -37,18 +41,27 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.content.FileProvider
 import com.jbitmstr.purewallet.WalletViewModel
+import com.jbitmstr.purewallet.core.BackupManifest
+import com.jbitmstr.purewallet.core.BackupTransfer
+import com.jbitmstr.purewallet.core.ChannelBackup
+import com.jbitmstr.purewallet.core.ChannelBackupExport
 import com.jbitmstr.purewallet.core.ChainNetwork
 import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.WalletState
 import com.jbitmstr.purewallet.ui.components.Banner
 import com.jbitmstr.purewallet.ui.components.GhostButton
 import com.jbitmstr.purewallet.ui.components.LabelRow
+import com.jbitmstr.purewallet.ui.components.PrimaryButton
 import com.jbitmstr.purewallet.ui.components.SectionLabel
 import com.jbitmstr.purewallet.ui.components.SheetHeader
 import com.jbitmstr.purewallet.ui.components.WalletSheet
 import com.jbitmstr.purewallet.ui.components.WalletTextField
 import com.jbitmstr.purewallet.ui.theme.Pal
+import java.io.File
+import kotlinx.coroutines.launch
 
 /** Settings: network, Esplora endpoint, gossip source, node identity, seed and wipe. */
 @Composable
@@ -57,13 +70,54 @@ fun SettingsSheet(
     state: WalletState,
     lockAvailable: Boolean,
     onBackup: () -> Unit,
+    onAuthorize: (String, () -> Unit) -> Unit,
     onClose: () -> Unit
 ) {
     var esplora by remember(state.esploraUrl) { mutableStateOf(state.esploraUrl) }
     var esploraError by remember { mutableStateOf<String?>(null) }
     var confirmWipe by remember { mutableStateOf(false) }
+    var backupBusy by remember { mutableStateOf(false) }
+    var backupNote by remember { mutableStateOf<String?>(null) }
+    var backupError by remember { mutableStateOf<String?>(null) }
+    var pendingRestore by remember { mutableStateOf<ByteArray?>(null) }
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val transfer by BackupTransfer.state.collectAsStateWithLifecycle()
+
+    // The picked file arrives through the activity-owned picker, so it still lands even when
+    // the picker backgrounded the app and lock-on-open took the wallet out of composition.
+    LaunchedEffect(transfer.restoreBytes) {
+        val bytes = transfer.restoreBytes ?: return@LaunchedEffect
+        pendingRestore = bytes
+        BackupTransfer.consumeRestoreBytes()
+    }
+
+    val statusText = backupError ?: transfer.message ?: backupNote
+    val statusFailed = backupError != null || (transfer.message != null && transfer.failed)
+
+    fun prepareBackup(share: Boolean) {
+        onAuthorize("Authenticate to save an encrypted channel backup.") {
+            scope.launch {
+                backupBusy = true
+                backupError = null
+                backupNote = null
+                vm.exportChannelBackup()
+                    .onSuccess { export ->
+                        if (share) {
+                            runCatching { shareBackup(context, export) }
+                                .onFailure { backupError = "Could not share the backup: ${it.message}" }
+                            backupNote = "Backup ready: ${export.manifest.channelCount} channels, sealed " +
+                                "with your recovery phrase."
+                        } else if (!BackupTransfer.requestSave(export)) {
+                            backupError = "The file picker is not available right now"
+                        }
+                    }
+                    .onFailure { backupError = it.message ?: "The backup could not be prepared" }
+                backupBusy = false
+            }
+        }
+    }
 
     WalletSheet(onDismiss = onClose) {
         SheetHeader(
@@ -255,8 +309,8 @@ fun SettingsSheet(
                 checked = state.rgsEnabled,
                 onCheckedChange = { vm.setRapidGossipSync(it) },
                 colors = SwitchDefaults.colors(
-                    checkedThumbColor = Color.Black,
-                    checkedTrackColor = Color.White,
+                    checkedThumbColor = Pal.OnAccent,
+                    checkedTrackColor = Pal.Accent,
                     uncheckedThumbColor = Pal.TextSecondary,
                     uncheckedTrackColor = Pal.SurfaceElevated,
                     uncheckedBorderColor = Pal.Border
@@ -308,6 +362,63 @@ fun SettingsSheet(
             modifier = Modifier.fillMaxWidth()
         )
 
+        SectionLabel("Lightning channel backup")
+
+        Text(
+            "Open channels live only on this phone. This saves the node's channel data as one " +
+                "file, locked with your recovery phrase, so Google Drive or the share sheet can hold " +
+                "it without anyone being able to read it.",
+            color = Pal.TextSecondary,
+            fontSize = 11.sp,
+            lineHeight = 15.sp
+        )
+        Spacer(Modifier.height(10.dp))
+        PrimaryButton(
+            text = if (backupBusy) "Working" else "Save backup to Drive",
+            onClick = { prepareBackup(share = false) },
+            enabled = !backupBusy && state.seedPresent,
+            loading = backupBusy
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GhostButton(
+                text = "Share backup",
+                onClick = { prepareBackup(share = true) },
+                modifier = Modifier.weight(1f),
+                enabled = !backupBusy && state.seedPresent
+            )
+            GhostButton(
+                text = "Restore backup",
+                onClick = {
+                    backupError = null
+                    if (!BackupTransfer.requestOpen()) {
+                        backupError = "The file picker is not available right now"
+                    }
+                },
+                modifier = Modifier.weight(1f),
+                enabled = !backupBusy && state.seedPresent
+            )
+        }
+        if (statusText != null) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                statusText,
+                color = if (statusFailed) Pal.Danger else Pal.Positive,
+                fontSize = 11.sp,
+                lineHeight = 15.sp
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Only these same 12 or 24 words open it - ZeroWallet cannot open it for you. Restore " +
+                "works after the phrase is on the phone: pick the file and the node replaces its " +
+                "channel data with it. A backup is a snapshot, so a channel that changed after it " +
+                "was saved may close when you restore.",
+            color = Pal.TextTertiary,
+            fontSize = 11.sp,
+            lineHeight = 15.sp
+        )
+
         Spacer(Modifier.height(24.dp))
 
         GhostButton(
@@ -322,6 +433,49 @@ fun SettingsSheet(
             color = Pal.TextTertiary,
             fontSize = 11.sp,
             lineHeight = 15.sp
+        )
+    }
+
+    pendingRestore?.let { bytes ->
+        AlertDialog(
+            onDismissRequest = { pendingRestore = null },
+            containerColor = Pal.SurfaceElevated,
+            titleContentColor = Pal.TextPrimary,
+            textContentColor = Pal.TextSecondary,
+            title = { Text("Restore channel backup?") },
+            text = {
+                Text(
+                    "The channel data on this phone is replaced with the backup and the node " +
+                        "restarts. This is how a replacement phone gets its open channels back.",
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingRestore = null
+                    scope.launch {
+                        backupBusy = true
+                        backupError = null
+                        backupNote = null
+                        BackupTransfer.reset()
+                        vm.importChannelBackup(bytes)
+                            .onSuccess { manifest: BackupManifest ->
+                                backupNote = "Restored ${manifest.channelCount} channels from a " +
+                                    "${manifest.network} backup"
+                            }
+                            .onFailure { backupError = it.message ?: "The backup could not be restored" }
+                        backupBusy = false
+                    }
+                }) {
+                    Text("Restore", color = Pal.AccentBright)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRestore = null }) {
+                    Text("Cancel", color = Pal.TextSecondary)
+                }
+            }
         )
     }
 
@@ -390,8 +544,8 @@ private fun SwitchRow(
             onCheckedChange = onCheckedChange,
             enabled = enabled,
             colors = SwitchDefaults.colors(
-                checkedThumbColor = Color.Black,
-                checkedTrackColor = Color.White,
+                checkedThumbColor = Pal.OnAccent,
+                checkedTrackColor = Pal.Accent,
                 uncheckedThumbColor = Pal.TextSecondary,
                 uncheckedTrackColor = Pal.SurfaceElevated,
                 uncheckedBorderColor = Pal.Border
@@ -413,12 +567,12 @@ private fun NetworkRow(network: ChainNetwork, selected: Boolean, onClick: () -> 
             modifier = Modifier
                 .size(16.dp)
                 .clip(CircleShape)
-                .background(if (selected) Color.White else Color.Transparent)
-                .border(1.dp, if (selected) Color.White else Pal.Border, CircleShape),
+                .background(if (selected) Pal.Accent else Color.Transparent)
+                .border(1.dp, if (selected) Pal.AccentBright else Pal.Border, CircleShape),
             contentAlignment = Alignment.Center
         ) {
             if (selected) {
-                Box(Modifier.size(6.dp).clip(CircleShape).background(Color.Black))
+                Box(Modifier.size(6.dp).clip(CircleShape).background(Pal.OnAccent))
             }
         }
         Spacer(Modifier.width(12.dp))
@@ -428,4 +582,23 @@ private fun NetworkRow(network: ChainNetwork, selected: Boolean, onClick: () -> 
             Text(network.detail, color = Pal.TextTertiary, fontSize = 11.sp)
         }
     }
+}
+
+/**
+ * Hands the sealed backup to the Android share sheet, where Google Drive, Gmail and any other
+ * app can take it. The bytes go to the app's own cache and leave it through a FileProvider
+ * URI, so no storage permission is needed and nothing is world-readable.
+ */
+private fun shareBackup(context: Context, export: ChannelBackupExport) {
+    val file = File(File(context.cacheDir, "backups"), export.fileName)
+    file.parentFile?.mkdirs()
+    file.writeBytes(export.bytes)
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = ChannelBackup.MIME_TYPE
+        putExtra(Intent.EXTRA_STREAM, uri)
+        putExtra(Intent.EXTRA_SUBJECT, "ZeroWallet encrypted channel backup")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(intent, "Share channel backup"))
 }

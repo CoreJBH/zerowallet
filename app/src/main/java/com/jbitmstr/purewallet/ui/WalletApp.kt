@@ -263,6 +263,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                     backupVerify = !state.backedUp
                 }
             },
+            onAuthorize = authorize,
             onClose = { sheet = ActiveSheet.NONE }
         )
         ActiveSheet.SEND -> SendSheet(
