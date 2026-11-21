@@ -78,7 +78,8 @@ so a reinstall needs the previous build removed first.
   "Stopped" and a zero balance: the reason is shown under the node status in Settings and as
   a banner on the home screen with a Try again button. If port 9735 cannot be bound (another
   node holds it, or the phone refuses it), the node is started again without a listening
-  address so on-chain sync, payments and open channels keep working. Every start and stop
+  address so on-chain sync, payments and open channels keep working - and without a node
+  alias, which LDK Node only accepts alongside a listening address. Every start and stop
   goes through one lock, so a restart picked while the node is coming up is queued instead
   of dropped, and returning to the app brings back a node Android froze - unless it was
   stopped on purpose.
@@ -165,7 +166,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.6`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.7`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -193,7 +194,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 121 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), backup encryption round trip and refusals, endpoint rules and the mainnet default, Esplora fee estimates, restart-on-endpoint-change, node start/stop rules (foreground recovery, manual stop, port 9735 fallback), log rotation, lock lifecycle |
+| Unit tests | `./gradlew testDebugUnitTest` | 122 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), backup encryption round trip and refusals, endpoint rules and the mainnet default, Esplora fee estimates, restart-on-endpoint-change, node start/stop rules (foreground recovery, manual stop, port 9735 fallback), log rotation, lock lifecycle |
 | Android lint | `./gradlew lintDebug` | no errors |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
 | Package / label | `aapt2 dump badging app-debug.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |

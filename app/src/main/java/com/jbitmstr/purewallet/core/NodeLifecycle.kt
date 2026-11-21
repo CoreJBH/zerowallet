@@ -16,6 +16,13 @@ internal const val DEFAULT_LISTENING_ADDRESS = "0.0.0.0:9735"
  *   bound (another node holds it, or the phone blocks it) the same start is tried once more
  *   without a listening address, so on-chain sync, sending and already-open channels keep
  *   working instead of leaving the wallet on "Stopped".
+ *
+ * An attempt is the whole way the node is configured, not only its socket: the node alias is
+ * set together with the listening address and omitted with it. ldk-node's `Builder::build()`
+ * rejects any config that carries a `node_alias` without `listening_addresses` (its
+ * `may_announce_channel` check turns into `BuildError::InvalidListeningAddresses`), so a
+ * fallback attempt that kept the alias could never build — which is exactly how v1.1.6 lost
+ * the wallet whenever port 9735 was taken. A node that announces nothing needs no name.
  */
 internal class NodeLifecycle(private val listeningAddress: String? = DEFAULT_LISTENING_ADDRESS) {
 
@@ -47,7 +54,7 @@ internal class NodeLifecycle(private val listeningAddress: String? = DEFAULT_LIS
 
     /**
      * Listening addresses for one start, in order. The second entry is `null`, meaning the
-     * node runs without a public listening address.
+     * node runs without a public listening address — and therefore without a node alias.
      */
     fun startAttempts(): List<String?> =
         if (listeningAddress.isNullOrBlank()) {

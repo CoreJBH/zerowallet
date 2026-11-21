@@ -104,6 +104,19 @@ class NodeLifecycleTest {
     }
 
     @Test
+    fun onlyTheAttemptThatBindsThePortCanNameTheNode() {
+        // v1.1.6 regression: ldk-node's Builder::build() runs may_announce_channel, which fails
+        // as soon as a node alias is set without a listening address, and the builder turns
+        // that into BuildError::InvalidListeningAddresses ("Given listening addresses are
+        // invalid."). The alias is therefore set only where the port is set, and the fallback
+        // attempt has to stay nameless: it is the attempt that exists for when the port is
+        // taken, and carrying the alias made it fail every time it was tried.
+        val attempts = NodeLifecycle().startAttempts()
+        assertEquals("only one attempt may carry the node alias", 1, attempts.count { it != null })
+        assertNull("the fallback must stay nameless so it can build", attempts.last())
+    }
+
+    @Test
     fun aFailureOnThePortIsWorthRetrying() {
         val lifecycle = NodeLifecycle()
         assertTrue(lifecycle.shouldRetryWithoutListening(DEFAULT_LISTENING_ADDRESS))

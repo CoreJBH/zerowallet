@@ -521,14 +521,24 @@ class NodeManager(context: Context) {
             EsploraSyncConfig(BackgroundSyncConfig(30uL, 20uL, 300uL))
         )
         builder.setEntropyBip39Mnemonic(Bip39.normalize(mnemonic), null)
-        builder.setNodeAlias(NODE_ALIAS)
         if (prefs.rapidGossipSync) {
             builder.setGossipSourceRgs(RGS_URL)
         } else {
             builder.setGossipSourceP2p()
         }
         if (listeningAddress != null) {
+            // The alias goes in only on the attempt that binds the Lightning port, and it goes
+            // in with it. ldk-node's `Builder::build()` runs `may_announce_channel`, which fails
+            // with `MissingListeningAddresses` as soon as `node_alias` is set but
+            // `listening_addresses` is not; the builder then returns
+            // `BuildError::InvalidListeningAddresses` ("Given listening addresses are
+            // invalid.") for a config that only wanted a name. Setting the alias on the
+            // no-listening fallback therefore failed every fallback outright.
+            //
+            // A node that announces nothing needs no alias, so the fallback start sets
+            // neither: it runs silently, and that is what lets it come up at all.
             runCatching { builder.setListeningAddresses(listOf(listeningAddress)) }
+                .onSuccess { builder.setNodeAlias(NODE_ALIAS) }
         }
         runCatching { builder.setFilesystemLogger(logFile.absolutePath, LogLevel.INFO) }
 
