@@ -117,6 +117,9 @@ object Bip39 {
     fun isValidMnemonic(mnemonic: String): Boolean =
         runCatching { entropyFromMnemonic(mnemonic) }.isSuccess
 
+    /** True when [word] is exactly one entry of the BIP-39 English wordlist. */
+    fun isWord(word: String): Boolean = WORD_INDEX.containsKey(word)
+
     /** Returns the first word that is not part of the wordlist, or null. */
     fun firstUnknownWord(mnemonic: String): String? =
         normalize(mnemonic).split(" ").firstOrNull { it.isNotEmpty() && !WORD_INDEX.containsKey(it) }

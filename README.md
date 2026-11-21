@@ -56,9 +56,14 @@ so a reinstall needs the previous build removed first.
   stay on the device.
 - **12 or 24 words.** A new wallet can be created from 128-bit (12 words) or 256-bit
   (24 words) entropy; both restore the same way.
-- **Word suggestions while restoring.** Typing one to four letters of a word shows tappable
-  BIP-39 suggestions for that word; four letters already identify a single word, so one tap
-  finishes it and leaves a space for the next. Pasting a whole phrase still works as before.
+- **One numbered box per word when restoring.** The phrase is entered in a 12- or 24-box grid
+  (three columns, one word per box) instead of a single long field. As soon as the letters
+  typed in a box name exactly one BIP-39 word, the box fills itself and the caret jumps to the
+  next one; ambiguous prefixes (`act` -> act, action, actor, actress, actual) show tappable
+  suggestion chips right above the keyboard. Deleting never triggers a jump, backspace in an
+  empty box steps back one box, and pasting a whole phrase (spaces, newlines, commas or a
+  numbered list) spreads it over the boxes, switching the grid to 24 words when the paste is
+  longer than 12.
 - **Encrypted channel backup.** The node store (channel manager and monitors, on-chain wallet,
   node keys) is packed into one `.zwbackup` file sealed with AES-256-GCM under a key derived
   from the recovery phrase. Android's own file picker saves it to Google Drive or anywhere
@@ -140,7 +145,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.3`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.4`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -168,7 +173,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 68 tests: BIP-39 vectors and word suggestions, backup encryption round trip and refusals, endpoint rules, log rotation, lock lifecycle |
+| Unit tests | `./gradlew testDebugUnitTest` | 96 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), backup encryption round trip and refusals, endpoint rules, log rotation, lock lifecycle |
 | Android lint | `./gradlew lintDebug` | no errors |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
 | Package / label | `aapt2 dump badging app-debug.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |
@@ -181,8 +186,8 @@ app/src/main/java/com/jbitmstr/purewallet/
   PureWalletApp.kt           application graph
   WalletViewModel.kt         UI bridge
   core/                      node, seed, app lock, channel backup, endpoint rules, log rotation, market data
-  ui/                        home screen, lock screen, sheets, setup and scanner
-app/src/test/                BIP-39, channel backup, endpoint, log rotation and lock lifecycle tests
+  ui/                        home screen, lock screen, sheets, word-box setup and scanner
+app/src/test/                BIP-39, restore-word grid, channel backup, endpoint, log rotation and lock lifecycle tests
 docs/icon.png                launcher icon artwork
 docs/preview.jpg             the screenshot above
 .github/workflows/apk.yml    CI build

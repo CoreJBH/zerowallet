@@ -156,6 +156,15 @@ class Bip39Test {
     }
 
     @Test
+    fun wordlistMembershipIsExact() {
+        assertTrue(Bip39.isWord("abandon"))
+        assertTrue(Bip39.isWord("zoo"))
+        assertFalse(Bip39.isWord("aban"))
+        assertFalse(Bip39.isWord("Abandon"))
+        assertFalse(Bip39.isWord(""))
+    }
+
+    @Test
     fun everyWordIsReachableFromItsFullText() {
         for (word in listOf("abandon", "acid", "zoo", "wrong", "yellow")) {
             assertEquals(listOf(word), Bip39.suggestWords(word))
