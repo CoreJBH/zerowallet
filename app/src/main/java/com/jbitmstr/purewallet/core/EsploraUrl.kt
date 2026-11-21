@@ -33,13 +33,13 @@ object EsploraUrl {
         val uri = try {
             URI(trimmed)
         } catch (e: Exception) {
-            return failure("That is not a valid URL. Include the full address, for example https://mempool.space/api.")
+            return failure("That is not a valid URL. Include the full address, for example https://blockstream.info/api.")
         }
 
         val scheme = uri.scheme?.lowercase()
         val host = uri.host?.lowercase()
         if (scheme.isNullOrEmpty() || host.isNullOrEmpty()) {
-            return failure("Include the full URL with its scheme, for example https://mempool.space/api.")
+            return failure("Include the full URL with its scheme, for example https://blockstream.info/api.")
         }
         if (uri.userInfo != null) {
             return failure("Remove the username or password from the endpoint URL.")

@@ -23,7 +23,9 @@ enum class ChainNetwork(
         title = "Bitcoin Mainnet",
         detail = "Real bitcoin. Payments are final.",
         ldk = Network.BITCOIN,
-        defaultEsploraUrl = "https://mempool.space/api",
+        // Blockstream's Esplora answers chain scans and address lookups without the rate
+        // limiting that made mempool.space return 429 during the wallet's full scan.
+        defaultEsploraUrl = "https://blockstream.info/api",
         explorerTxUrl = "https://mempool.space/tx/",
         ticker = "BTC"
     ),

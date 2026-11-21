@@ -178,6 +178,7 @@ class NodeManager(context: Context) {
             if (bootstrapped) return
             bootstrapped = true
         }
+        prefs.migrateLegacyEsploraDefault()
         val network = prefs.network
         val seed = secureStore.loadSeed()
         if (seed == null && secureStore.hasSeed()) {
@@ -574,11 +575,35 @@ class NodeManager(context: Context) {
         }
     }
 
+    /**
+     * Saves a new Esplora endpoint and, when the node is already running, restarts it right
+     * away. The chain source is fixed when the node is built, so a saved URL only takes
+     * effect on the next start: waiting for the user to find "Restart node" left people on
+     * the slow endpoint they had just replaced.
+     */
     fun setEsploraUrl(url: String?): Result<Unit> {
-        val result = prefs.setEsploraUrl(prefs.network, url)
+        val network = prefs.network
+        val before = prefs.esploraUrl(network)
+        val result = prefs.setEsploraUrl(network, url)
         result.onSuccess {
-            _state.update { it.copy(esploraUrl = prefs.esploraUrl(prefs.network)) }
-            _messages.tryEmit("Esplora endpoint saved. Restart the node to use it.")
+            val after = prefs.esploraUrl(network)
+            _state.update { it.copy(esploraUrl = after) }
+            val seed = secureStore.loadSeed()
+            val running = node != null && !_state.value.starting
+            if (esploraChangeNeedsRestart(before, after, running, seed != null)) {
+                _messages.tryEmit("Esplora endpoint saved. Restarting the node to use it…")
+                scope.launch {
+                    stopNodeInternal(keepState = true)
+                    startNodeInternal(seed!!)
+                    if (_state.value.running) {
+                        _messages.tryEmit("Esplora endpoint saved and in use")
+                    }
+                }
+            } else if (before != after) {
+                _messages.tryEmit("Esplora endpoint saved. It is used the next time the node starts.")
+            } else {
+                _messages.tryEmit("Esplora endpoint saved.")
+            }
         }.onFailure { failure ->
             _messages.tryEmit(failure.message ?: "That endpoint could not be saved.")
         }
@@ -988,3 +1013,15 @@ class NodeManager(context: Context) {
         private val invoiceExpirySecs: UInt = 3600u
     }
 }
+
+/**
+ * A saved endpoint only reaches the node when it is built, so a change to a different
+ * address on a node that is up and has a seed to start from means a restart is due.
+ * A node that is stopped, or a device without a recovery phrase yet, has nothing to restart.
+ */
+internal fun esploraChangeNeedsRestart(
+    before: String,
+    after: String,
+    nodeRunning: Boolean,
+    seedAvailable: Boolean
+): Boolean = before != after && nodeRunning && seedAvailable

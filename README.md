@@ -41,6 +41,11 @@ so a reinstall needs the previous build removed first.
 
 - **Bitcoin mainnet by default.** Signet and Testnet3 are selectable in Settings for
   testing; a small network badge appears only when the wallet is not on mainnet.
+- **Blockstream's Esplora as the default chain source.** Mainnet starts on
+  `https://blockstream.info/api`, which answers the first full scan and address lookups
+  without the rate limiting that made mempool.space return 429. A different Esplora
+  endpoint can be typed into Settings, and saving it restarts the node so the new source is
+  in use right away instead of waiting for the next start.
 - **On-chain wallet.** Receive to a freshly derived address, send with Normal/Fast fee
   priorities taken from the network fee estimator, or sweep the whole balance.
 - **Lightning.** Create BOLT11 invoices and BOLT12 offers, pay BOLT11 invoices, BOLT12
@@ -122,6 +127,9 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
 - `core/ScreenSecurity.kt` applies `FLAG_SECURE` to the wallet window.
 - `core/EsploraUrl.kt` holds the endpoint rules; `core/Prefs.kt` refuses to store anything
   that fails them.
+- `core/FeeEstimates.kt` reads the standard Esplora `/fee-estimates` reply (confirmation
+  target to sat/vB), so fee estimates work on any Esplora endpoint rather than only on
+  mempool.space's numbered helper.
 - `core/NodeLog.kt` rotates the LDK log file with a size cap.
 - `core/Bip39.kt` implements BIP-39 generation and validation in plain Kotlin, covered by
   unit tests against the official vectors.
@@ -145,7 +153,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.4`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.5`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -173,7 +181,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 96 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), backup encryption round trip and refusals, endpoint rules, log rotation, lock lifecycle |
+| Unit tests | `./gradlew testDebugUnitTest` | 108 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), backup encryption round trip and refusals, endpoint rules and the mainnet default, Esplora fee estimates, restart-on-endpoint-change, log rotation, lock lifecycle |
 | Android lint | `./gradlew lintDebug` | no errors |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
 | Package / label | `aapt2 dump badging app-debug.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |

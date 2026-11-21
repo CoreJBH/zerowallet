@@ -276,7 +276,8 @@ fun SettingsSheet(
             Spacer(Modifier.height(8.dp))
             Text(
                 "Only https:// endpoints are accepted. Plain http:// is allowed just for a node " +
-                    "on this phone (127.0.0.1 or localhost).",
+                    "on this phone (127.0.0.1 or localhost). Saving a different endpoint restarts " +
+                    "the node, so it is in use right away.",
                 color = Pal.TextTertiary,
                 fontSize = 11.sp,
                 lineHeight = 15.sp

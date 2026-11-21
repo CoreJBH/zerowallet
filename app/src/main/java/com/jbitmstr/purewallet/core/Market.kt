@@ -32,9 +32,23 @@ object Market {
         coingecko() ?: upbit() ?: mempoolUsd()
     }
 
+    /**
+     * Fee estimates for the configured Esplora endpoint.
+     *
+     * The standard Esplora `/fee-estimates` reply is asked for first, because every
+     * endpoint (Blockstream's included) serves it in one request; the mempool.space
+     * `/v1/fees/recommended` helper is only a fallback for deployments that expose nothing
+     * else. Without either, the caller falls back to its own conservative defaults.
+     */
     suspend fun fetchFeeRates(esploraBaseUrl: String): FeeRates? = withContext(Dispatchers.IO) {
-        val body = httpGet(esploraBaseUrl.trimEnd('/') + "/v1/fees/recommended") ?: return@withContext null
-        runCatching {
+        val base = esploraBaseUrl.trimEnd('/')
+        httpGet("$base/fee-estimates")?.let { body -> FeeEstimates.fromEsplora(body) }
+            ?: recommendedFees(base)
+    }
+
+    private fun recommendedFees(base: String): FeeRates? {
+        val body = httpGet("$base/v1/fees/recommended") ?: return null
+        return runCatching {
             val json = JSONObject(body)
             FeeRates(
                 fastestSatPerVb = json.optLong("fastestFee", 0L).coerceAtLeast(1L),

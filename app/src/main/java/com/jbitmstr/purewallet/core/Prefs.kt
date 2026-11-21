@@ -73,6 +73,26 @@ class Prefs(context: Context) {
     fun isCustomEsplora(network: ChainNetwork): Boolean =
         esploraUrl(network) != network.defaultEsploraUrl
 
+    /**
+     * One-time cleanup for the 1.1.4 default.
+     *
+     * Mainnet's built-in endpoint moved from mempool.space to Blockstream in 1.1.5 because
+     * mempool.space answered the wallet's full scan with 429. A stored mainnet value that is
+     * still that old default (only possible when it was saved with a trailing slash or other
+     * letter case, since saving the default itself clears the key) is dropped once so the
+     * faster endpoint is picked up. Anything saved after this update is a real choice and
+     * is left alone.
+     */
+    fun migrateLegacyEsploraDefault() {
+        if (prefs.getBoolean(KEY_ESPLORA_MIGRATED, false)) return
+        val key = KEY_ESPLORA + ChainNetwork.MAINNET.id
+        val stored = prefs.getString(key, null)
+        if (stored != null && stored.trimEnd('/').equals(LEGACY_MAINNET_ESPLORA, ignoreCase = true)) {
+            prefs.edit().remove(key).apply()
+        }
+        prefs.edit().putBoolean(KEY_ESPLORA_MIGRATED, true).apply()
+    }
+
     fun clear() {
         prefs.edit().clear().apply()
     }
@@ -86,5 +106,9 @@ class Prefs(context: Context) {
         private const val KEY_SCREEN_PROTECTION = "screen_protection"
         private const val KEY_CREATED_AT = "wallet_created_at"
         private const val KEY_ESPLORA = "esplora_url_"
+        private const val KEY_ESPLORA_MIGRATED = "esplora_default_migrated_1_1_5"
+
+        /** The mainnet endpoint that shipped up to 1.1.4. */
+        private const val LEGACY_MAINNET_ESPLORA = "https://mempool.space/api"
     }
 }
