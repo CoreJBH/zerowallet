@@ -82,6 +82,8 @@ data class WalletState(
     val network: ChainNetwork = ChainNetwork.MAINNET,
     val esploraUrl: String = ChainNetwork.MAINNET.defaultEsploraUrl,
     val rgsEnabled: Boolean = false,
+    val appLockEnabled: Boolean = true,
+    val screenProtection: Boolean = true,
     val seedPresent: Boolean = false,
     val backedUp: Boolean = false,
     val setupRequired: Boolean = true,
@@ -174,6 +176,8 @@ class NodeManager(context: Context) {
                 it.copy(
                     network = network,
                     esploraUrl = prefs.esploraUrl(network),
+                    appLockEnabled = prefs.appLockEnabled,
+                    screenProtection = prefs.screenProtection,
                     seedPresent = false,
                     setupRequired = true,
                     unlockError = true,
@@ -188,6 +192,8 @@ class NodeManager(context: Context) {
                 network = network,
                 esploraUrl = prefs.esploraUrl(network),
                 rgsEnabled = prefs.rapidGossipSync,
+                appLockEnabled = prefs.appLockEnabled,
+                screenProtection = prefs.screenProtection,
                 seedPresent = seed != null,
                 backedUp = prefs.seedBackedUp,
                 setupRequired = seed == null
@@ -200,10 +206,10 @@ class NodeManager(context: Context) {
         }
     }
 
-    /** Creates a new wallet from 128 bits of SecureRandom entropy and returns the words. */
-    fun createWallet(): String {
+    /** Creates a new wallet from SecureRandom entropy and returns the words. */
+    fun createWallet(wordCount: Int = 12): String {
         check(!secureStore.hasSeed()) { "A wallet already exists on this device" }
-        val mnemonic = Bip39.randomMnemonic(12)
+        val mnemonic = Bip39.randomMnemonic(wordCount)
         secureStore.saveSeed(mnemonic)
         prefs.seedBackedUp = false
         prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
@@ -248,7 +254,10 @@ class NodeManager(context: Context) {
                 stopNodeInternal(keepState = true)
                 val network = prefs.network
                 val dir = networkDir(network).apply { mkdirs() }
-                val logFile = File(appContext.filesDir, "logs/ldk-node.log").apply { parentFile?.mkdirs() }
+                val logFile = NodeLog.file(appContext).apply { parentFile?.mkdirs() }
+                // Keep the on-device log bounded. The node is stopped here, so the file is
+                // not being written while it is renamed.
+                runCatching { NodeLog.rotateIfNeeded(logFile) }
 
                 val builder = Builder()
                 builder.setStorageDirPath(dir.absolutePath)
@@ -385,6 +394,7 @@ class NodeManager(context: Context) {
                 runCatching { current.stop() }
                 runCatching { current.destroy() }
             }
+            runCatching { NodeLog.rotateIfNeeded(NodeLog.file(appContext)) }
         }
         _state.update {
             it.copy(
@@ -436,16 +446,31 @@ class NodeManager(context: Context) {
         }
     }
 
-    fun setEsploraUrl(url: String?) {
-        prefs.setEsploraUrl(prefs.network, url)
-        _state.update { it.copy(esploraUrl = prefs.esploraUrl(prefs.network)) }
-        _messages.tryEmit("Esplora endpoint saved. Restart the node to use it.")
+    fun setEsploraUrl(url: String?): Result<Unit> {
+        val result = prefs.setEsploraUrl(prefs.network, url)
+        result.onSuccess {
+            _state.update { it.copy(esploraUrl = prefs.esploraUrl(prefs.network)) }
+            _messages.tryEmit("Esplora endpoint saved. Restart the node to use it.")
+        }.onFailure { failure ->
+            _messages.tryEmit(failure.message ?: "That endpoint could not be saved.")
+        }
+        return result
     }
 
     fun setRapidGossipSync(enabled: Boolean) {
         prefs.rapidGossipSync = enabled
         _state.update { it.copy(rgsEnabled = enabled) }
         _messages.tryEmit("Gossip source changed. Restart the node to apply it.")
+    }
+
+    fun setAppLockEnabled(enabled: Boolean) {
+        prefs.appLockEnabled = enabled
+        _state.update { it.copy(appLockEnabled = enabled) }
+    }
+
+    fun setScreenProtection(enabled: Boolean) {
+        prefs.screenProtection = enabled
+        _state.update { it.copy(screenProtection = enabled) }
     }
 
     // ------------------------------------------------------------- sync
@@ -717,7 +742,7 @@ class NodeManager(context: Context) {
     suspend fun closeChannel(channel: ChannelRow, force: Boolean): Result<Unit> = runCatching {
         val n = requireNode()
         if (force) {
-            n.forceCloseChannel(channel.userChannelId, channel.peer, "Closed from PUREWALLET")
+            n.forceCloseChannel(channel.userChannelId, channel.peer, "Closed from ZeroWallet")
         } else {
             n.closeChannel(channel.userChannelId, channel.peer)
         }

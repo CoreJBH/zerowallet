@@ -36,6 +36,7 @@ import com.jbitmstr.purewallet.core.ChannelRow
 import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.WalletState
 import com.jbitmstr.purewallet.ui.components.GhostButton
+import com.jbitmstr.purewallet.ui.components.Banner
 import com.jbitmstr.purewallet.ui.components.PrimaryButton
 import com.jbitmstr.purewallet.ui.components.SectionLabel
 import com.jbitmstr.purewallet.ui.components.SheetHeader
@@ -53,6 +54,7 @@ fun ChannelsSheet(
     vm: WalletViewModel,
     state: WalletState,
     initialPeer: String,
+    onAuthorize: (String, () -> Unit) -> Unit,
     onScan: () -> Unit,
     onClose: () -> Unit
 ) {
@@ -71,13 +73,15 @@ fun ChannelsSheet(
             error = "Enter a channel size in sats"
             return
         }
-        scope.launch {
-            busy = true
-            error = null
-            vm.openChannel(peerUri.trim(), amount, 0L).onFailure {
-                error = it.message ?: "Could not open the channel"
+        onAuthorize("Authenticate to fund this channel.") {
+            scope.launch {
+                busy = true
+                error = null
+                vm.openChannel(peerUri.trim(), amount, 0L).onFailure {
+                    error = it.message ?: "Could not open the channel"
+                }
+                busy = false
             }
-            busy = false
         }
     }
 
@@ -98,6 +102,15 @@ fun ChannelsSheet(
             subtitle = "Direct connections to Lightning peers, funded from your on-chain balance.",
             onClose = onClose
         )
+
+        Banner(
+            title = "Channel state lives on this phone",
+            body = "Your recovery phrase restores on-chain bitcoin only. Open Lightning channels " +
+                "are stored on this device and are not backed up to any cloud or server, so a lost " +
+                "or wiped phone can lose the funds that are in them. Keep channels small."
+        )
+
+        Spacer(Modifier.height(14.dp))
 
         if (state.channels.isEmpty()) {
             Text(
@@ -231,9 +244,11 @@ fun ChannelsSheet(
                 TextButton(onClick = {
                     val target = channel
                     closing = null
-                    scope.launch {
-                        vm.closeChannel(target, forceClose).onFailure {
-                            error = it.message ?: "Could not close the channel"
+                    onAuthorize(if (forceClose) "Authenticate to force close this channel." else "Authenticate to close this channel.") {
+                        scope.launch {
+                            vm.closeChannel(target, forceClose).onFailure {
+                                error = it.message ?: "Could not close the channel"
+                            }
                         }
                     }
                 }) {

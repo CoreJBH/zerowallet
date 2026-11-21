@@ -22,7 +22,7 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
     fun bootstrap() = manager.bootstrap()
 
-    fun createWallet(): String = manager.createWallet()
+    fun createWallet(wordCount: Int = 12): String = manager.createWallet(wordCount)
 
     fun restoreWallet(mnemonic: String): Result<Unit> = manager.restoreWallet(mnemonic)
 
@@ -38,9 +38,13 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
     fun switchNetwork(network: ChainNetwork) = manager.switchNetwork(network)
 
-    fun setEsploraUrl(url: String?) = manager.setEsploraUrl(url)
+    fun setEsploraUrl(url: String?): Result<Unit> = manager.setEsploraUrl(url)
 
     fun setRapidGossipSync(enabled: Boolean) = manager.setRapidGossipSync(enabled)
+
+    fun setAppLockEnabled(enabled: Boolean) = manager.setAppLockEnabled(enabled)
+
+    fun setScreenProtection(enabled: Boolean) = manager.setScreenProtection(enabled)
 
     fun wipeWallet() = manager.wipeWallet()
 

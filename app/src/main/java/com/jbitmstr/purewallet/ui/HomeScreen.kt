@@ -144,7 +144,7 @@ private fun TopBar(state: WalletState, onMenu: () -> Unit, onRefresh: () -> Unit
         }
         Spacer(Modifier.width(10.dp))
         Text(
-            text = "PUREWALLET",
+            text = "ZeroWallet",
             color = Pal.TextSecondary,
             fontSize = 11.sp,
             fontWeight = FontWeight.Medium,

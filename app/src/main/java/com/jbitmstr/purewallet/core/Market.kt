@@ -97,7 +97,7 @@ object Market {
                 requestMethod = "GET"
                 connectTimeout = 8_000
                 readTimeout = 8_000
-                setRequestProperty("User-Agent", "PUREWALLET/1.0")
+                setRequestProperty("User-Agent", "ZeroWallet/1.0")
                 setRequestProperty("Accept", "application/json")
             }
             if (connection.responseCode in 200..299) {

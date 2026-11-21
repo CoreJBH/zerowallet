@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "PUREWALLET"
+rootProject.name = "ZeroWallet"
 include(":app")

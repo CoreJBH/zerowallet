@@ -77,6 +77,33 @@ class Bip39Test {
     }
 
     @Test
+    fun randomTwentyFourWordMnemonicIsValid() {
+        val mnemonic = Bip39.randomMnemonic(24)
+        assertTrue(Bip39.isValidMnemonic(mnemonic))
+        assertEquals(24, Bip39.wordCount(mnemonic))
+    }
+
+    @Test
+    fun everySupportedWordCountProducesAValidPhrase() {
+        for (count in listOf(12, 15, 18, 21, 24)) {
+            val mnemonic = Bip39.randomMnemonic(count)
+            assertEquals(count, Bip39.wordCount(mnemonic))
+            assertTrue(Bip39.isValidMnemonic(mnemonic))
+        }
+    }
+
+    @Test
+    fun twentyFourWordPhraseRoundTripsToThirtyTwoBytes() {
+        val mnemonic = Bip39.randomMnemonic(24)
+        assertEquals(32, Bip39.entropyFromMnemonic(mnemonic).size)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun unsupportedWordCountIsRejected() {
+        Bip39.randomMnemonic(13)
+    }
+
+    @Test
     fun checksumErrorsAreRejected() {
         val valid = Bip39.mnemonicFromEntropy(ByteArray(16))
         val words = valid.split(" ")

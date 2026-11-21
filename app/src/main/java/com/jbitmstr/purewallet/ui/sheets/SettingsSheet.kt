@@ -55,10 +55,12 @@ import com.jbitmstr.purewallet.ui.theme.Pal
 fun SettingsSheet(
     vm: WalletViewModel,
     state: WalletState,
+    lockAvailable: Boolean,
     onBackup: () -> Unit,
     onClose: () -> Unit
 ) {
     var esplora by remember(state.esploraUrl) { mutableStateOf(state.esploraUrl) }
+    var esploraError by remember { mutableStateOf<String?>(null) }
     var confirmWipe by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
@@ -73,7 +75,7 @@ fun SettingsSheet(
         if (!state.backedUp) {
             Banner(
                 title = "Recovery phrase not backed up",
-                body = "Without the 12 words, a lost phone means lost funds.",
+                body = "Without your recovery phrase, a lost phone means lost funds.",
                 actionLabel = "Show phrase",
                 onAction = onBackup
             )
@@ -197,16 +199,33 @@ fun SettingsSheet(
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             GhostButton(
                 text = "Save endpoint",
-                onClick = { vm.setEsploraUrl(esplora) },
+                onClick = {
+                    esploraError = null
+                    vm.setEsploraUrl(esplora).onFailure { esploraError = it.message }
+                },
                 modifier = Modifier.weight(1f)
             )
             GhostButton(
                 text = "Use default",
                 onClick = {
+                    esploraError = null
                     esplora = state.network.defaultEsploraUrl
                     vm.setEsploraUrl(state.network.defaultEsploraUrl)
                 },
                 modifier = Modifier.weight(1f)
+            )
+        }
+        if (esploraError != null) {
+            Spacer(Modifier.height(8.dp))
+            Text(esploraError ?: "", color = Pal.Danger, fontSize = 12.sp, lineHeight = 16.sp)
+        } else {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Only https:// endpoints are accepted. Plain http:// is allowed just for a node " +
+                    "on this phone (127.0.0.1 or localhost).",
+                color = Pal.TextTertiary,
+                fontSize = 11.sp,
+                lineHeight = 15.sp
             )
         }
 
@@ -245,6 +264,28 @@ fun SettingsSheet(
             )
         }
 
+        SectionLabel("Security")
+
+        SwitchRow(
+            title = "App lock",
+            detail = if (lockAvailable) {
+                "Ask for your fingerprint or screen lock when the app opens and before sending funds."
+            } else {
+                "Set a screen lock (PIN, pattern or password) on this phone to use the app lock."
+            },
+            checked = state.appLockEnabled,
+            enabled = lockAvailable,
+            onCheckedChange = { vm.setAppLockEnabled(it) }
+        )
+        Spacer(Modifier.height(10.dp))
+        SwitchRow(
+            title = "Block screenshots",
+            detail = "Keep the wallet out of screenshots, screen recordings and the recent-apps preview.",
+            checked = state.screenProtection,
+            enabled = true,
+            onCheckedChange = { vm.setScreenProtection(it) }
+        )
+
         SectionLabel("Recovery")
 
         GhostButton(
@@ -279,7 +320,7 @@ fun SettingsSheet(
             title = { Text("Wipe this wallet?") },
             text = {
                 Text(
-                    "You will need your 12 words to restore it. This cannot be undone.",
+                    "You will need your recovery phrase to restore it. This cannot be undone.",
                     fontSize = 13.sp,
                     lineHeight = 18.sp
                 )
@@ -298,6 +339,49 @@ fun SettingsSheet(
                     Text("Cancel", color = Pal.TextSecondary)
                 }
             }
+        )
+    }
+}
+
+@Composable
+private fun SwitchRow(
+    title: String,
+    detail: String,
+    checked: Boolean,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(Pal.Surface)
+            .border(1.dp, Pal.Border, RoundedCornerShape(16.dp))
+            .padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                color = if (enabled) Pal.TextPrimary else Pal.TextSecondary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(3.dp))
+            Text(detail, color = Pal.TextTertiary, fontSize = 11.sp, lineHeight = 15.sp)
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(
+            checked = checked && enabled,
+            onCheckedChange = onCheckedChange,
+            enabled = enabled,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.Black,
+                checkedTrackColor = Color.White,
+                uncheckedThumbColor = Pal.TextSecondary,
+                uncheckedTrackColor = Pal.SurfaceElevated,
+                uncheckedBorderColor = Pal.Border
+            )
         )
     }
 }

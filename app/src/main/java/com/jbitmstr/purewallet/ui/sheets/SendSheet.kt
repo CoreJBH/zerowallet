@@ -56,6 +56,7 @@ fun SendSheet(
     vm: WalletViewModel,
     state: WalletState,
     initialText: String,
+    onAuthorize: (String, () -> Unit) -> Unit,
     onClose: () -> Unit,
     onScan: () -> Unit
 ) {
@@ -122,23 +123,25 @@ fun SendSheet(
             error = "Enter an amount in sats"
             return
         }
-        scope.launch {
-            busy = true
-            error = null
-            val outcome = if (current.input.kind == PaymentInputKind.ONCHAIN && sendAll) {
-                vm.sendOnchain(
-                    address = current.input.address.orEmpty(),
-                    amountSats = null,
-                    sendAll = true,
-                    priority = priority
-                )
-            } else {
-                vm.pay(current, amount, priority)
+        onAuthorize("Authenticate to send this payment.") {
+            scope.launch {
+                busy = true
+                error = null
+                val outcome = if (current.input.kind == PaymentInputKind.ONCHAIN && sendAll) {
+                    vm.sendOnchain(
+                        address = current.input.address.orEmpty(),
+                        amountSats = null,
+                        sendAll = true,
+                        priority = priority
+                    )
+                } else {
+                    vm.pay(current, amount, priority)
+                }
+                outcome.onSuccess { reference = it }.onFailure {
+                    error = it.message ?: "The payment could not be sent"
+                }
+                busy = false
             }
-            outcome.onSuccess { reference = it }.onFailure {
-                error = it.message ?: "The payment could not be sent"
-            }
-            busy = false
         }
     }
 

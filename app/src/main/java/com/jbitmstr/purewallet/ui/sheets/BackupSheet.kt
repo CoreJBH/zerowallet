@@ -68,7 +68,7 @@ fun BackupSheet(
         if (step == 0) {
             Banner(
                 title = "Keep this private",
-                body = "Anyone who has these words can spend your bitcoin. PUREWALLET cannot recover them for you."
+                body = "Anyone who has these words can spend your bitcoin. ZeroWallet cannot recover them for you."
             )
 
             Spacer(Modifier.height(18.dp))
@@ -95,6 +95,15 @@ fun BackupSheet(
                     }
                 }
             }
+
+            Spacer(Modifier.height(20.dp))
+
+            Banner(
+                title = "On-chain recovery only",
+                body = "These words restore bitcoin held on-chain. Lightning channel state is not " +
+                    "part of the phrase and is not backed up to any cloud or server, so funds in open " +
+                    "channels are gone if this phone is lost or wiped."
+            )
 
             Spacer(Modifier.height(20.dp))
 

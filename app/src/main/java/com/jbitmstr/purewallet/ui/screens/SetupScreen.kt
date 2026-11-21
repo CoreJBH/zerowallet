@@ -34,6 +34,7 @@ import com.jbitmstr.purewallet.ui.components.Banner
 import com.jbitmstr.purewallet.ui.components.BoltGlyph
 import com.jbitmstr.purewallet.ui.components.GhostButton
 import com.jbitmstr.purewallet.ui.components.PrimaryButton
+import com.jbitmstr.purewallet.ui.components.SegmentedOptions
 import com.jbitmstr.purewallet.ui.components.WalletTextField
 import com.jbitmstr.purewallet.ui.theme.Pal
 
@@ -44,10 +45,11 @@ import com.jbitmstr.purewallet.ui.theme.Pal
 @Composable
 fun SetupScreen(
     unlockError: Boolean = false,
-    onCreate: () -> Unit,
+    onCreate: (Int) -> Unit,
     onRestore: (String) -> Result<Unit>
 ) {
     var mode by remember { mutableStateOf(if (unlockError) 1 else 0) }
+    var wordCount by remember { mutableStateOf(12) }
     var phrase by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -75,7 +77,7 @@ fun SetupScreen(
 
         Spacer(Modifier.height(24.dp))
 
-        Text("PUREWALLET", color = Pal.TextPrimary, fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+        Text("ZeroWallet", color = Pal.TextPrimary, fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
         Spacer(Modifier.height(10.dp))
         Text(
             "A self-custodial Lightning and on-chain wallet that runs entirely on this phone. No account, no server, no middleman.",
@@ -114,11 +116,19 @@ fun SetupScreen(
 
         if (mode == 0) {
             Banner(
-                title = "One tap, 12 words",
-                body = "The phrase is generated from the phone's secure random generator and encrypted with a key in the Android Keystore. You will see it once for backup."
+                title = if (wordCount == 24) "One tap, 24 words" else "One tap, 12 words",
+                body = "The phrase is generated from the phone's secure random generator " +
+                    "(${if (wordCount == 24) "256" else "128"} bits) and encrypted with a key in the " +
+                    "Android Keystore. You will see it once for backup."
+            )
+            Spacer(Modifier.height(16.dp))
+            SegmentedOptions(
+                options = listOf("12 words", "24 words"),
+                selected = if (wordCount == 24) 1 else 0,
+                onSelect = { wordCount = if (it == 1) 24 else 12 }
             )
             Spacer(Modifier.height(20.dp))
-            PrimaryButton(text = "Create wallet", onClick = onCreate)
+            PrimaryButton(text = "Create wallet", onClick = { onCreate(wordCount) })
         } else {
             Text(
                 "Recovery phrase",

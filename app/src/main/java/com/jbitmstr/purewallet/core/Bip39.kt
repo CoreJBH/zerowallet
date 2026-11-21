@@ -6,9 +6,10 @@ import java.security.SecureRandom
 /**
  * BIP-39 mnemonic generation and checking.
  *
- * Entropy comes from the platform CSPRNG ([randomMnemonic]: 128 bits from SecureRandom,
- * the same source Android uses for key material). Mnemonics can also be parsed back and
- * validated for restore.
+ * Entropy comes from the platform CSPRNG ([randomMnemonic]: 128 bits for 12 words and
+ * 256 bits for 24 words from SecureRandom, the same source Android uses for key material).
+ * The entropy buffer is zeroed as soon as the words exist, so it does not linger in the
+ * heap. Mnemonics can also be parsed back and validated for restore.
  *
  * Everything here is deterministic and free of Android APIs so it can be covered by
  * plain JVM unit tests.
@@ -32,13 +33,20 @@ object Bip39 {
         return if (normalized.isEmpty()) 0 else normalized.split(" ").size
     }
 
-    /** A fresh 12-word mnemonic from the platform CSPRNG (128 bits of entropy). */
+    /**
+     * A fresh mnemonic from the platform CSPRNG: 12 words (128 bits) by default, or any
+     * supported count such as 24 words (256 bits).
+     */
     fun randomMnemonic(wordCount: Int = 12): String {
         require(wordCount in VALID_WORD_COUNTS) { "Unsupported word count: $wordCount" }
         val entropyBytes = wordCount * 32 / 3 / 8
         val entropy = ByteArray(entropyBytes)
-        SecureRandom().nextBytes(entropy)
-        return mnemonicFromEntropy(entropy)
+        try {
+            SecureRandom().nextBytes(entropy)
+            return mnemonicFromEntropy(entropy)
+        } finally {
+            entropy.fill(0)
+        }
     }
 
     /** Encodes entropy (16/20/24/28/32 bytes) as a BIP-39 mnemonic with checksum. */
