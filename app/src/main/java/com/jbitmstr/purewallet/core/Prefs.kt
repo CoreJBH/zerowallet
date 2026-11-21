@@ -21,10 +21,16 @@ class Prefs(context: Context) {
         get() = prefs.getBoolean(KEY_RGS, false)
         set(value) = prefs.edit().putBoolean(KEY_RGS, value).apply()
 
-    /** Ask for the fingerprint or screen lock when the app opens and before spending. */
-    var appLockEnabled: Boolean
-        get() = prefs.getBoolean(KEY_APP_LOCK, true)
-        set(value) = prefs.edit().putBoolean(KEY_APP_LOCK, value).apply()
+    /**
+     * Ask for the fingerprint or screen lock when the app opens.
+     *
+     * Off by default: an opt-in in Settings, so nobody is locked out of their own wallet on
+     * first run. Sending funds and showing the recovery phrase always authenticate on their
+     * own, whether or not this is on.
+     */
+    var lockOnOpen: Boolean
+        get() = prefs.getBoolean(KEY_LOCK_ON_OPEN, false)
+        set(value) = prefs.edit().putBoolean(KEY_LOCK_ON_OPEN, value).apply()
 
     /** Block screenshots, screen recording and the recent-apps preview of the wallet. */
     var screenProtection: Boolean
@@ -76,7 +82,7 @@ class Prefs(context: Context) {
         private const val KEY_NETWORK = "network"
         private const val KEY_BACKED_UP = "seed_backed_up"
         private const val KEY_RGS = "rapid_gossip_sync"
-        private const val KEY_APP_LOCK = "app_lock"
+        private const val KEY_LOCK_ON_OPEN = "lock_on_open"
         private const val KEY_SCREEN_PROTECTION = "screen_protection"
         private const val KEY_CREATED_AT = "wallet_created_at"
         private const val KEY_ESPLORA = "esplora_url_"

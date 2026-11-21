@@ -42,7 +42,7 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setRapidGossipSync(enabled: Boolean) = manager.setRapidGossipSync(enabled)
 
-    fun setAppLockEnabled(enabled: Boolean) = manager.setAppLockEnabled(enabled)
+    fun setLockOnOpen(enabled: Boolean) = manager.setLockOnOpen(enabled)
 
     fun setScreenProtection(enabled: Boolean) = manager.setScreenProtection(enabled)
 

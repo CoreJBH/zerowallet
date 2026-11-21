@@ -59,8 +59,13 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     val activity = remember(context) { AppLock.activityOf(context) }
     val appLock = remember(activity) { activity?.let { AppLock(it) } }
     val lockAvailable = remember(activity) { appLock?.isAvailable() == true }
-    val lockEnabled = state.appLockEnabled && lockAvailable
-    var unlocked by remember(lockEnabled) { mutableStateOf(!lockEnabled) }
+    // Until the wallet is loaded it is not known whether one exists, so the gate stays
+    // armed; after that only a real wallet is worth locking. Onboarding is never gated.
+    val lockArmed = if (state.bootstrapped) state.seedPresent else true
+    // Locking the app every time it opens is opt-in in Settings. Sending funds and showing
+    // the recovery phrase authenticate on their own, whether or not that option is on.
+    val openLockEnabled = state.lockOnOpen && lockAvailable && lockArmed
+    var unlocked by remember(openLockEnabled) { mutableStateOf(!openLockEnabled) }
     var unlockError by remember { mutableStateOf<String?>(null) }
 
     var sheet by remember { mutableStateOf(ActiveSheet.NONE) }
@@ -73,7 +78,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
 
     fun unlockWith(reason: String) {
         val lock = appLock
-        if (lock == null || !lockEnabled) {
+        if (lock == null || !openLockEnabled) {
             unlocked = true
             return
         }
@@ -88,19 +93,20 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
         }
     }
 
-    // Ask as soon as the lock screen appears, including after a relock.
-    LaunchedEffect(lockEnabled, unlocked) {
-        if (lockEnabled && !unlocked) {
+    // Ask as soon as the lock screen appears, including after a relock. Nothing is asked
+    // while the wallet is still being loaded or does not exist yet.
+    LaunchedEffect(openLockEnabled, unlocked, state.bootstrapped) {
+        if (openLockEnabled && !unlocked && state.bootstrapped) {
             unlockWith("Authenticate to open your wallet.")
         }
     }
 
-    // Lock again when the app leaves the screen, unless the system prompt itself is up
-    // (the screen-lock fallback opens a system screen, which must not create a loop).
+    // Lock again whenever the app leaves the screen. The prompt itself keeps its own
+    // lifecycle: it resets on stop and restarts on resume, so this cannot strand it.
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, lockEnabled) {
+    DisposableEffect(lifecycleOwner, openLockEnabled) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && lockEnabled && appLock?.isRunning() != true) {
+            if (event == Lifecycle.Event.ON_STOP && openLockEnabled) {
                 unlocked = false
                 // Never leave the recovery phrase on screen behind a locked wallet.
                 backupWords = null
@@ -111,19 +117,21 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     }
 
     DisposableEffect(appLock) {
-        onDispose { appLock?.cancel() }
+        onDispose { appLock?.dispose() }
     }
 
     /**
      * Runs [action] only after the user proves it is them: payments, channel funding and
-     * showing the recovery phrase. Nothing is asked when the app lock is off.
+     * showing the recovery phrase. This always applies when the phone can authenticate,
+     * independent of the optional lock-on-open. A phone with no screen lock cannot ask,
+     * so the action runs directly.
      */
     val authorize: (String, () -> Unit) -> Unit = { reason, action ->
         val lock = appLock
-        when {
-            !lockEnabled || lock == null -> action()
-            lock.isRunning() -> Unit
-            else -> lock.authenticate("Confirm it's you", reason) { ok ->
+        if (!lockAvailable || lock == null) {
+            action()
+        } else {
+            lock.authenticate("Confirm it's you", reason) { ok ->
                 if (ok) {
                     action()
                 } else {
@@ -146,7 +154,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
         if (state.running) NodeService.start(context) else NodeService.stop(context)
     }
 
-    if (lockEnabled && !unlocked) {
+    if (openLockEnabled && !unlocked) {
         LockedScreen(
             error = unlockError,
             onUnlock = { unlockWith("Authenticate to open your wallet.") }

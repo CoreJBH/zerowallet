@@ -12,8 +12,8 @@ android {
         applicationId = "com.jbitmstr.purewallet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.1.1"
 
         ndk {
             // Phones are ARM; keeping the APK to the two ARM ABIs halves its size.

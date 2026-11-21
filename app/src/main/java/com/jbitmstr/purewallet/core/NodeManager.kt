@@ -82,8 +82,9 @@ data class WalletState(
     val network: ChainNetwork = ChainNetwork.MAINNET,
     val esploraUrl: String = ChainNetwork.MAINNET.defaultEsploraUrl,
     val rgsEnabled: Boolean = false,
-    val appLockEnabled: Boolean = true,
+    val lockOnOpen: Boolean = false,
     val screenProtection: Boolean = true,
+    val bootstrapped: Boolean = false,
     val seedPresent: Boolean = false,
     val backedUp: Boolean = false,
     val setupRequired: Boolean = true,
@@ -176,8 +177,9 @@ class NodeManager(context: Context) {
                 it.copy(
                     network = network,
                     esploraUrl = prefs.esploraUrl(network),
-                    appLockEnabled = prefs.appLockEnabled,
+                    lockOnOpen = prefs.lockOnOpen,
                     screenProtection = prefs.screenProtection,
+                    bootstrapped = true,
                     seedPresent = false,
                     setupRequired = true,
                     unlockError = true,
@@ -192,8 +194,9 @@ class NodeManager(context: Context) {
                 network = network,
                 esploraUrl = prefs.esploraUrl(network),
                 rgsEnabled = prefs.rapidGossipSync,
-                appLockEnabled = prefs.appLockEnabled,
+                lockOnOpen = prefs.lockOnOpen,
                 screenProtection = prefs.screenProtection,
+                bootstrapped = true,
                 seedPresent = seed != null,
                 backedUp = prefs.seedBackedUp,
                 setupRequired = seed == null
@@ -417,7 +420,13 @@ class NodeManager(context: Context) {
             runCatching { secureStore.clear() }
             runCatching { notes.clear() }
             runCatching { prefs.clear() }
-            _state.value = WalletState(setupRequired = true, seedPresent = false)
+            _state.value = WalletState(
+                setupRequired = true,
+                seedPresent = false,
+                bootstrapped = true,
+                lockOnOpen = prefs.lockOnOpen,
+                screenProtection = prefs.screenProtection
+            )
         }
     }
 
@@ -463,9 +472,9 @@ class NodeManager(context: Context) {
         _messages.tryEmit("Gossip source changed. Restart the node to apply it.")
     }
 
-    fun setAppLockEnabled(enabled: Boolean) {
-        prefs.appLockEnabled = enabled
-        _state.update { it.copy(appLockEnabled = enabled) }
+    fun setLockOnOpen(enabled: Boolean) {
+        prefs.lockOnOpen = enabled
+        _state.update { it.copy(lockOnOpen = enabled) }
     }
 
     fun setScreenProtection(enabled: Boolean) {

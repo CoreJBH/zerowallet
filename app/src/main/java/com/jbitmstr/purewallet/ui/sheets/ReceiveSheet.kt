@@ -91,7 +91,7 @@ fun ReceiveSheet(
         if (!state.backedUp) {
             Banner(
                 title = "Back up your recovery phrase first",
-                body = "Funds sent to this wallet can only be recovered with your 12 words.",
+                body = "Funds sent to this wallet can only be recovered with your recovery phrase.",
                 actionLabel = "Back up now",
                 onAction = onBackup
             )

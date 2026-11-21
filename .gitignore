@@ -14,3 +14,7 @@ local.properties
 *.jks
 *.keystore
 keystore.properties
+
+# JVM crash logs
+hs_err_pid*.log
+replay_pid*.log

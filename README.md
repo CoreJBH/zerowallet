@@ -58,12 +58,14 @@ so a reinstall needs the previous build removed first.
 
 ## Security
 
-- **App lock.** The wallet asks for a biometric or the device screen lock when it opens and
-  before anything that moves money: sending a payment, funding or closing a channel, and
-  showing the recovery phrase. One prompt accepts either a strong biometric or the screen
-  lock on Android 11+; older versions ask for the fingerprint and offer the screen lock as
-  the fallback. The lock can be turned off in Settings, and relocks whenever the app leaves
-  the screen.
+- **Authentication before money moves.** Sending a payment, funding or closing a channel
+  and showing the recovery phrase always ask for a biometric or the device screen lock
+  first. One prompt accepts either a strong biometric or the screen lock on Android 11+;
+  older versions ask for the fingerprint and offer the screen lock as the fallback. A phone
+  with no screen lock cannot ask, and says so in Settings.
+- **Optional lock on open.** Off by default, a switch in Settings makes the app ask every
+  time it opens and after coming back from the background. The prompt is lifecycle-driven:
+  it restarts cleanly on resume, so the Unlock button cannot go dead after backgrounding.
 - **No screenshots, no Recents thumbnail.** The window is `FLAG_SECURE`, so the wallet is
   blocked from screenshots and screen recording and blanked in the recent-apps list. The
   recovery phrase forces it on even if the setting is off.
@@ -126,7 +128,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.0`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.1`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -154,7 +156,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 32 tests: BIP-39 vectors, endpoint rules, log rotation |
+| Unit tests | `./gradlew testDebugUnitTest` | 40 tests: BIP-39 vectors, endpoint rules, log rotation, lock lifecycle |
 | Android lint | `./gradlew lintDebug` | no errors |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
 | Package / label | `aapt2 dump badging app-debug.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |
@@ -168,7 +170,7 @@ app/src/main/java/com/jbitmstr/purewallet/
   WalletViewModel.kt         UI bridge
   core/                      node, seed, app lock, endpoint rules, log rotation, market data
   ui/                        home screen, lock screen, sheets, setup and scanner
-app/src/test/                BIP-39, endpoint and log rotation unit tests
+app/src/test/                BIP-39, endpoint, log rotation and lock lifecycle tests
 docs/icon.png                launcher icon artwork
 docs/preview.jpg             the screenshot above
 .github/workflows/apk.yml    CI build

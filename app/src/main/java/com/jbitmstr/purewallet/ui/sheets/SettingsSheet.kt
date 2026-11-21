@@ -267,15 +267,29 @@ fun SettingsSheet(
         SectionLabel("Security")
 
         SwitchRow(
-            title = "App lock",
+            title = "Lock on open",
             detail = if (lockAvailable) {
-                "Ask for your fingerprint or screen lock when the app opens and before sending funds."
+                "Off by default. When on, the app asks for your fingerprint or screen lock " +
+                    "every time it opens or comes back from the background."
             } else {
-                "Set a screen lock (PIN, pattern or password) on this phone to use the app lock."
+                "Set a screen lock (PIN, pattern or password) on this phone to lock the wallet."
             },
-            checked = state.appLockEnabled,
+            checked = state.lockOnOpen,
             enabled = lockAvailable,
-            onCheckedChange = { vm.setAppLockEnabled(it) }
+            onCheckedChange = { vm.setLockOnOpen(it) }
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            if (lockAvailable) {
+                "Sending funds, funding a channel and showing the recovery phrase always ask " +
+                    "for your fingerprint or screen lock before they go ahead."
+            } else {
+                "Without a screen lock on this phone the wallet cannot ask for authentication, " +
+                    "so those confirmations are skipped."
+            },
+            color = Pal.TextTertiary,
+            fontSize = 11.sp,
+            lineHeight = 15.sp
         )
         Spacer(Modifier.height(10.dp))
         SwitchRow(
