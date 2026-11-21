@@ -47,7 +47,7 @@ so a reinstall needs the previous build removed first.
   and ldk-node then fails the whole start with `FeerateEstimationUpdateTimeout`: so when the
   saved endpoint does not answer, the same start is retried on `https://mempool.space/api`
   and then `https://mempool.emzy.de/api`, and the node says which server it is reading. The
-  endpoint that came up last is tried second next time, so the timeout is not paid again. An
+  endpoint that came up last is remembered and tried ahead of the remaining fallbacks. An
   endpoint typed into Settings is the user's own choice and is never swapped for a public
   one. A different Esplora endpoint can be typed into Settings, and saving it restarts the
   node so the new source is in use right away instead of waiting for the next start.
