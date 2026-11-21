@@ -178,6 +178,26 @@ fun SettingsSheet(
                 )
             }
 
+            // A start that failed used to leave nothing but "Stopped" and ₿0 on screen.
+            // Whatever the node said goes right here, under the status it belongs to.
+            val nodeError = state.error
+            if (nodeError != null && !state.running) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "Could not start",
+                    color = Pal.Danger,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    nodeError,
+                    color = Pal.Danger,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
+                )
+            }
+
             Spacer(Modifier.height(14.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 GhostButton(
@@ -198,9 +218,10 @@ fun SettingsSheet(
             Spacer(Modifier.height(8.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 GhostButton(
-                    text = "Restart node",
+                    text = if (state.starting) "Starting…" else "Restart node",
                     onClick = { vm.restartNode() },
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    enabled = !state.starting
                 )
                 GhostButton(
                     text = "Stop node",

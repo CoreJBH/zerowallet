@@ -106,10 +106,16 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, openLockEnabled) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && openLockEnabled) {
-                unlocked = false
-                // Never leave the recovery phrase on screen behind a locked wallet.
-                backupWords = null
+            when (event) {
+                Lifecycle.Event.ON_STOP -> if (openLockEnabled) {
+                    unlocked = false
+                    // Never leave the recovery phrase on screen behind a locked wallet.
+                    backupWords = null
+                }
+                // Android can freeze or kill the node while the app is away, and a start
+                // that failed leaves nothing running. Coming back asks for it again.
+                Lifecycle.Event.ON_RESUME -> vm.onAppForeground()
+                else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -209,6 +215,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                 state = state,
                 onMenu = { sheet = ActiveSheet.SETTINGS },
                 onRefresh = { vm.refresh() },
+                onRestart = { vm.restartNode() },
                 onScan = {
                     scanPurpose = ScanPurpose.SEND
                     scanning = true

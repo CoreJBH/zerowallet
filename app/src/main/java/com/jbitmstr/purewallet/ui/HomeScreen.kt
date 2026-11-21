@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,6 +26,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -47,6 +49,7 @@ import com.jbitmstr.purewallet.ui.components.BoltGlyph
 import com.jbitmstr.purewallet.ui.components.CardSurface
 import com.jbitmstr.purewallet.ui.components.ChevronGlyph
 import com.jbitmstr.purewallet.ui.components.CircleIconButton
+import com.jbitmstr.purewallet.ui.components.GhostButton
 import com.jbitmstr.purewallet.ui.components.MenuGlyph
 import com.jbitmstr.purewallet.ui.components.PlusGlyph
 import com.jbitmstr.purewallet.ui.components.RefreshGlyph
@@ -61,6 +64,7 @@ fun HomeScreen(
     state: WalletState,
     onMenu: () -> Unit,
     onRefresh: () -> Unit,
+    onRestart: () -> Unit,
     onScan: () -> Unit,
     onSend: () -> Unit,
     onReceive: () -> Unit,
@@ -68,8 +72,15 @@ fun HomeScreen(
     onSwap: () -> Unit
 ) {
     var expanded by rememberSaveable { mutableStateOf(true) }
+    var dismissedError by rememberSaveable { mutableStateOf<String?>(null) }
     val completed = state.payments.filter { it.succeeded }
     val pending = state.payments.filter { it.status == "PENDING" }
+
+    // A wallet that comes up again starts with a clean slate.
+    LaunchedEffect(state.running) {
+        if (state.running) dismissedError = null
+    }
+    val nodeError = state.error?.takeIf { !state.running && it != dismissedError }
 
     LazyColumn(
         modifier = Modifier
@@ -79,6 +90,21 @@ fun HomeScreen(
         contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 6.dp, bottom = 48.dp)
     ) {
         item { TopBar(state, onMenu, onRefresh) }
+
+        if (nodeError != null) {
+            item {
+                Spacer(Modifier.height(16.dp))
+                NodeErrorBanner(
+                    message = nodeError,
+                    starting = state.starting,
+                    onRetry = {
+                        dismissedError = null
+                        onRestart()
+                    },
+                    onDismiss = { dismissedError = nodeError }
+                )
+            }
+        }
 
         item { Spacer(Modifier.height(20.dp)) }
 
@@ -121,6 +147,46 @@ fun HomeScreen(
 
         items(completed, key = { it.id }) { payment ->
             PaymentItem(payment, pending = false)
+        }
+    }
+}
+
+@Composable
+private fun NodeErrorBanner(
+    message: String,
+    starting: Boolean,
+    onRetry: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(Pal.Surface)
+            .border(1.dp, Pal.Danger.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+            .padding(14.dp)
+    ) {
+        Text(
+            "The node is not running",
+            color = Pal.Danger,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(message, color = Pal.TextSecondary, fontSize = 12.sp, lineHeight = 17.sp)
+        Spacer(Modifier.height(10.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GhostButton(
+                text = if (starting) "Starting…" else "Try again",
+                onClick = onRetry,
+                modifier = Modifier.weight(1f),
+                enabled = !starting
+            )
+            GhostButton(
+                text = "Dismiss",
+                onClick = onDismiss,
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }

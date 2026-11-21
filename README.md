@@ -74,6 +74,14 @@ so a reinstall needs the previous build removed first.
   from the recovery phrase. Android's own file picker saves it to Google Drive or anywhere
   else, or the share sheet does, with no Google Play Services and no OAuth. Restoring it on a
   replacement phone after entering the phrase brings the open channels back.
+- **A node that stays up and says why it stops.** A start that fails no longer leaves a bare
+  "Stopped" and a zero balance: the reason is shown under the node status in Settings and as
+  a banner on the home screen with a Try again button. If port 9735 cannot be bound (another
+  node holds it, or the phone refuses it), the node is started again without a listening
+  address so on-chain sync, payments and open channels keep working. Every start and stop
+  goes through one lock, so a restart picked while the node is coming up is queued instead
+  of dropped, and returning to the app brings back a node Android froze - unless it was
+  stopped on purpose.
 
 ## Security
 
@@ -120,6 +128,10 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
 
 - `core/NodeManager.kt` owns the single `Node` instance, its event loop and every wallet
   action. Balances, payments, channels and peers are read from the node, never invented.
+  A mutex serialises every start and stop.
+- `core/NodeLifecycle.kt` holds the start and stop rules as plain Kotlin - when a return to
+  the foreground brings the node back, when "Stop node" keeps it down, and the order of
+  listening attempts (port 9735, then none) - so they are unit tested without a phone.
 - `core/SecureStore.kt` encrypts the BIP-39 mnemonic with a non-exportable Keystore key and
   Android backup is disabled for the app, so the ciphertext never leaves the device.
 - `core/AppLock.kt` wraps `BiometricPrompt` with the screen-lock fallback and exposes the
@@ -153,7 +165,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.5`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.6`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -181,7 +193,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 108 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), backup encryption round trip and refusals, endpoint rules and the mainnet default, Esplora fee estimates, restart-on-endpoint-change, log rotation, lock lifecycle |
+| Unit tests | `./gradlew testDebugUnitTest` | 121 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), backup encryption round trip and refusals, endpoint rules and the mainnet default, Esplora fee estimates, restart-on-endpoint-change, node start/stop rules (foreground recovery, manual stop, port 9735 fallback), log rotation, lock lifecycle |
 | Android lint | `./gradlew lintDebug` | no errors |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
 | Package / label | `aapt2 dump badging app-debug.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |
@@ -193,9 +205,9 @@ app/src/main/java/com/jbitmstr/purewallet/
   MainActivity.kt            single activity host, screenshot blocking
   PureWalletApp.kt           application graph
   WalletViewModel.kt         UI bridge
-  core/                      node, seed, app lock, channel backup, endpoint rules, log rotation, market data
+  core/                      node, node lifecycle rules, seed, app lock, channel backup, endpoint rules, log rotation, market data
   ui/                        home screen, lock screen, sheets, word-box setup and scanner
-app/src/test/                BIP-39, restore-word grid, channel backup, endpoint, log rotation and lock lifecycle tests
+app/src/test/                BIP-39, restore-word grid, channel backup, endpoint, node lifecycle, log rotation and lock lifecycle tests
 docs/icon.png                launcher icon artwork
 docs/preview.jpg             the screenshot above
 .github/workflows/apk.yml    CI build
