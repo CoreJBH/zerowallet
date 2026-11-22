@@ -39,6 +39,7 @@ import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.PaymentInputKind
 import com.jbitmstr.purewallet.core.PaymentInputParser
 import com.jbitmstr.purewallet.core.ResolvedTarget
+import com.jbitmstr.purewallet.core.SendDraftFlow
 import com.jbitmstr.purewallet.core.WalletState
 import com.jbitmstr.purewallet.ui.components.Banner
 import com.jbitmstr.purewallet.ui.components.GhostButton
@@ -61,7 +62,7 @@ fun SendSheet(
     state: WalletState,
     initialText: String,
     backgrounded: Int,
-    onAuthorize: (String, () -> Unit) -> Unit,
+    onAuthorize: (String, (Boolean) -> Unit) -> Unit,
     onClose: () -> Unit,
     onScan: () -> Unit
 ) {
@@ -85,6 +86,20 @@ fun SendSheet(
 
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
+    // Whether the draft survives the app leaving the screen is a rule with more than one
+    // case in it (a send on its way, the device-lock prompt, a plain leave); it lives in
+    // [SendDraftFlow] so the cases are tested rather than argued about here.
+    val draftFlow = remember { SendDraftFlow() }
+
+    fun clearDraft() {
+        text = ""
+        target = null
+        amountText = ""
+        sendAll = false
+        viaLightning = true
+        error = null
+        highFee = null
+    }
 
     LaunchedEffect(initialText) {
         if (initialText.isNotBlank()) {
@@ -96,18 +111,14 @@ fun SendSheet(
 
     // The app went to the background: a request that was pasted, scanned or just reviewed is
     // a draft for one payment and does not stay on the screen for whoever picks the phone up
-    // next. A payment that is already running, and the id of one that went out, are left
-    // alone: the first must not be cancelled and the second is what the user came back for.
+    // next. Two things are not that: a payment that is already running (it must not be
+    // cancelled and its reference is what the user comes back to), and the device-lock prompt
+    // raised for this very payment, whose PIN screen is a system activity and therefore stops
+    // this one. [SendDraftFlow] decides, and a draft kept only for the prompt goes when the
+    // prompt ends without the user.
     LaunchedEffect(backgrounded) {
         if (backgrounded == 0) return@LaunchedEffect
-        if (busy || reference != null) return@LaunchedEffect
-        text = ""
-        target = null
-        amountText = ""
-        sendAll = false
-        viaLightning = true
-        error = null
-        highFee = null
+        if (draftFlow.onBackgrounded(paymentInFlight = busy || reference != null)) clearDraft()
     }
 
     val lightningRoute = target?.lightning != null && viaLightning
@@ -160,39 +171,50 @@ fun SendSheet(
     }
 
     fun dispatch(current: ResolvedTarget, amount: Long?) {
-        onAuthorize("Authenticate to send this payment.") {
-            scope.launch {
-                busy = true
-                error = null
-                // Send-all is only ever offered on an editable on-chain request (see
-                // [ResolvedTarget.allowsSendAll]); a fixed-amount QR is paid for exactly
-                // what it says even if the switch somehow ended up on.
-                val sendAllApplies = current.allowsSendAll && !lightningRoute
-                if (sendAllApplies && sendAll && isOnchainSend(current)) {
-                    val rate = feeRate
-                    if (rate == null) {
-                        error = "The fee estimate has not arrived yet. Wait a moment, then try again."
-                        busy = false
-                        return@launch
-                    }
-                    sentOverLightning = false
-                    vm.sendOnchain(
-                        address = current.input.address.orEmpty(),
-                        amountSats = null,
-                        sendAll = true,
-                        feeRateSatPerVb = rate
-                    )
-                } else {
-                    sentOverLightning =
-                        current.input.kind != PaymentInputKind.ONCHAIN || lightningRoute
-                    // The rate shown when the payment was confirmed is the rate it is signed
-                    // with: it is passed through rather than read again before signing, and
-                    // an on-chain send without one is refused instead of paying a fallback.
-                    vm.pay(current, amount, viaLightning, feeRate)
-                }.onSuccess { reference = it }.onFailure {
-                    error = it.message ?: "The payment could not be sent"
-                }
+        // The sheet is busy from here on: the prompt is part of sending, and a second tap
+        // while it is up must not start a second one.
+        busy = true
+        draftFlow.onAuthenticationStarted()
+        onAuthorize("Authenticate to send this payment.") { granted ->
+            if (!granted) {
+                // Nothing was sent. The draft stays unless the screen had already been left
+                // while the prompt was up, in which case [SendDraftFlow] says it goes now.
+                if (draftFlow.onAuthenticationFinished(granted = false)) clearDraft()
                 busy = false
+            } else {
+                draftFlow.onAuthenticationFinished(granted = true)
+                scope.launch {
+                    error = null
+                    // Send-all is only ever offered on an editable on-chain request (see
+                    // [ResolvedTarget.allowsSendAll]); a fixed-amount QR is paid for exactly
+                    // what it says even if the switch somehow ended up on.
+                    val sendAllApplies = current.allowsSendAll && !lightningRoute
+                    if (sendAllApplies && sendAll && isOnchainSend(current)) {
+                        val rate = feeRate
+                        if (rate == null) {
+                            error = "The fee estimate has not arrived yet. Wait a moment, then try again."
+                            busy = false
+                            return@launch
+                        }
+                        sentOverLightning = false
+                        vm.sendOnchain(
+                            address = current.input.address.orEmpty(),
+                            amountSats = null,
+                            sendAll = true,
+                            feeRateSatPerVb = rate
+                        )
+                    } else {
+                        sentOverLightning =
+                            current.input.kind != PaymentInputKind.ONCHAIN || lightningRoute
+                        // The rate shown when the payment was confirmed is the rate it is signed
+                        // with: it is passed through rather than read again before signing, and
+                        // an on-chain send without one is refused instead of paying a fallback.
+                        vm.pay(current, amount, viaLightning, feeRate)
+                    }.onSuccess { reference = it }.onFailure {
+                        error = it.message ?: "The payment could not be sent"
+                    }
+                    busy = false
+                }
             }
         }
     }

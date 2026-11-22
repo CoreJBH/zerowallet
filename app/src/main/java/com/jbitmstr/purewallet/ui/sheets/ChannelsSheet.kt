@@ -54,7 +54,7 @@ fun ChannelsSheet(
     vm: WalletViewModel,
     state: WalletState,
     initialPeer: String,
-    onAuthorize: (String, () -> Unit) -> Unit,
+    onAuthorize: (String, (Boolean) -> Unit) -> Unit,
     onScan: () -> Unit,
     onClose: () -> Unit
 ) {

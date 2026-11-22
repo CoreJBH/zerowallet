@@ -46,6 +46,7 @@ import com.jbitmstr.purewallet.BuildConfig
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /** One row of the history list. */
 data class PaymentRow(
@@ -249,6 +250,15 @@ class NodeManager(context: Context) {
      */
     private val nodeMutex = Mutex()
 
+    /**
+     * Which wallet this process is on, bumped every time the stored phrase is replaced.
+     *
+     * A start that was asked for under one epoch and reaches the node afterwards belongs to a
+     * wallet that is gone (wiped, or replaced by a restore), and must not bring a node up on
+     * a phrase the wallet no longer holds. See [requestStart].
+     */
+    private val walletEpoch = AtomicLong(0L)
+
     /** Starts that are running or waiting for [nodeMutex]; at most one is worth queueing. */
     private val queuedStarts = AtomicInteger(0)
 
@@ -278,8 +288,13 @@ class NodeManager(context: Context) {
         val snapshot = _state.value
         when (lifecycle.foregroundAction(snapshot.seedPresent, snapshot.running, snapshot.starting)) {
             ForegroundAction.REFRESH -> scope.launch { refreshInternal(userInitiated = false) }
-            ForegroundAction.START -> {
-                val seed = seedOrNull() ?: return
+            ForegroundAction.START -> scope.launch {
+                // Leaving the screen dropped the copy of the phrase this process had opened,
+                // so this read goes back to the Keystore - and this function runs on the
+                // lifecycle callback's thread, which is the main one. A Keystore read there
+                // is a main-thread stall right when the user is waiting for their wallet, so
+                // it is done on the IO dispatcher like the rest of the node work.
+                val seed = withContext(Dispatchers.IO) { seedOrNull() } ?: return@launch
                 requestStart(seed)
             }
             ForegroundAction.NONE -> Unit
@@ -476,28 +491,46 @@ class NodeManager(context: Context) {
         }
     }
 
-    /** Creates a new wallet from SecureRandom entropy and returns the words. */
+    /**
+     * Creates a new wallet from SecureRandom entropy and returns the words.
+     *
+     * The wallet transition runs under [nodeMutex], the way a restore does: without it two
+     * taps, or a create crossing a start or a wipe, could both find "no wallet" here, both
+     * seal a phrase and both bring a node up on a different one - leaving a node store that
+     * belongs to neither of them.
+     *
+     * The start itself is queued after the lock is released rather than awaited under it. The
+     * words are the only copy of the wallet until the user has written them down, so they
+     * have to reach the screen even when the chain source is slow and the first start takes
+     * its time; a restore can wait, because the user already has its phrase. The start
+     * carries the epoch it was created under, so one a wipe or a restore overtook before it
+     * got the lock cannot bring a node up on the phrase that used to be here.
+     */
     suspend fun createWallet(wordCount: Int = 12): String = withContext(Dispatchers.IO) {
-        check(!secureStore.hasSeed()) { "A wallet already exists on this device" }
-        val mnemonic = Bip39.randomMnemonic(wordCount)
-        // Sealing the phrase means generating a Keystore key pair, which is slow enough to
-        // be felt on the main thread and must not run there.
-        secureStore.saveSeed(mnemonic)
-        openedSeed = mnemonic
-        prefs.seedBackedUp = false
-        prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
-        // A new wallet starts with nothing; an older snapshot must not show through, on
-        // this chain or on any other one it was left under.
-        prefs.clearAllCachedWallets()
-        _state.update {
-            it.copy(
-                seedPresent = true,
-                backedUp = false,
-                setupRequired = false,
-                seedProtection = protectionStatus()
-            )
+        val (mnemonic, epoch) = nodeMutex.withLock {
+            check(!secureStore.hasSeed()) { "A wallet already exists on this device" }
+            val generated = Bip39.randomMnemonic(wordCount)
+            // Sealing the phrase means generating a Keystore key pair, which is slow enough to
+            // be felt on the main thread and must not run there.
+            secureStore.saveSeed(generated)
+            openedSeed = generated
+            val created = walletEpoch.incrementAndGet()
+            prefs.seedBackedUp = false
+            prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
+            // A new wallet starts with nothing; an older snapshot must not show through, on
+            // this chain or on any other one it was left under.
+            prefs.clearAllCachedWallets()
+            _state.update {
+                it.copy(
+                    seedPresent = true,
+                    backedUp = false,
+                    setupRequired = false,
+                    seedProtection = protectionStatus()
+                )
+            }
+            Pair(generated, created)
         }
-        startNode(mnemonic)
+        requestStart(mnemonic, epoch)
         mnemonic
     }
 
@@ -527,6 +560,9 @@ class NodeManager(context: Context) {
                 clearNodeData()
                 secureStore.saveSeed(normalized)
                 openedSeed = normalized
+                // A different wallet: any start still waiting for the lock was asked for by
+                // the one this phrase replaces.
+                walletEpoch.incrementAndGet()
                 prefs.seedBackedUp = true
                 prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
                 // The phrase may belong to another wallet than the one this snapshot was taken from,
@@ -990,9 +1026,24 @@ class NodeManager(context: Context) {
         }
     }
 
+    /**
+     * A refresh owed to a node event, coalesced.
+     *
+     * One payment raises several events in a row (`PaymentClaimable`, then
+     * `PaymentSuccessful`, then the channel update), and each one used to queue its own
+     * delayed refresh: several full syncs of which the last made the rest pointless. Each new
+     * event replaces the refresh that is still waiting, so a burst settles into one sync.
+     */
+    private var pendingRefresh: Job? = null
+
     private fun scheduleRefresh() {
-        scope.launch {
-            delay(1_500)
+        pendingRefresh?.cancel()
+        pendingRefresh = scope.launch {
+            delay(REFRESH_SETTLE_MILLIS)
+            // The wait is over: from here this job is the sync itself, so it stops being the
+            // pending one. A later event must not cancel a sync that is already talking to
+            // the node; it schedules the next one instead.
+            if (pendingRefresh === coroutineContext[Job]) pendingRefresh = null
             refreshInternal(userInitiated = false)
         }
     }
@@ -1004,15 +1055,23 @@ class NodeManager(context: Context) {
     }
 
     fun restartNode() {
-        val seed = seedOrNull() ?: return
-        requestStart(seed)
+        scope.launch {
+            // The phrase may have to come back out of the Keystore, which is a blocking call:
+            // this is reached from a button on the main thread.
+            val seed = withContext(Dispatchers.IO) { seedOrNull() } ?: return@launch
+            requestStart(seed)
+        }
     }
 
     /**
      * Queues one start. A second request while a start is running or waiting is dropped: the
      * node coming up once is what the caller wants, not a restart loop.
+     *
+     * [requestedAt] is the wallet epoch this start was asked under. A start that waited for
+     * the lock while the phrase was replaced (a wipe, or a restore) is dropped instead of
+     * building a node on a phrase that is no longer the wallet's.
      */
-    private fun requestStart(mnemonic: String) {
+    private fun requestStart(mnemonic: String, requestedAt: Long = walletEpoch.get()) {
         lifecycle.onUserStart()
         prefs.nodeStoppedByUser = false
         if (queuedStarts.incrementAndGet() > 1) {
@@ -1026,6 +1085,13 @@ class NodeManager(context: Context) {
             var counted = true
             try {
                 nodeMutex.withLock {
+                    if (requestedAt != walletEpoch.get()) {
+                        // The wallet was replaced while this start waited. The node that is
+                        // here now is the new wallet's business, so this start ends quietly
+                        // instead of building a node the wallet would have to throw away.
+                        _state.update { it.copy(starting = false, busy = null) }
+                        return@withLock
+                    }
                     startNodeLocked(mnemonic)
                     // Counted out while the lock is still held: whoever stops the node next
                     // and starts it again is not mistaken for a duplicate of this start.
@@ -1088,6 +1154,7 @@ class NodeManager(context: Context) {
                 runCatching { File(appContext.filesDir, "logs").deleteRecursively() }
                 runCatching { File(appContext.cacheDir, "backups").deleteRecursively() }
                 openedSeed = null
+                walletEpoch.incrementAndGet()
                 runCatching { secureStore.clear() }
                 runCatching { SecretStore.deleteKey() }
                 runCatching { notes.clear() }
@@ -1108,9 +1175,8 @@ class NodeManager(context: Context) {
 
     fun switchNetwork(network: ChainNetwork) {
         if (network == prefs.network) return
-        val seed = seedOrNull()
         scope.launch {
-            nodeMutex.withLock {
+            val seed = nodeMutex.withLock {
                 stopNodeLocked(keepState = false)
                 prefs.network = network
                 _state.update {
@@ -1132,6 +1198,10 @@ class NodeManager(context: Context) {
                 }
                 // Show what this chain last looked like, if it was used before.
                 _state.update { WalletCache.applyTo(it, prefs.cachedWallet(network)) }
+                // Read under the lock, and so off the caller's (main) thread: this was a
+                // synchronous Keystore call on the settings sheet's thread, and it is the
+                // slow kind of read whenever backgrounding dropped the opened phrase.
+                seedOrNull()
             }
             _messages.tryEmit("Switched to ${network.title}")
             if (seed != null) requestStart(seed)
@@ -1809,6 +1879,9 @@ class NodeManager(context: Context) {
 
         /** How long a stopping node waits for its event loop to leave the native call. */
         private const val EVENT_LOOP_STOP_MILLIS = 2_000L
+
+        /** How long a burst of node events is given to settle before one refresh runs. */
+        private const val REFRESH_SETTLE_MILLIS = 1_500L
     }
 }
 

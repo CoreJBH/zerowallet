@@ -72,7 +72,7 @@ fun SettingsSheet(
     state: WalletState,
     lockAvailable: Boolean,
     onBackup: () -> Unit,
-    onAuthorize: (String, () -> Unit) -> Unit,
+    onAuthorize: (String, (Boolean) -> Unit) -> Unit,
     onClose: () -> Unit
 ) {
     var esplora by remember(state.esploraUrl) { mutableStateOf(state.esploraUrl) }

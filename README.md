@@ -226,7 +226,19 @@ so a reinstall needs the previous build removed first.
 - **One lock around the node.** Every JNI call into ldk-node runs on an IO thread while the
   node is held by the same mutex that serialises starts and stops, so a stop, wipe or
   restart can never destroy a node a sync or payment is still using. A stop also waits for
-  the event loop to leave its blocking native call before the node is destroyed.
+  the event loop to leave its blocking native call before the node is destroyed. Creating a
+  wallet takes that lock too, together with restoring, wiping and switching chains, so two
+  taps can never seal two different phrases under one wallet; a start that a wipe or a
+  restore overtook while it waited is dropped rather than building a node on the phrase that
+  used to be here. Opening the sealed phrase is a Keystore call, so the paths that may have
+  to do it (coming back to the screen, restarting the node, switching chains) do it on the IO
+  thread instead of the one drawing the screen.
+- **A send draft survives only the lock prompt.** Leaving the screen with a pasted request or
+  a reviewed amount drops it, so it is never waiting for whoever picks the phone up next. The
+  device-lock prompt is the exception: the PIN / pattern screen is a system activity, so the
+  wallet's own activity stops while it is up, which looked exactly like leaving. The draft is
+  kept while the prompt for that payment is in charge - and dropped anyway if the prompt ends
+  without the user. A send already on its way is never cancelled by any of it.
 - **Wipe leaves nothing readable.** Wiping the wallet asks for the same proof as a payment
   first, then deletes the seed, the Android Keystore keys that sealed it (both halves), every
   chain's node data, the sealed payment notes, the settings (sealed balance cache included),
@@ -274,7 +286,8 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
 - `core/NodeLifecycle.kt` holds the start and stop rules as plain Kotlin - when a return to
   the foreground brings the node back, when it only resyncs, when "Stop node" keeps it down,
   and the order of listening attempts (port 9735, then none) - so they are unit tested
-  without a phone.
+  without a phone. `core/SendDraftFlow.kt` does the same for the send screen's draft: a
+  payment in flight, the lock prompt, and a real leave are three different cases.
 - `core/EsploraFallback.kt` orders the endpoints a start tries and tells a chain-source
   failure from a Lightning-port failure, with no Android APIs so it is unit tested.
 - `core/WalletCache.kt` encodes the last known balances and history and hydrates the wallet
@@ -322,7 +335,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.14`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.15`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -357,7 +370,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 234 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate BIP-21 amount refusal, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate |
+| Unit tests | `./gradlew testDebugUnitTest` | 242 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate BIP-21 amount refusal, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate |
 | Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
 | Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
@@ -372,7 +385,7 @@ app/src/main/java/com/jbitmstr/purewallet/
   WalletViewModel.kt         UI bridge
   core/                      node, node lifecycle rules, seed, app lock, channel backup, endpoint rules, log rotation, market data
   ui/                        home screen, lock screen, sheets, word-box setup and scanner
-app/src/test/                BIP-39, restore-word grid, channel backup, endpoint, node lifecycle, log rotation and lock lifecycle tests
+app/src/test/                BIP-39, restore-word grid, channel backup, endpoint, node lifecycle, send draft, log rotation and lock lifecycle tests
 docs/icon.png                launcher icon artwork
 docs/preview.jpg             the screenshot above
 .github/workflows/apk.yml    CI build

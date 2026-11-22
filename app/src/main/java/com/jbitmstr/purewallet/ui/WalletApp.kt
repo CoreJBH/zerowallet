@@ -202,18 +202,25 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
      * wallet asks for the lock to be set instead. Letting it through would leave every
      * sensitive action open to whoever is holding the phone, which is exactly the case this
      * check exists for.
+     *
+     * [action] is told how it ended, not just called on success: a sheet that holds a draft
+     * has to know that the authentication was cancelled rather than still being in flight,
+     * because the system's PIN screen takes the app off screen while it is up. Every path
+     * answers exactly once - authenticated, cancelled, or no lock to authenticate with.
      */
-    val authorize: (String, () -> Unit) -> Unit = { reason, action ->
+    val authorize: (String, (Boolean) -> Unit) -> Unit = { reason, action ->
         val lock = appLock
         val available = lock?.isAvailable() == true
         lockAvailable = available
         if (lock == null || !available) {
             needsScreenLock = true
+            action(false)
         } else {
             lock.authenticate("Confirm it's you", reason) { ok ->
                 if (ok) {
-                    action()
+                    action(true)
                 } else {
+                    action(false)
                     scope.launch { snackbarHostState.showSnackbar("Authentication was not completed.") }
                 }
             }
