@@ -73,8 +73,15 @@ so a reinstall needs the previous build removed first.
   QR rendering for everything the wallet hands out.
 - **Live fiat value.** BTC/KRW (with a USD fallback) from public price endpoints, and a
   graceful dash instead of a stale number when the phone is offline.
-- **Real history.** Payments are read from the node's own database; local invoice notes
-  stay on the device.
+- **Gossip from peers, or a snapshot of this chain.** The node learns the channel graph from
+  its peers by default. Rapid Gossip Sync can be switched on in Settings, and the snapshot
+  server is chosen per chain: the mainnet URL on mainnet, the testnet URL on Testnet3, and
+  none at all on signet, which has no server of its own and keeps to peers instead of
+  downloading another chain's graph.
+- **Real history, failures included.** Payments are read from the node's own database; local
+  invoice notes stay on the device. A payment that failed is listed as `Failed` rather than
+  hidden: it is the record that the attempt happened, and what keeps a failed Lightning
+  payment from looking like one that was never made - and so being sent twice.
 - **12 or 24 words.** A new wallet can be created from 128-bit (12 words) or 256-bit
   (24 words) entropy; both restore the same way.
 - **One numbered box per word when restoring.** The phrase is entered in a 12- or 24-box grid
@@ -128,6 +135,16 @@ so a reinstall needs the previous build removed first.
   security settings, and receiving keeps working. The same answer is given when the system
   reports it cannot authenticate right now. Whether a lock exists is re-read on every
   resume, so removing it outside the app is noticed at once rather than after a restart.
+  The prompt's answer is what decides: each of those actions is passed to an `Authorization`
+  that has no other way to run its body, so it runs only when the prompt reported success.
+  Cancelling the prompt, dismissing it, or having no lock to ask with runs none of it - the
+  body is not reachable from the answer.
+- **An unanswered prompt is answered anyway.** The send sheet is busy from the moment its
+  prompt opens, so a caller waiting on the lock is told how it ended in every case: a result,
+  a cancel, a prompt superseded or thrown away with the screen. Android dismisses its own
+  biometric dialog when the app goes to the background and may never call back, and the
+  system's error for a prompt this app cancelled belongs to a stale token; both are reported
+  as "not authenticated" instead of leaving the sheet busy with no prompt on screen.
 - **The seed is bound to the phone's lock, in the Keystore itself.** On Android 8 and later
   (this app's minimum is API 26) on a phone with a screen lock, the key that decrypts the
   recovery phrase is created with `setUserAuthenticationRequired(true)` and a 60-second
@@ -146,8 +163,10 @@ so a reinstall needs the previous build removed first.
   phrase sealed with a key that opens without the device lock. That state is read back from
   the Keystore entry itself (not from a flag written at creation) and shown in Settings as
   "Recovery phrase key: not bound to the screen lock", with what it means and what would fix
-  it. The screen-based checks on sending, showing the phrase and wiping still apply, and this
-  is now visible instead of being a silent downgrade.
+  it. The same warning is on the home screen, where the wallet is actually opened, so the
+  state cannot pass unnoticed by anyone who never opens Settings. The screen-based checks on
+  sending, showing the phrase and wiping still apply, and this is now visible instead of
+  being a silent downgrade.
 - **A screen-lock change is reported, not hidden.** Removing or resetting the phone's lock
   invalidates that key by design, and the ciphertext cannot be opened by anything on the
   device afterwards. The wallet says exactly that and sends the user to restore with the
@@ -168,10 +187,18 @@ so a reinstall needs the previous build removed first.
   authentication instead of answering from a backgrounded process's memory.
 - **What is stored on disk and why.** The BIP-39 mnemonic lives only as AES-256-GCM
   ciphertext under a non-exportable Keystore key; nothing plaintext is written by the app.
-  The one exception is upstream: ldk-node keeps its own seed material (`keys_seed`) in the
-  app's `noBackupFilesDir`, an `ldk-node` requirement for holding Lightning channel state,
-  and it is protected by Android's app sandbox plus `allowBackup="false"` rather than by
-  this app's own lock. Lock-on-open stays off by default - an opt-in in Settings - because
+  The one exception is upstream. ldk-node's node store, in the app's private file directory
+  (`filesDir/ldk-node/<chain>`), holds the key material its Lightning channels and on-chain
+  wallet need, derived from the phrase - a node built with the library's default entropy
+  source keeps a `keys_seed` file there, and this app hands the library the mnemonic itself
+  instead, so that file is not written at all. Either way the library does not seal what it
+  keeps with the Keystore key the phrase uses. What protects it is the Android app sandbox, exactly and only that:
+  another app cannot read the directory, `allowBackup="false"` keeps it out of cloud backups
+  and device-to-device transfer, and the release build is not `android:debuggable`, so there
+  is no `run-as` or adb path to it on a device that is not rooted. A rooted phone, or one
+  whose app data is copied while unlocked, exposes it - the limitation every non-custodial
+  Android wallet shares, and the reason the node store leaves this phone only as the
+  encrypted `.zwbackup`. Lock-on-open stays off by default - an opt-in in Settings - because
   sending, showing the phrase and wiping always authenticate on their own.
 - **No screenshots, no Recents thumbnail.** The window is `FLAG_SECURE`, so the wallet is
   blocked from screenshots and screen recording and blanked in the recent-apps list. The
@@ -214,6 +241,11 @@ so a reinstall needs the previous build removed first.
 - **Duplicate BIP-21 amounts are refused.** BIP-21 does not say which `amount` wins, so a QR
   with two of them can be read as a different payment by another wallet. The send screen
   refuses the request and says why instead of picking one of the numbers.
+- **A BIP-21 amount that cannot be read is refused too.** `amount=abc`, `amount=1e-3`, a
+  negative or zero sum, more than eight decimals, or an amount above the 21 million supply
+  refuses the whole request with a sentence saying so. Reading it as "no amount" would put
+  the payer in front of an editable box on a request that named a sum, and the number they
+  then type is not the one the receiver asked for.
 - **BOLT12 stays on its chain.** A BOLT12 invoice names its chain by genesis hash and an offer
   by the chains it accepts; both are checked against the running network before the payment
   screen, along with the bech32 shape of the string (`lno1`/`lni1` with a valid data part), so
@@ -335,7 +367,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.15`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.16`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -370,7 +402,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 242 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate BIP-21 amount refusal, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate |
+| Unit tests | `./gradlew testDebugUnitTest` | 268 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate and unreadable BIP-21 amounts, the authorization gate that runs a privileged action only on a reported success, an abandoned prompt answering its caller, the per-chain RGS URL, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate |
 | Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
 | Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
 | English-only repository | `python3 verify-english.py` | no non-English characters |

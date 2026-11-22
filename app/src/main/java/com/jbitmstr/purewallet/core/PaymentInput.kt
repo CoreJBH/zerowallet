@@ -230,6 +230,9 @@ object PaymentInputParser {
     /** Characters bech32 data may use; `1` is only the separator. */
     private const val BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
+    /** Decimals in one bitcoin: a satoshi is the smallest amount an invoice can name. */
+    private const val SATS_DECIMALS = 8
+
     /**
      * Shortest string this wallet treats as BOLT12. A real offer carries a 33-byte signing
      * key, a description and a signature, so it is several hundred characters; this is only
@@ -261,7 +264,11 @@ object PaymentInputParser {
                         // number the receiver meant.
                         if (amountSeen) return duplicateAmount(text)
                         amountSeen = true
-                        amountSats = Fmt.parseBtcToSats(value)
+                        // An amount that cannot be read is refused, not dropped: treating it
+                        // as "no amount" would show an editable box and let the payer send a
+                        // sum of their own to a request that named one.
+                        amountSats = parseBip21Amount(value)
+                            ?: return unreadableAmount(text, value)
                     }
                     "label" -> label = value.ifBlank { null }
                     "message" -> message = value.ifBlank { null }
@@ -289,6 +296,38 @@ object PaymentInputParser {
         raw = text,
         rejection = "This payment request carries more than one amount. Wallets read that " +
             "differently, so it is not paid here. Ask for a new QR or a Lightning invoice."
+    )
+
+    /**
+     * The `amount=` of a BIP-21 request in satoshis, or null when it is not an amount this
+     * wallet can read.
+     *
+     * BIP-21 spells the amount as whole bitcoin in plain decimal - digits with at most one
+     * dot - so that is the only shape accepted here: no exponent, no comma, no sign. More
+     * decimals than a satoshi has are refused too. Rounding them down would quietly pay a
+     * different sum than the one the receiver asked for, and rounding up would pay more.
+     */
+    private fun parseBip21Amount(value: String): Long? {
+        val cleaned = value.trim()
+        if (cleaned.isEmpty()) return null
+        if (!cleaned.all { it.isDigit() || it == '.' }) return null
+        if (cleaned.count { it == '.' } > 1) return null
+        val fraction = cleaned.substringAfter('.', "").trimEnd('0')
+        if (fraction.length > SATS_DECIMALS) return null
+        return Fmt.parseBtcToSats(cleaned)
+    }
+
+    /**
+     * A request that names an amount this wallet cannot read. It is refused whole: falling
+     * through to the address alone would turn a fixed sum into an editable one.
+     */
+    private fun unreadableAmount(text: String, value: String) = PaymentInput(
+        kind = PaymentInputKind.UNKNOWN,
+        raw = text,
+        rejection = "This payment request carries an amount this wallet cannot read " +
+            "(amount=${value.take(24)}). An amount is plain bitcoin with at most 8 " +
+            "decimals, so the sum is not guessed here - ask for a new QR code or a " +
+            "Lightning invoice."
     )
 
     private fun decode(value: String): String = try {

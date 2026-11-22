@@ -32,6 +32,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jbitmstr.purewallet.WalletViewModel
+import com.jbitmstr.purewallet.core.Authorization
 import com.jbitmstr.purewallet.core.ChannelRow
 import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.WalletState
@@ -54,7 +55,7 @@ fun ChannelsSheet(
     vm: WalletViewModel,
     state: WalletState,
     initialPeer: String,
-    onAuthorize: (String, (Boolean) -> Unit) -> Unit,
+    authorization: Authorization,
     onScan: () -> Unit,
     onClose: () -> Unit
 ) {
@@ -73,7 +74,7 @@ fun ChannelsSheet(
             error = "Enter a channel size in sats"
             return
         }
-        onAuthorize("Authenticate to fund this channel.") {
+        authorization.guarded("Authenticate to fund this channel.") {
             scope.launch {
                 busy = true
                 error = null
@@ -244,7 +245,9 @@ fun ChannelsSheet(
                 TextButton(onClick = {
                     val target = channel
                     closing = null
-                    onAuthorize(if (forceClose) "Authenticate to force close this channel." else "Authenticate to close this channel.") {
+                    authorization.guarded(
+                        if (forceClose) "Authenticate to force close this channel." else "Authenticate to close this channel."
+                    ) {
                         scope.launch {
                             vm.closeChannel(target, forceClose).onFailure {
                                 error = it.message ?: "Could not close the channel"

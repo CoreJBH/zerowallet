@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.sp
 import com.jbitmstr.purewallet.core.ChainNetwork
 import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.PaymentRow
+import com.jbitmstr.purewallet.core.SecureStore
 import com.jbitmstr.purewallet.core.WalletState
 import com.jbitmstr.purewallet.ui.components.ActionButton
 import com.jbitmstr.purewallet.ui.components.ArrowGlyph
@@ -75,6 +76,16 @@ fun HomeScreen(
     var dismissedError by rememberSaveable { mutableStateOf<String?>(null) }
     val completed = state.payments.filter { it.succeeded }
     val pending = state.payments.filter { it.status == "PENDING" }
+    // A payment that did not go through is part of the history too. Hiding it left the user
+    // with no record of having tried at all, and the usual next step for a payment that
+    // looks like it never happened is to send it again - which is how a Lightning payment
+    // that failed once gets paid twice. It is listed with its status instead.
+    val failed = state.payments.filter { !it.succeeded && it.status != "PENDING" }
+    // The phrase is sealed either way, but a key that opens without the device lock is worth
+    // saying out loud on the one screen the user actually opens: Settings reports it, and
+    // until now that was the only place it showed.
+    val unboundKey = state.seedProtection
+        ?.takeIf { it.level == SecureStore.SeedProtection.UNBOUND }
 
     // A wallet that comes up again starts with a clean slate.
     LaunchedEffect(state.running) {
@@ -106,6 +117,13 @@ fun HomeScreen(
             }
         }
 
+        if (unboundKey != null) {
+            item {
+                Spacer(Modifier.height(16.dp))
+                UnboundKeyBanner(detail = unboundKey.detail, onOpenSettings = onMenu)
+            }
+        }
+
         item { Spacer(Modifier.height(20.dp)) }
 
         item {
@@ -133,7 +151,7 @@ fun HomeScreen(
 
         item { Spacer(Modifier.height(22.dp)) }
 
-        item { SectionLabel("Completed") }
+        item { SectionLabel("History") }
 
         if (pending.isNotEmpty()) {
             items(pending, key = { "pending-" + it.id }) { payment ->
@@ -141,13 +159,66 @@ fun HomeScreen(
             }
         }
 
-        if (completed.isEmpty() && pending.isEmpty()) {
+        if (failed.isNotEmpty()) {
+            items(failed, key = { "failed-" + it.id }) { payment ->
+                PaymentItem(payment, failed = true)
+            }
+        }
+
+        if (completed.isEmpty() && pending.isEmpty() && failed.isEmpty()) {
             item { EmptyHistory() }
         }
 
         items(completed, key = { it.id }) { payment ->
             PaymentItem(payment, pending = false)
         }
+    }
+}
+
+/**
+ * The one warning that can be about the wallet itself: the stored phrase is sealed with a key
+ * that opens without the device lock. The sentences come from [SecureStore], which reads the
+ * Keystore rather than trusting a flag, and the button leads to the settings sheet that says
+ * what would fix it.
+ */
+@Composable
+private fun UnboundKeyBanner(detail: String?, onOpenSettings: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(Pal.Surface)
+            .border(1.dp, Pal.Warning.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+            .padding(14.dp)
+    ) {
+        Text(
+            "Recovery phrase key is not bound to the screen lock",
+            color = Pal.Warning,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            detail ?: ("The phrase on this phone is sealed by the Android Keystore, but that " +
+                "key opens without your screen lock."),
+            color = Pal.TextSecondary,
+            fontSize = 12.sp,
+            lineHeight = 17.sp
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Sending, showing the phrase and wiping still ask for your fingerprint or screen " +
+                "lock first. This is about what protects the sealed copy itself.",
+            color = Pal.TextTertiary,
+            fontSize = 11.sp,
+            lineHeight = 15.sp
+        )
+        Spacer(Modifier.height(10.dp))
+        GhostButton(
+            text = "What would fix it",
+            onClick = onOpenSettings,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
@@ -354,7 +425,7 @@ private fun BalanceRow(
 }
 
 @Composable
-private fun PaymentItem(payment: PaymentRow, pending: Boolean) {
+private fun PaymentItem(payment: PaymentRow, pending: Boolean = false, failed: Boolean = false) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -378,7 +449,7 @@ private fun PaymentItem(payment: PaymentRow, pending: Boolean) {
         Column(Modifier.weight(1f)) {
             Text(
                 if (payment.incoming) "You received" else "You sent",
-                color = Pal.TextPrimary,
+                color = if (failed) Pal.TextSecondary else Pal.TextPrimary,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium
             )
@@ -399,14 +470,22 @@ private fun PaymentItem(payment: PaymentRow, pending: Boolean) {
             val sign = if (payment.incoming) "+" else "-"
             Text(
                 sign + Fmt.sats(payment.amountSats),
-                color = if (payment.incoming) Pal.Positive else Pal.TextPrimary,
+                color = when {
+                    failed -> Pal.TextTertiary
+                    payment.incoming -> Pal.Positive
+                    else -> Pal.TextPrimary
+                },
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium
             )
             Spacer(Modifier.height(2.dp))
             Text(
-                if (pending) "Pending" else Fmt.date(payment.timestampSecs),
-                color = Pal.TextTertiary,
+                when {
+                    pending -> "Pending"
+                    failed -> "Failed"
+                    else -> Fmt.date(payment.timestampSecs)
+                },
+                color = if (failed) Pal.Danger else Pal.TextTertiary,
                 fontSize = 12.sp
             )
         }

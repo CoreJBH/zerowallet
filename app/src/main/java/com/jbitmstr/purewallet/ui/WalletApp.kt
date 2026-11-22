@@ -32,6 +32,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.AppLock
 import com.jbitmstr.purewallet.core.AppLockGate
+import com.jbitmstr.purewallet.core.Authorization
 import com.jbitmstr.purewallet.core.DeviceLockSettings
 import com.jbitmstr.purewallet.core.ScreenSecurity
 import com.jbitmstr.purewallet.ui.screens.LockedScreen
@@ -203,12 +204,14 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
      * sensitive action open to whoever is holding the phone, which is exactly the case this
      * check exists for.
      *
-     * [action] is told how it ended, not just called on success: a sheet that holds a draft
-     * has to know that the authentication was cancelled rather than still being in flight,
-     * because the system's PIN screen takes the app off screen while it is up. Every path
-     * answers exactly once - authenticated, cancelled, or no lock to authenticate with.
+     * The answer is delivered, not thrown away. [Authorization] is the only way a screen gets
+     * to run a privileged body, and it runs that body only for a reported success; every
+     * path answers exactly once - authenticated, cancelled, or no lock to authenticate with -
+     * because a sheet that holds a draft has to know that the authentication was cancelled
+     * rather than still being in flight (the system's PIN screen takes the app off screen
+     * while it is up).
      */
-    val authorize: (String, (Boolean) -> Unit) -> Unit = { reason, action ->
+    val authorization = Authorization { reason, action ->
         val lock = appLock
         val available = lock?.isAvailable() == true
         lockAvailable = available
@@ -376,12 +379,12 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
             state = state,
             lockAvailable = lockAvailable,
             onBackup = {
-                authorize("Authenticate to view your recovery phrase.") {
+                authorization.guarded("Authenticate to view your recovery phrase.") {
                     backupWords = vm.revealSeed()
                     backupVerify = !state.backedUp
                 }
             },
-            onAuthorize = authorize,
+            authorization = authorization,
             onClose = { sheet = ActiveSheet.NONE }
         )
         ActiveSheet.SEND -> SendSheet(
@@ -389,7 +392,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
             state = state,
             initialText = sendPrefill,
             backgrounded = backgrounded,
-            onAuthorize = authorize,
+            authorization = authorization,
             onClose = { sheet = ActiveSheet.NONE },
             onScan = {
                 sheet = ActiveSheet.NONE
@@ -402,7 +405,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
             state = state,
             backgrounded = backgrounded,
             onBackup = {
-                authorize("Authenticate to view your recovery phrase.") {
+                authorization.guarded("Authenticate to view your recovery phrase.") {
                     backupWords = vm.revealSeed()
                     backupVerify = !state.backedUp
                 }
@@ -413,7 +416,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
             vm = vm,
             state = state,
             initialPeer = peerPrefill,
-            onAuthorize = authorize,
+            authorization = authorization,
             onScan = {
                 sheet = ActiveSheet.NONE
                 scanPurpose = ScanPurpose.PEER

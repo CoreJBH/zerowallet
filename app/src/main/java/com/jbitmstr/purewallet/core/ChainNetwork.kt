@@ -20,6 +20,17 @@ enum class ChainNetwork(
     val explorerTxUrl: String,
     val ticker: String,
     /**
+     * The Rapid Gossip Sync server for this chain, or null when the chain has none.
+     *
+     * RGS is served per chain, and a snapshot URL names the chain it belongs to: the mainnet
+     * URL on a test chain downloads a graph of a different network, which the node either
+     * rejects or routes from - silently, and until a payment fails to find a path. So the URL
+     * is chosen here, next to the chain, and a chain without a server (signet, as of this
+     * writing: the LDK project serves mainnet and testnet snapshots and answers 404 for
+     * signet) is left with peer-to-peer gossip instead of borrowing another chain's.
+     */
+    val rgsUrl: String?,
+    /**
      * Hash of block 0 on this chain, as hex.
      *
      * BOLT12 does not carry a network name: a BOLT12 invoice names the chain it is for by
@@ -41,6 +52,7 @@ enum class ChainNetwork(
         ),
         explorerTxUrl = "https://mempool.space/tx/",
         ticker = "BTC",
+        rgsUrl = "https://rapidsync.lightningdevkit.org/snapshot/",
         genesisBlockHash = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
     ),
     SIGNET(
@@ -54,6 +66,10 @@ enum class ChainNetwork(
         ),
         explorerTxUrl = "https://mempool.space/signet/tx/",
         ticker = "SIGBTC",
+        // The LDK project publishes no signet snapshot (its signet URL answers 404), so this
+        // chain learns the graph from its peers. Borrowing the mainnet snapshot here would
+        // be a graph of another network.
+        rgsUrl = null,
         genesisBlockHash = "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"
     ),
     TESTNET(
@@ -67,10 +83,14 @@ enum class ChainNetwork(
         ),
         explorerTxUrl = "https://blockstream.info/testnet/tx/",
         ticker = "TBTC",
+        rgsUrl = "https://rapidsync.lightningdevkit.org/testnet/snapshot/",
         genesisBlockHash = "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
     );
 
     val isMainnet: Boolean get() = this == MAINNET
+
+    /** Whether this chain has an RGS server at all, so the option can be offered. */
+    val rgsSupported: Boolean get() = rgsUrl != null
 
     /** The chain's built-in endpoints, default first, with no repeats. */
     val publicEsploraUrls: List<String>
@@ -79,6 +99,20 @@ enum class ChainNetwork(
     companion object {
         fun fromId(id: String?): ChainNetwork = values().firstOrNull { it.id == id } ?: MAINNET
     }
+}
+
+/**
+ * The gossip source the node is built with, decided in one place.
+ *
+ * The chain outranks the saved option: a snapshot is only ever fetched from the current
+ * chain's own server, and a chain without one falls back to peer-to-peer gossip even when
+ * the switch was left on from a mainnet session.
+ */
+object GossipSource {
+
+    /** The RGS URL to build with, or null to learn gossip from peers. */
+    fun rgsUrlFor(network: ChainNetwork, rgsEnabled: Boolean): String? =
+        if (rgsEnabled) network.rgsUrl else null
 }
 
 /**

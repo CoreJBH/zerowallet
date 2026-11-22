@@ -32,6 +32,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jbitmstr.purewallet.WalletViewModel
+import com.jbitmstr.purewallet.core.Authorization
 import com.jbitmstr.purewallet.core.FeePriority
 import com.jbitmstr.purewallet.core.FeeWarning
 import com.jbitmstr.purewallet.core.OnchainFeeEstimate
@@ -62,7 +63,7 @@ fun SendSheet(
     state: WalletState,
     initialText: String,
     backgrounded: Int,
-    onAuthorize: (String, (Boolean) -> Unit) -> Unit,
+    authorization: Authorization,
     onClose: () -> Unit,
     onScan: () -> Unit
 ) {
@@ -175,46 +176,47 @@ fun SendSheet(
         // while it is up must not start a second one.
         busy = true
         draftFlow.onAuthenticationStarted()
-        onAuthorize("Authenticate to send this payment.") { granted ->
-            if (!granted) {
+        authorization.guarded(
+            reason = "Authenticate to send this payment.",
+            onDenied = {
                 // Nothing was sent. The draft stays unless the screen had already been left
                 // while the prompt was up, in which case [SendDraftFlow] says it goes now.
                 if (draftFlow.onAuthenticationFinished(granted = false)) clearDraft()
                 busy = false
-            } else {
-                draftFlow.onAuthenticationFinished(granted = true)
-                scope.launch {
-                    error = null
-                    // Send-all is only ever offered on an editable on-chain request (see
-                    // [ResolvedTarget.allowsSendAll]); a fixed-amount QR is paid for exactly
-                    // what it says even if the switch somehow ended up on.
-                    val sendAllApplies = current.allowsSendAll && !lightningRoute
-                    if (sendAllApplies && sendAll && isOnchainSend(current)) {
-                        val rate = feeRate
-                        if (rate == null) {
-                            error = "The fee estimate has not arrived yet. Wait a moment, then try again."
-                            busy = false
-                            return@launch
-                        }
-                        sentOverLightning = false
-                        vm.sendOnchain(
-                            address = current.input.address.orEmpty(),
-                            amountSats = null,
-                            sendAll = true,
-                            feeRateSatPerVb = rate
-                        )
-                    } else {
-                        sentOverLightning =
-                            current.input.kind != PaymentInputKind.ONCHAIN || lightningRoute
-                        // The rate shown when the payment was confirmed is the rate it is signed
-                        // with: it is passed through rather than read again before signing, and
-                        // an on-chain send without one is refused instead of paying a fallback.
-                        vm.pay(current, amount, viaLightning, feeRate)
-                    }.onSuccess { reference = it }.onFailure {
-                        error = it.message ?: "The payment could not be sent"
+            }
+        ) {
+            draftFlow.onAuthenticationFinished(granted = true)
+            scope.launch {
+                error = null
+                // Send-all is only ever offered on an editable on-chain request (see
+                // [ResolvedTarget.allowsSendAll]); a fixed-amount QR is paid for exactly
+                // what it says even if the switch somehow ended up on.
+                val sendAllApplies = current.allowsSendAll && !lightningRoute
+                if (sendAllApplies && sendAll && isOnchainSend(current)) {
+                    val rate = feeRate
+                    if (rate == null) {
+                        error = "The fee estimate has not arrived yet. Wait a moment, then try again."
+                        busy = false
+                        return@launch
                     }
-                    busy = false
+                    sentOverLightning = false
+                    vm.sendOnchain(
+                        address = current.input.address.orEmpty(),
+                        amountSats = null,
+                        sendAll = true,
+                        feeRateSatPerVb = rate
+                    )
+                } else {
+                    sentOverLightning =
+                        current.input.kind != PaymentInputKind.ONCHAIN || lightningRoute
+                    // The rate shown when the payment was confirmed is the rate it is signed
+                    // with: it is passed through rather than read again before signing, and
+                    // an on-chain send without one is refused instead of paying a fallback.
+                    vm.pay(current, amount, viaLightning, feeRate)
+                }.onSuccess { reference = it }.onFailure {
+                    error = it.message ?: "The payment could not be sent"
                 }
+                busy = false
             }
         }
     }

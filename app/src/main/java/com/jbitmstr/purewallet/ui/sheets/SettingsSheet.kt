@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.content.FileProvider
 import com.jbitmstr.purewallet.WalletViewModel
+import com.jbitmstr.purewallet.core.Authorization
 import com.jbitmstr.purewallet.core.BackupManifest
 import com.jbitmstr.purewallet.core.BackupTransfer
 import com.jbitmstr.purewallet.core.ChannelBackup
@@ -72,7 +73,7 @@ fun SettingsSheet(
     state: WalletState,
     lockAvailable: Boolean,
     onBackup: () -> Unit,
-    onAuthorize: (String, (Boolean) -> Unit) -> Unit,
+    authorization: Authorization,
     onClose: () -> Unit
 ) {
     var esplora by remember(state.esploraUrl) { mutableStateOf(state.esploraUrl) }
@@ -98,7 +99,7 @@ fun SettingsSheet(
     val statusFailed = backupError != null || (transfer.message != null && transfer.failed)
 
     fun prepareBackup(share: Boolean) {
-        onAuthorize("Authenticate to save an encrypted channel backup.") {
+        authorization.guarded("Authenticate to save an encrypted channel backup.") {
             scope.launch {
                 backupBusy = true
                 backupError = null
@@ -331,7 +332,16 @@ fun SettingsSheet(
                 Text("Rapid Gossip Sync", color = Pal.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                 Spacer(Modifier.height(3.dp))
                 Text(
-                    "Off: learn the network from peers over the Lightning P2P network. On: fetch a signed snapshot instead.",
+                    if (!state.rgsSupported) {
+                        // A snapshot names the chain it belongs to, and this one has no
+                        // server of its own: pointing it at another chain's snapshot would
+                        // mean routing from a graph of a different network.
+                        state.network.title + " has no Rapid Gossip Sync server of its own, " +
+                            "so this chain always learns the network from peers."
+                    } else {
+                        "Off: learn the network from peers over the Lightning P2P network. " +
+                            "On: fetch a signed snapshot from the server for this chain instead."
+                    },
                     color = Pal.TextTertiary,
                     fontSize = 11.sp,
                     lineHeight = 15.sp
@@ -339,8 +349,9 @@ fun SettingsSheet(
             }
             Spacer(Modifier.width(12.dp))
             Switch(
-                checked = state.rgsEnabled,
+                checked = state.rgsEnabled && state.rgsSupported,
                 onCheckedChange = { vm.setRapidGossipSync(it) },
+                enabled = state.rgsSupported,
                 colors = SwitchDefaults.colors(
                     checkedThumbColor = Pal.OnAccent,
                     checkedTrackColor = Pal.Accent,
@@ -539,7 +550,7 @@ fun SettingsSheet(
                     pendingRestore = null
                     // Replacing the channel data can cost the funds in a live channel, so it
                     // asks for the same proof as a payment before it runs.
-                    onAuthorize("Authenticate to restore a channel backup.") {
+                    authorization.guarded("Authenticate to restore a channel backup.") {
                         scope.launch {
                             backupBusy = true
                             backupError = null
@@ -585,7 +596,7 @@ fun SettingsSheet(
                     confirmWipe = false
                     // A wipe deletes the only copy of the seed on this phone, so it asks for
                     // the same proof as a payment before it runs.
-                    onAuthorize("Authenticate to wipe this wallet.") {
+                    authorization.guarded("Authenticate to wipe this wallet.") {
                         vm.wipeWallet()
                         onClose()
                     }

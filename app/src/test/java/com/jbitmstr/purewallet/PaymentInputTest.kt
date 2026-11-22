@@ -30,9 +30,76 @@ class PaymentInputTest {
 
     @Test
     fun bip21WithMoreThanTheSupplyIsNotAnAmount() {
+        // An amount above 21 million bitcoin is not a sum this chain has; it is refused as a
+        // request, not read as "no amount" - the difference is whether the payer is then
+        // shown an empty box and invited to send a sum of their own.
         val parsed = PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=21000001")
-        assertEquals(PaymentInputKind.ONCHAIN, parsed.kind)
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
         assertNull(parsed.amountSats)
+        assertTrue(parsed.rejection.orEmpty().contains("amount"))
+    }
+
+    @Test
+    fun aMalformedAmountIsRefusedInsteadOfIgnored() {
+        // The eighth review: `amount=abc` used to be dropped on the floor, and the send sheet
+        // then offered an editable amount for a request that had named one.
+        val parsed = PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=abc")
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertNull(parsed.amountSats)
+        assertTrue(parsed.rejection.orEmpty().contains("cannot read"))
+    }
+
+    @Test
+    fun anEmptyAmountIsRefused() {
+        val parsed = PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=")
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertTrue(parsed.rejection != null)
+    }
+
+    @Test
+    fun anAmountWrittenAsAnExponentIsRefused() {
+        // BIP-21 spells the amount in plain decimal; 1e-3 is a different language for the
+        // same number, and a wallet that guesses at it can disagree with the next one.
+        val parsed = PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=1e-3")
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertNull(parsed.amountSats)
+    }
+
+    @Test
+    fun aNegativeOrZeroAmountIsRefused() {
+        assertEquals(
+            PaymentInputKind.UNKNOWN,
+            PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=-0.001").kind
+        )
+        assertEquals(
+            PaymentInputKind.UNKNOWN,
+            PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=0").kind
+        )
+        assertEquals(
+            PaymentInputKind.UNKNOWN,
+            PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=0.00000000").kind
+        )
+    }
+
+    @Test
+    fun anAmountFinerThanASatoshiIsRefused() {
+        // 0.000000019 BTC is 1.9 satoshis: rounding it to 1 would underpay the receiver and
+        // rounding up would overpay it, so the request is not paid at all.
+        val parsed = PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=0.000000019")
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertNull(parsed.amountSats)
+        assertTrue(parsed.rejection.orEmpty().contains("8"))
+    }
+
+    @Test
+    fun eightDecimalsAndTrailingZerosAreStillAnAmount() {
+        val exact = PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=0.00000001")
+        assertEquals(PaymentInputKind.ONCHAIN, exact.kind)
+        assertEquals(1L, exact.amountSats)
+
+        val trailing = PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=0.00100000000")
+        assertEquals(PaymentInputKind.ONCHAIN, trailing.kind)
+        assertEquals(100_000L, trailing.amountSats)
     }
 
     @Test

@@ -135,6 +135,9 @@ data class WalletState(
     val error: String? = null
 ) {
     val totalSats: Long get() = onchainTotalSats + lightningBalanceSats
+
+    /** Whether this chain has a Rapid Gossip Sync server, so the option applies to it. */
+    val rgsSupported: Boolean get() = network.rgsSupported
 }
 
 data class InvoiceResult(val invoice: String, val paymentHash: String)
@@ -430,7 +433,7 @@ class NodeManager(context: Context) {
                         it.copy(
                             network = network,
                             esploraUrl = prefs.esploraUrl(network),
-                            rgsEnabled = prefs.rapidGossipSync,
+                            rgsEnabled = prefs.rapidGossipSync && network.rgsSupported,
                             lockOnOpen = prefs.lockOnOpen,
                             screenProtection = prefs.screenProtection,
                             bootstrapped = true,
@@ -471,7 +474,7 @@ class NodeManager(context: Context) {
             it.copy(
                 network = network,
                 esploraUrl = prefs.esploraUrl(network),
-                rgsEnabled = prefs.rapidGossipSync,
+                rgsEnabled = prefs.rapidGossipSync && network.rgsSupported,
                 lockOnOpen = prefs.lockOnOpen,
                 screenProtection = prefs.screenProtection,
                 bootstrapped = true,
@@ -936,8 +939,12 @@ class NodeManager(context: Context) {
             EsploraSyncConfig(BackgroundSyncConfig(30uL, 20uL, 300uL))
         )
         builder.setEntropyBip39Mnemonic(Bip39.normalize(mnemonic), null)
-        if (prefs.rapidGossipSync) {
-            builder.setGossipSourceRgs(RGS_URL)
+        // The snapshot server belongs to the chain: the mainnet URL on signet or testnet
+        // would hand this node a graph of another network. [GossipSource] picks the chain's
+        // own server or none at all, and the option cannot override that.
+        val rgsUrl = GossipSource.rgsUrlFor(network, prefs.rapidGossipSync)
+        if (rgsUrl != null) {
+            builder.setGossipSourceRgs(rgsUrl)
         } else {
             builder.setGossipSourceP2p()
         }
@@ -1184,6 +1191,10 @@ class NodeManager(context: Context) {
                         network = network,
                         esploraUrl = prefs.esploraUrl(network),
                         activeEsploraUrl = null,
+                        // The saved option is read as "on" only for a chain that has a
+                        // snapshot server, so the settings sheet never shows a switch that
+                        // claims a source this chain cannot use.
+                        rgsEnabled = prefs.rapidGossipSync && network.rgsSupported,
                         payments = emptyList(),
                         channels = emptyList(),
                         peers = emptyList(),
@@ -1245,6 +1256,17 @@ class NodeManager(context: Context) {
     }
 
     fun setRapidGossipSync(enabled: Boolean) {
+        val network = _state.value.network
+        // A chain with no snapshot server of its own is never pointed at another chain's.
+        // The option stays a saved preference for the chains that have one.
+        if (enabled && !network.rgsSupported) {
+            _state.update { it.copy(rgsEnabled = false) }
+            _messages.tryEmit(
+                "${network.title} has no Rapid Gossip Sync server, so the node keeps " +
+                    "learning the network from peers."
+            )
+            return
+        }
         prefs.rapidGossipSync = enabled
         _state.update { it.copy(rgsEnabled = enabled) }
         _messages.tryEmit("Gossip source changed. Restart the node to apply it.")
@@ -1874,7 +1896,6 @@ class NodeManager(context: Context) {
     companion object {
         private const val TAG = "PureWalletNode"
         private const val NODE_ALIAS = "purewallet"
-        private const val RGS_URL = "https://rapidsync.lightningdevkit.org/snapshot/"
         private val invoiceExpirySecs: UInt = 3600u
 
         /** How long a stopping node waits for its event loop to leave the native call. */

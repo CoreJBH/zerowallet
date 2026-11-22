@@ -38,6 +38,12 @@ import androidx.lifecycle.LifecycleEventObserver
  * Prompt state is lifecycle-driven, never a one-way flag. Every request replaces any
  * earlier attempt, and a request made while the activity is not resumed waits for the
  * next resume, so backgrounding the app can never leave Unlock unresponsive.
+ *
+ * Every request is answered exactly once. A prompt that the system dismisses without a
+ * result, one this class supersedes, and one thrown away with the screen all report false
+ * to their caller through [awaiting]; without that a sheet that is busy while it waits - the
+ * send sheet is busy from the moment the prompt opens, on purpose - never heard back and
+ * stayed busy with the prompt long gone.
  */
 class AppLock(private val activity: FragmentActivity) {
 
@@ -46,6 +52,9 @@ class AppLock(private val activity: FragmentActivity) {
     private var prompt: BiometricPrompt? = null
     private var attempt = 0
     private var pending: Pending? = null
+
+    /** The caller of the prompt that is (or is about to be) on screen, until it is answered. */
+    private val awaiting = PendingAuth()
 
     private data class Pending(
         val title: String,
@@ -92,15 +101,21 @@ class AppLock(private val activity: FragmentActivity) {
      *
      * A request that arrives while the activity is not resumed (for example right after
      * the app returns from the background) is held until the next resume instead of being
-     * dropped.
+     * dropped. Either way the request is answered exactly once: false when there is nothing
+     * to ask with, false when another prompt owns the screen or this one is thrown away, and
+     * the system's own answer when it arrives.
      */
     fun authenticate(title: String, subtitle: String, onResult: (Boolean) -> Unit) {
         if (!isAvailable()) {
             onResult(false)
             return
         }
-        // The keyguard screen owns the attempt; a second prompt here would race it.
-        if (flow.showsSystemCredential) return
+        // The keyguard screen owns the attempt; a second prompt here would race it. The
+        // caller is not left waiting for it either: the screen it owns is not this request's.
+        if (flow.showsSystemCredential) {
+            onResult(false)
+            return
+        }
 
         if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
             pending = Pending(title, subtitle, onResult)
@@ -109,10 +124,18 @@ class AppLock(private val activity: FragmentActivity) {
         start(title, subtitle, onResult)
     }
 
-    /** Stops observing and dismisses anything still on screen. */
+    /**
+     * Stops observing and dismisses anything still on screen.
+     *
+     * A request held for the next resume is not going to get one, and a prompt still up is
+     * about to lose its screen; both are answered false here rather than left waiting for a
+     * result that can no longer arrive.
+     */
     fun dispose() {
         activity.lifecycle.removeObserver(observer)
+        val held = pending
         pending = null
+        held?.onResult?.invoke(false)
         supersede()
     }
 
@@ -131,13 +154,21 @@ class AppLock(private val activity: FragmentActivity) {
         }
     }
 
-    /** Invalidates callbacks from the previous attempt and dismisses its prompt. */
+    /**
+     * Invalidates callbacks from the previous attempt and dismisses its prompt.
+     *
+     * The dismissed attempt is told it ended without the user. Its caller may be holding a
+     * payment draft or a button that is busy until it hears back, and the system's own
+     * callback for the cancelled prompt belongs to a token that is no longer current, so it
+     * is dropped on the floor below and would never have reached the caller.
+     */
     private fun supersede() {
         attempt++
         flow.finish()
         val active = prompt
         prompt = null
         runCatching { active?.cancelAuthentication() }
+        awaiting.abandon()
     }
 
     private fun show(
@@ -149,6 +180,7 @@ class AppLock(private val activity: FragmentActivity) {
         onResult: (Boolean) -> Unit
     ) {
         if (allowed == DEVICE_CREDENTIAL) flow.beginSystemCredential() else flow.begin()
+        awaiting.begin(onResult)
 
         val callback = object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
@@ -156,6 +188,7 @@ class AppLock(private val activity: FragmentActivity) {
                 pending = null
                 flow.finish()
                 prompt = null
+                awaiting.settle()
                 onResult(true)
             }
 
@@ -169,6 +202,7 @@ class AppLock(private val activity: FragmentActivity) {
                 pending = null
                 flow.finish()
                 prompt = null
+                awaiting.settle()
                 onResult(false)
             }
 
@@ -193,6 +227,7 @@ class AppLock(private val activity: FragmentActivity) {
                 pending = null
                 flow.finish()
                 prompt = null
+                awaiting.settle()
                 onResult(false)
             }
         }
