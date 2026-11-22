@@ -70,6 +70,70 @@ class PaymentInputTest {
         assertEquals(PaymentInputKind.PEER, PaymentInputParser.parse(peer).kind)
     }
 
+    // ------------------------------------------------------ BOLT12 shape checks
+
+    private val offer = "lno1" + "q".repeat(80)
+
+    @Test
+    fun aTruncatedBolt12OfferIsNotAnOffer() {
+        // The prefix alone used to be enough, so this reached the node and failed there.
+        assertEquals(PaymentInputKind.UNKNOWN, PaymentInputParser.parse("lno1q").kind)
+        assertEquals(PaymentInputKind.UNKNOWN, PaymentInputParser.parse("lno1").kind)
+        // Bech32 never carries b, i or o, and only one '1' separator.
+        assertEquals(
+            PaymentInputKind.UNKNOWN,
+            PaymentInputParser.parse("lno1" + "b".repeat(80)).kind
+        )
+        assertEquals(
+            PaymentInputKind.UNKNOWN,
+            PaymentInputParser.parse("lno1" + "q".repeat(40) + "1" + "q".repeat(40)).kind
+        )
+    }
+
+    @Test
+    fun aWellFormedOfferIsStillAnOffer() {
+        assertTrue(PaymentInputParser.looksLikeBolt12Offer(offer))
+        assertEquals(PaymentInputKind.BOLT12_OFFER, PaymentInputParser.parse(offer).kind)
+        assertEquals(
+            PaymentInputKind.BOLT12_OFFER,
+            PaymentInputParser.parse("lightning:$offer").kind
+        )
+        assertEquals(
+            PaymentInputKind.BOLT12_INVOICE,
+            PaymentInputParser.parse("lni1" + "q".repeat(80)).kind
+        )
+    }
+
+    // ------------------------------------------------- BIP-21 lightning= hand-off
+
+    private val bolt11 = "lnbc2500u1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4js"
+
+    @Test
+    fun theLightningParameterOfABip21QrIsKept() {
+        val parsed = PaymentInputParser.parse(
+            "bitcoin:$mainnetBech32?amount=0.001&lightning=$bolt11"
+        )
+        assertEquals(PaymentInputKind.ONCHAIN, parsed.kind)
+        assertEquals(100_000L, parsed.amountSats)
+        assertEquals(bolt11, parsed.lightning)
+
+        val lightning = PaymentInputParser.parseLightningValue(parsed.lightning!!)
+        assertEquals(PaymentInputKind.BOLT11, lightning?.kind)
+        assertEquals(bolt11, lightning?.bolt11)
+
+        val fromOffer = PaymentInputParser.parseLightningValue(offer)
+        assertEquals(PaymentInputKind.BOLT12_OFFER, fromOffer?.kind)
+        assertEquals(offer, fromOffer?.bolt12Offer)
+    }
+
+    @Test
+    fun aBrokenLightningParameterIsIgnored() {
+        assertNull(PaymentInputParser.parseLightningValue(""))
+        assertNull(PaymentInputParser.parseLightningValue("not-an-invoice"))
+        assertNull(PaymentInputParser.parseLightningValue("lno1q"))
+        assertNull(PaymentInputParser.parseLightningValue("lnr1" + "q".repeat(80)))
+    }
+
     @Test
     fun amountsStayWithinTheSupply() {
         // The parser is not the only gate; this pins the constant the node checks against.

@@ -119,6 +119,8 @@ fun WalletTextField(
     modifier: Modifier = Modifier,
     label: String? = null,
     keyboardType: KeyboardType = KeyboardType.Text,
+    // Words of a recovery phrase must never be learned or corrected by the keyboard.
+    autoCorrectEnabled: Boolean = true,
     singleLine: Boolean = true,
     minLines: Int = 1,
     enabled: Boolean = true,
@@ -148,7 +150,10 @@ fun WalletTextField(
             minLines = minLines,
             enabled = enabled,
             shape = RoundedCornerShape(14.dp),
-            keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = keyboardType,
+                autoCorrectEnabled = autoCorrectEnabled
+            ),
             trailingIcon = trailing,
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = Pal.TextTertiary,

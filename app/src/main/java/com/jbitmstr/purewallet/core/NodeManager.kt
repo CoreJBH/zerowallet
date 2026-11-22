@@ -33,6 +33,7 @@ import org.lightningdevkit.ldknode.EsploraSyncConfig
 import org.lightningdevkit.ldknode.Event
 import org.lightningdevkit.ldknode.FeeRate
 import org.lightningdevkit.ldknode.LogLevel
+import org.lightningdevkit.ldknode.Network
 import org.lightningdevkit.ldknode.Node
 import org.lightningdevkit.ldknode.Offer
 import org.lightningdevkit.ldknode.OfferAmount
@@ -137,17 +138,29 @@ data class ResolvedTarget(
     val input: PaymentInput,
     val description: String,
     val amountSats: Long?,
-    val amountEditable: Boolean
-)
+    val amountEditable: Boolean,
+    /**
+     * The Lightning request carried by the same BIP-21 QR as [input], when this wallet can
+     * pay it over Lightning. Paying it this way keeps the on-chain address as the fallback
+     * the sender offered; the caller decides which route to take.
+     */
+    val lightning: PaymentInput? = null
+) {
+    /** True when a BIP-21 QR offers both an on-chain address and a Lightning request. */
+    val hasLightningAlternative: Boolean get() = lightning != null
+}
 
 enum class FeePriority(val label: String, val detail: String) {
     NORMAL("Normal", "Usually confirms within ~30 minutes"),
     FAST("Fast", "Usually confirms within ~10 minutes");
 
-    fun satPerVb(rates: FeeRates?): Long = when (this) {
-        NORMAL -> rates?.halfHourSatPerVb ?: 8L
-        FAST -> rates?.fastestSatPerVb ?: 16L
-    }
+    /** The rate this priority pays, always inside the range [FeeEstimates] allows. */
+    fun satPerVb(rates: FeeRates?): Long = FeeEstimates.clamp(
+        when (this) {
+            NORMAL -> rates?.halfHourSatPerVb ?: 8L
+            FAST -> rates?.fastestSatPerVb ?: 16L
+        }
+    )
 }
 
 /**
@@ -481,8 +494,13 @@ class NodeManager(context: Context) {
             val dir = networkDir(network).apply { mkdirs() }
             val logFile = NodeLog.file(appContext).apply { parentFile?.mkdirs() }
             // Keep the on-device log bounded. The node is stopped here, so the file is
-            // not being written while it is renamed.
-            runCatching { NodeLog.rotateIfNeeded(logFile) }
+            // not being written while it is renamed. A release build writes no log at all,
+            // so a file left by an earlier debug build is removed instead of kept.
+            if (BuildConfig.DEBUG) {
+                runCatching { NodeLog.rotateIfNeeded(logFile) }
+            } else {
+                runCatching { NodeLog.deleteAll(logFile) }
+            }
 
             val started = startWithFallback(mnemonic, network, dir, logFile)
             val built = started.node
@@ -519,7 +537,10 @@ class NodeManager(context: Context) {
         } catch (c: CancellationException) {
             throw c
         } catch (t: Throwable) {
-            Log.e(TAG, "Node start failed", t)
+            // The exception text can name the endpoint and the peers it was talking to, so it
+            // is only written where a developer is watching. A release build keeps the user's
+            // message and nothing else.
+            if (BuildConfig.DEBUG) Log.e(TAG, "Node start failed", t)
             runCatching { node?.stop() }
             runCatching { node?.destroy() }
             node = null
@@ -578,7 +599,7 @@ class NodeManager(context: Context) {
                 try {
                     val built = buildAndStart(mnemonic, network, dir, logFile, address, esploraUrl)
                     if (index > 0) {
-                        Log.w(TAG, "Node started without a listening address")
+                        if (BuildConfig.DEBUG) Log.w(TAG, "Node started without a listening address")
                         _messages.tryEmit(
                             "Port 9735 is not available, so the node is running without a public " +
                                 "listening address. Sending and receiving over open channels still work."
@@ -589,7 +610,9 @@ class NodeManager(context: Context) {
                     throw c
                 } catch (t: Throwable) {
                     lastFailure = t
-                    Log.w(TAG, "Node start on $esploraUrl (${address ?: "no listening address"}) failed", t)
+                    if (BuildConfig.DEBUG) {
+                        Log.w(TAG, "Node start on $esploraUrl (${address ?: "no listening address"}) failed", t)
+                    }
                     val moreEndpoints = candidateIndex < candidates.lastIndex
                     // A chain source that will not answer is not fixed by dropping the port.
                     if (moreEndpoints && EsploraFallback.isChainSourceFailure(t)) break
@@ -641,7 +664,13 @@ class NodeManager(context: Context) {
             runCatching { builder.setListeningAddresses(listOf(listeningAddress)) }
                 .onSuccess { builder.setNodeAlias(NODE_ALIAS) }
         }
-        runCatching { builder.setFilesystemLogger(logFile.absolutePath, LogLevel.INFO) }
+        // The node's own log file records addresses, peers and channel ids in plain text, and
+        // nothing on a phone is needed to read it back. It is therefore written only in a
+        // debug build; a release build starts the node with no filesystem logger at all, so
+        // no such file is created or appended to.
+        if (BuildConfig.DEBUG) {
+            runCatching { builder.setFilesystemLogger(logFile.absolutePath, LogLevel.INFO) }
+        }
 
         val built = builder.build()
         try {
@@ -1002,78 +1031,10 @@ class NodeManager(context: Context) {
     suspend fun resolveTarget(input: PaymentInput): Result<ResolvedTarget> = runCatching {
         withNode { n ->
             when (input.kind) {
-                PaymentInputKind.BOLT11 -> {
-                    val raw = input.bolt11 ?: input.raw
-                    val invoice = Bolt11Invoice.fromStr(raw)
-                    if (invoice.network() != n.config().network) {
-                        throw IllegalArgumentException("This invoice belongs to a different network")
-                    }
-                    if (invoice.isExpired()) {
-                        throw IllegalArgumentException("This invoice has expired")
-                    }
-                    val description = when (val d = invoice.invoiceDescription()) {
-                        is Bolt11InvoiceDescription.Direct -> d.description
-                        is Bolt11InvoiceDescription.Hash -> ""
-                    }
-                    val amountSats = invoice.amountMilliSatoshis()?.toLong()?.let { it / 1000L }
-                    ResolvedTarget(
-                        input = input.copy(bolt11 = raw),
-                        description = description,
-                        amountSats = amountSats,
-                        amountEditable = amountSats == null
-                    )
-                }
-                PaymentInputKind.BOLT12_OFFER -> {
-                    val raw = input.bolt12Offer ?: input.raw
-                    val offer = Offer.fromStr(raw)
-                    if (offer.isExpired()) {
-                        throw IllegalArgumentException("This offer has expired")
-                    }
-                    val fixed = when (val amount = offer.amount()) {
-                        is OfferAmount.Bitcoin -> amount.amountMsats.toLong() / 1000L
-                        is OfferAmount.Currency -> throw IllegalArgumentException(
-                            "This offer is priced in ${amount.iso4217Code} and cannot be paid from here"
-                        )
-                        null -> null
-                    }
-                    ResolvedTarget(
-                        input = input.copy(bolt12Offer = raw),
-                        description = offer.offerDescription() ?: "",
-                        amountSats = fixed,
-                        amountEditable = fixed == null
-                    )
-                }
-                PaymentInputKind.BOLT12_INVOICE -> {
-                    val raw = input.bolt12Invoice ?: input.raw
-                    val invoice = Bolt12Invoice.fromStr(raw)
-                    if (invoice.isExpired()) {
-                        throw IllegalArgumentException("This invoice has expired")
-                    }
-                    ResolvedTarget(
-                        input = input.copy(bolt12Invoice = raw),
-                        description = invoice.invoiceDescription() ?: "",
-                        amountSats = invoice.amountMsats().toLong() / 1000L,
-                        amountEditable = false
-                    )
-                }
-                PaymentInputKind.ONCHAIN -> {
-                    val address = input.address ?: throw IllegalArgumentException("No Bitcoin address found")
-                    // A test-chain address on mainnet (or the reverse) can only fail, and the
-                    // failure would come after signing. Refuse it while it can still be
-                    // fixed, naming the chain the wallet is on.
-                    val network = prefs.network
-                    if (!PaymentInputParser.matchesNetwork(address, network.isMainnet)) {
-                        throw IllegalArgumentException(
-                            "That is not a ${network.title} address. Check the address or switch networks in Settings."
-                        )
-                    }
-                    ResolvedTarget(
-                        input = input,
-                        description = input.label ?: input.message ?: "",
-                        amountSats = input.amountSats?.let { checkedSats(it) },
-                        amountEditable = input.amountSats == null
-                    )
-                }
+                PaymentInputKind.BOLT11,
+                PaymentInputKind.BOLT12_OFFER,
+                PaymentInputKind.BOLT12_INVOICE -> resolveLightning(n, input)
+                PaymentInputKind.ONCHAIN -> resolveOnchain(n, input)
                 PaymentInputKind.PEER -> throw IllegalArgumentException(
                     "That is a peer address. Use Channels to connect to it."
                 )
@@ -1085,54 +1046,235 @@ class NodeManager(context: Context) {
     }
 
     /**
+     * Amount and description of a Lightning request, after every check that can be made
+     * before the payment screen.
+     *
+     * A BOLT11 invoice names its network, a BOLT12 invoice names its chain by genesis hash,
+     * and a BOLT12 offer lists the chains it accepts. All three are checked here: paying an
+     * invoice from another chain cannot succeed, and the node would only discover it after
+     * signing.
+     */
+    private fun resolveLightning(n: Node, input: PaymentInput): ResolvedTarget =
+        when (input.kind) {
+            PaymentInputKind.BOLT11 -> {
+                val raw = input.bolt11 ?: input.raw
+                val invoice = Bolt11Invoice.fromStr(raw)
+                if (invoice.network() != n.config().network) {
+                    throw IllegalArgumentException(
+                        "This invoice is for ${networkName(invoice.network())}, and this wallet " +
+                            "is on ${prefs.network.title}. Switch networks in Settings to pay it."
+                    )
+                }
+                if (invoice.isExpired()) {
+                    throw IllegalArgumentException("This invoice has expired")
+                }
+                val description = when (val d = invoice.invoiceDescription()) {
+                    is Bolt11InvoiceDescription.Direct -> d.description
+                    is Bolt11InvoiceDescription.Hash -> ""
+                }
+                val amountSats = invoice.amountMilliSatoshis()?.toLong()?.let { it / 1000L }
+                ResolvedTarget(
+                    input = input.copy(bolt11 = raw),
+                    description = description,
+                    amountSats = amountSats,
+                    amountEditable = amountSats == null
+                )
+            }
+            PaymentInputKind.BOLT12_OFFER -> {
+                val raw = input.bolt12Offer ?: input.raw
+                // The `lno1` prefix alone proves nothing: a truncated or mistyped string
+                // starts the same way and would only fail after the payment screen.
+                if (!PaymentInputParser.looksLikeBolt12Offer(raw)) {
+                    throw IllegalArgumentException("That is not a complete BOLT12 offer")
+                }
+                val offer = Offer.fromStr(raw)
+                if (!offer.supportsChain(n.config().network)) {
+                    throw IllegalArgumentException(
+                        "This offer is not for ${prefs.network.title}, so this wallet cannot pay it"
+                    )
+                }
+                if (offer.isExpired()) {
+                    throw IllegalArgumentException("This offer has expired")
+                }
+                val fixed = when (val amount = offer.amount()) {
+                    is OfferAmount.Bitcoin -> amount.amountMsats.toLong() / 1000L
+                    is OfferAmount.Currency -> throw IllegalArgumentException(
+                        "This offer is priced in ${amount.iso4217Code} and cannot be paid from here"
+                    )
+                    null -> null
+                }
+                ResolvedTarget(
+                    input = input.copy(bolt12Offer = raw),
+                    description = offer.offerDescription() ?: "",
+                    amountSats = fixed,
+                    amountEditable = fixed == null
+                )
+            }
+            PaymentInputKind.BOLT12_INVOICE -> {
+                val raw = input.bolt12Invoice ?: input.raw
+                if (!PaymentInputParser.looksLikeBolt12Invoice(raw)) {
+                    throw IllegalArgumentException("That is not a complete BOLT12 invoice")
+                }
+                val invoice = Bolt12Invoice.fromStr(raw)
+                // BOLT12 has no network prefix: the chain is named by the genesis hash the
+                // invoice is signed over, and Bitcoin has no other way to tell them apart.
+                if (!Bolt12Chain.matches(invoice.chain(), prefs.network)) {
+                    throw IllegalArgumentException(
+                        "This BOLT12 invoice is for another chain, and this wallet is on " +
+                            prefs.network.title
+                    )
+                }
+                if (invoice.isExpired()) {
+                    throw IllegalArgumentException("This invoice has expired")
+                }
+                ResolvedTarget(
+                    input = input.copy(bolt12Invoice = raw),
+                    description = invoice.invoiceDescription() ?: "",
+                    amountSats = invoice.amountMsats().toLong() / 1000L,
+                    amountEditable = false
+                )
+            }
+            else -> throw IllegalArgumentException("Unrecognized payment request")
+        }
+
+    /**
+     * An on-chain request, together with the Lightning request the same QR may carry.
+     *
+     * BIP-21 has room for both halves: `bitcoin:<address>?amount=...&lightning=<invoice or
+     * offer>`. The Lightning half settles at once and costs a fraction of an on-chain fee, so
+     * it is used when this wallet can actually pay it - a ready channel with enough outbound
+     * balance - and when the two halves agree on the amount. The address stays behind as the
+     * other route, and it is used unchanged whenever anything about the Lightning half is off
+     * (expired, another chain, a different amount, no channel to pay it with).
+     */
+    private fun resolveOnchain(n: Node, input: PaymentInput): ResolvedTarget {
+        val address = input.address ?: throw IllegalArgumentException("No Bitcoin address found")
+        // A test-chain address on mainnet (or the reverse) can only fail, and the failure
+        // would come after signing. Refuse it while it can still be fixed, naming the chain
+        // the wallet is on.
+        val network = prefs.network
+        if (!PaymentInputParser.matchesNetwork(address, network.isMainnet)) {
+            throw IllegalArgumentException(
+                "That is not a ${network.title} address. Check the address or switch networks in Settings."
+            )
+        }
+
+        val onchainSats = input.amountSats?.let { checkedSats(it) }
+        val lightning = input.lightning
+            ?.let { PaymentInputParser.parseLightningValue(it) }
+            ?.let { parsed -> runCatching { resolveLightning(n, parsed) }.getOrNull() }
+        // Two halves that disagree on the amount are not the same payment: the on-chain
+        // amount is the one the sender wrote on the QR, so that route is used instead.
+        val agreed = when {
+            lightning == null -> null
+            onchainSats != null && lightning.amountSats != null && lightning.amountSats != onchainSats -> null
+            else -> lightning
+        }
+        val routable = agreed != null && hasLightningOutbound(agreed.amountSats ?: onchainSats)
+        val amount = onchainSats ?: agreed?.amountSats?.takeIf { routable }
+        return ResolvedTarget(
+            input = input,
+            description = input.label ?: input.message ?: agreed?.description.orEmpty(),
+            amountSats = amount,
+            amountEditable = amount == null,
+            lightning = if (routable) agreed?.input else null
+        )
+    }
+
+    /**
+     * Whether a Lightning payment of this size can leave this node right now.
+     *
+     * Only a usable channel's outbound balance can pay, and a payment needs a little room
+     * above its amount for routing fees. This is a snapshot for the confirmation screen; the
+     * node makes the real decision while the payment runs.
+     */
+    private fun hasLightningOutbound(amountSats: Long?): Boolean {
+        val outbound = _state.value.channels
+            .filter { it.usable }
+            .sumOf { it.localSats }
+        if (outbound <= 0L) return false
+        val needed = amountSats ?: return outbound > 1_000L
+        return outbound - needed >= 500L
+    }
+
+    /** A chain's name for a message the user reads. */
+    private fun networkName(network: Network): String = when (network) {
+        Network.BITCOIN -> "Bitcoin Mainnet"
+        Network.TESTNET -> "Testnet3"
+        Network.SIGNET -> "Signet"
+        Network.REGTEST -> "Regtest"
+    }
+
+    /**
      * Pays a resolved request. Returns a channel-agnostic reference: the payment id for
      * Lightning payments and the transaction id for on-chain payments.
      */
     suspend fun pay(
         target: ResolvedTarget,
         amountSats: Long?,
-        priority: FeePriority
+        priority: FeePriority,
+        viaLightning: Boolean = true
     ): Result<String> = runCatching {
         withNode { n ->
             val input = target.input
-            when (input.kind) {
-                PaymentInputKind.BOLT11 -> {
-                    val invoice = Bolt11Invoice.fromStr(input.bolt11 ?: input.raw)
-                    val amount = amountSats ?: target.amountSats
-                    if (invoice.amountMilliSatoshis() == null) {
-                        val sats = amount ?: throw IllegalArgumentException("Enter an amount")
-                        n.bolt11Payment().sendUsingAmount(invoice, millisats(sats), null)
-                    } else {
-                        n.bolt11Payment().send(invoice, null)
+            val lightning = target.lightning?.takeIf { viaLightning }
+            if (lightning != null && input.kind == PaymentInputKind.ONCHAIN) {
+                // The QR named both: this is the Lightning half of the same payment.
+                payLightning(n, lightning, amountSats ?: target.amountSats)
+            } else {
+                when (input.kind) {
+                    PaymentInputKind.BOLT11,
+                    PaymentInputKind.BOLT12_OFFER,
+                    PaymentInputKind.BOLT12_INVOICE ->
+                        payLightning(n, input, amountSats ?: target.amountSats)
+                    PaymentInputKind.UNKNOWN -> {
+                        when (val result = n.unifiedQrPayment().send(input.raw, null)) {
+                            is QrPaymentResult.Onchain -> result.txid
+                            is QrPaymentResult.Bolt11 -> result.paymentId
+                            is QrPaymentResult.Bolt12 -> result.paymentId
+                        }
                     }
-                }
-                PaymentInputKind.BOLT12_OFFER -> {
-                    val offer = Offer.fromStr(input.bolt12Offer ?: input.raw)
-                    val amount = amountSats ?: target.amountSats
-                    if (offer.amount() == null) {
-                        val sats = amount ?: throw IllegalArgumentException("Enter an amount")
-                        n.bolt12Payment().sendUsingAmount(offer, millisats(sats), null, null, null)
-                    } else {
-                        n.bolt12Payment().send(offer, null, null, null)
+                    PaymentInputKind.ONCHAIN -> {
+                        val address = input.address
+                            ?: throw IllegalArgumentException("No Bitcoin address found")
+                        val sats = amountSats ?: target.amountSats
+                            ?: throw IllegalArgumentException("Enter an amount")
+                        sendOnchainInternal(n, address, checkedSats(sats), priority)
                     }
+                    PaymentInputKind.PEER -> throw IllegalArgumentException("Use Channels to connect to this peer")
                 }
-                PaymentInputKind.BOLT12_INVOICE, PaymentInputKind.UNKNOWN -> {
-                    when (val result = n.unifiedQrPayment().send(input.raw, null)) {
-                        is QrPaymentResult.Onchain -> result.txid
-                        is QrPaymentResult.Bolt11 -> result.paymentId
-                        is QrPaymentResult.Bolt12 -> result.paymentId
-                    }
-                }
-                PaymentInputKind.ONCHAIN -> {
-                    val address = input.address ?: throw IllegalArgumentException("No Bitcoin address found")
-                    val sats = amountSats ?: target.amountSats
-                        ?: throw IllegalArgumentException("Enter an amount")
-                    sendOnchainInternal(n, address, checkedSats(sats), priority)
-                }
-                PaymentInputKind.PEER -> throw IllegalArgumentException("Use Channels to connect to this peer")
             }
         }
     }
+
+    /** Sends a BOLT11 invoice or BOLT12 offer/invoice and returns its payment id. */
+    private fun payLightning(n: Node, input: PaymentInput, amountSats: Long?): String =
+        when (input.kind) {
+            PaymentInputKind.BOLT11 -> {
+                val invoice = Bolt11Invoice.fromStr(input.bolt11 ?: input.raw)
+                if (invoice.amountMilliSatoshis() == null) {
+                    val sats = amountSats ?: throw IllegalArgumentException("Enter an amount")
+                    n.bolt11Payment().sendUsingAmount(invoice, millisats(sats), null)
+                } else {
+                    n.bolt11Payment().send(invoice, null)
+                }
+            }
+            PaymentInputKind.BOLT12_OFFER -> {
+                val offer = Offer.fromStr(input.bolt12Offer ?: input.raw)
+                if (offer.amount() == null) {
+                    val sats = amountSats ?: throw IllegalArgumentException("Enter an amount")
+                    n.bolt12Payment().sendUsingAmount(offer, millisats(sats), null, null, null)
+                } else {
+                    n.bolt12Payment().send(offer, null, null, null)
+                }
+            }
+            PaymentInputKind.BOLT12_INVOICE -> when (val result = n.unifiedQrPayment().send(input.raw, null)) {
+                is QrPaymentResult.Onchain -> result.txid
+                is QrPaymentResult.Bolt11 -> result.paymentId
+                is QrPaymentResult.Bolt12 -> result.paymentId
+            }
+            else -> throw IllegalArgumentException("This is not a Lightning payment request")
+        }
 
     suspend fun sendOnchain(
         address: String,
@@ -1143,8 +1285,7 @@ class NodeManager(context: Context) {
         withNode { n ->
             if (sendAll) {
                 val rates = Market.fetchFeeRates(currentEsploraUrl(prefs.network))
-                val feeRate = FeeRate.fromSatPerVbUnchecked(priority.satPerVb(rates).toULong())
-                n.onchainPayment().sendAllToAddress(address, true, feeRate)
+                n.onchainPayment().sendAllToAddress(address, true, feeRateFor(priority, rates))
             } else {
                 val sats = amountSats ?: throw IllegalArgumentException("Enter an amount")
                 sendOnchainInternal(n, address, checkedSats(sats), priority)
@@ -1159,9 +1300,18 @@ class NodeManager(context: Context) {
         priority: FeePriority
     ): String {
         val rates = Market.fetchFeeRates(currentEsploraUrl(prefs.network))
-        val feeRate = FeeRate.fromSatPerVbUnchecked(priority.satPerVb(rates).toULong())
-        return n.onchainPayment().sendToAddress(address, amountSats.toULong(), feeRate)
+        return n.onchainPayment().sendToAddress(address, amountSats.toULong(), feeRateFor(priority, rates))
     }
+
+    /**
+     * The fee rate a send uses, as the node takes it.
+     *
+     * `fromSatPerVbUnchecked` trusts its input: 0 or an enormous number goes straight into
+     * the transaction. Every rate therefore passes through [FeeEstimates.clamp] first, so a
+     * broken estimate can cost at most [FeeEstimates.MAX_SAT_PER_VB] per vB.
+     */
+    private fun feeRateFor(priority: FeePriority, rates: FeeRates?): FeeRate =
+        FeeRate.fromSatPerVbUnchecked(FeeEstimates.clamp(priority.satPerVb(rates)).toULong())
 
     suspend fun estimateFeeRate(priority: FeePriority): Long =
         withContext(Dispatchers.IO) {

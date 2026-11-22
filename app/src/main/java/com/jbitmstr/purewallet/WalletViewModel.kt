@@ -69,8 +69,12 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     suspend fun resolveTarget(input: PaymentInput): Result<ResolvedTarget> =
         manager.resolveTarget(input)
 
-    suspend fun pay(target: ResolvedTarget, amountSats: Long?, priority: FeePriority): Result<String> =
-        manager.pay(target, amountSats, priority)
+    suspend fun pay(
+        target: ResolvedTarget,
+        amountSats: Long?,
+        priority: FeePriority,
+        viaLightning: Boolean = true
+    ): Result<String> = manager.pay(target, amountSats, priority, viaLightning)
 
     suspend fun sendOnchain(
         address: String,

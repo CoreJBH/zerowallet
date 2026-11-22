@@ -12,8 +12,8 @@ android {
         applicationId = "com.jbitmstr.purewallet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "1.1.9"
+        versionCode = 12
+        versionName = "1.1.10"
 
         ndk {
             // Phones are ARM; keeping the APK to the two ARM ABIs halves its size.
@@ -31,6 +31,9 @@ android {
             // bindings and JNA are kept by proguard-rules.pro, and the rest is shrunk.
             isMinifyEnabled = true
             isShrinkResources = true
+            // A release build must not expose the debug runtime to a connected adb shell or a
+            // crash reporter that expects debuggable code.
+            isDebuggable = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -107,4 +110,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     testImplementation("junit:junit:4.13.2")
+    // The real org.json, so the fee parser is tested against the same class the app uses on
+    // Android instead of the unit-test stub whose methods return defaults.
+    testImplementation("org.json:json:20240303")
 }

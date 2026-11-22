@@ -126,18 +126,21 @@ object PaymentInputParser {
         val text = value.trim()
         val lower = text.lowercase()
         return when {
-            lower.startsWith("lno1") -> PaymentInput(
-                kind = PaymentInputKind.BOLT12_OFFER,
-                raw = text,
-                bolt12Offer = text
-            )
-            lower.startsWith("lni1") -> PaymentInput(
-                kind = PaymentInputKind.BOLT12_INVOICE,
-                raw = text,
-                bolt12Invoice = text
-            )
+            // The BOLT12 prefixes decide the kind, and the rest of the string decides whether
+            // it is that kind at all. A broken `lno1...` must not fall through to the BOLT11
+            // branch below just because its tail happens to look like bech32.
+            lower.startsWith("lno1") -> if (looksLikeBolt12Offer(text)) {
+                PaymentInput(kind = PaymentInputKind.BOLT12_OFFER, raw = text, bolt12Offer = text)
+            } else {
+                PaymentInput(PaymentInputKind.UNKNOWN, text)
+            }
+            lower.startsWith("lni1") -> if (looksLikeBolt12Invoice(text)) {
+                PaymentInput(kind = PaymentInputKind.BOLT12_INVOICE, raw = text, bolt12Invoice = text)
+            } else {
+                PaymentInput(PaymentInputKind.UNKNOWN, text)
+            }
             lower.startsWith("lnr1") -> PaymentInput(PaymentInputKind.UNKNOWN, text)
-            lower.startsWith("ln") && lower.length > 20 -> PaymentInput(
+            lower.startsWith("ln") && lower.length > 20 && isBolt11Body(text) -> PaymentInput(
                 kind = PaymentInputKind.BOLT11,
                 raw = text,
                 bolt11 = text
@@ -145,6 +148,88 @@ object PaymentInputParser {
             else -> PaymentInput(PaymentInputKind.UNKNOWN, text)
         }
     }
+
+    /**
+     * The Lightning request inside a BIP-21 `lightning=` parameter, when it is one this
+     * wallet can pay.
+     *
+     * A BIP-21 QR can carry an on-chain address and the same recipient's Lightning invoice
+     * side by side; the parameter is also used for BOLT12 offers and invoices. Anything
+     * that is not a well-formed BOLT11/BOLT12 string is ignored here rather than reported:
+     * the on-chain address in the same QR is still valid on its own.
+     */
+    fun parseLightningValue(value: String): PaymentInput? {
+        val trimmed = value.trim()
+        if (trimmed.isEmpty()) return null
+        val withoutScheme = if (trimmed.lowercase().startsWith("lightning:")) {
+            trimmed.substringAfter(':')
+        } else {
+            trimmed
+        }
+        val parsed = parseLightning(withoutScheme)
+        return when (parsed.kind) {
+            PaymentInputKind.BOLT11, PaymentInputKind.BOLT12_OFFER, PaymentInputKind.BOLT12_INVOICE -> parsed
+            else -> null
+        }
+    }
+
+    /**
+     * BOLT12 offers are bech32 strings with the `lno1` prefix.
+     *
+     * The prefix alone is not enough: a truncated or mistyped string also starts with
+     * `lno1`, and handing it to the node only fails after the payment screen. The payload
+     * must be bech32 data (the separator `1` never repeats, and `b`, `i` and `o` are not in
+     * the alphabet) and long enough to carry a signed offer.
+     */
+    fun looksLikeBolt12Offer(text: String): Boolean =
+        text.length >= MIN_BOLT12_LENGTH &&
+            text.lowercase().startsWith("lno1") &&
+            isBech32Body(text, "lno".length)
+
+    /** BOLT12 invoices use the `lni1` prefix; the same shape rules apply. */
+    fun looksLikeBolt12Invoice(text: String): Boolean =
+        text.length >= MIN_BOLT12_LENGTH &&
+            text.lowercase().startsWith("lni1") &&
+            isBech32Body(text, "lni".length)
+
+    /**
+     * True when everything after the `1` separator at [prefixLength] is bech32 data.
+     *
+     * Accepts all-lowercase and all-uppercase bech32 (never a mix), which is what the
+     * encoding allows and what a QR scanner can hand over.
+     */
+    private fun isBech32Body(text: String, prefixLength: Int): Boolean {
+        val body = text.substring(prefixLength)
+        if (body.length < 7 || body[0] != '1') return false
+        return isBech32Data(body.substring(1))
+    }
+
+    /**
+     * True when [text] is a BOLT11 invoice: `ln` + currency + optional amount + `1` + data.
+     *
+     * The separator is the last `1` in the string, because bech32 data cannot contain one.
+     */
+    private fun isBolt11Body(text: String): Boolean {
+        val separator = text.lastIndexOf('1')
+        if (separator <= 2 || separator >= text.length - 1) return false
+        return isBech32Data(text.substring(separator + 1))
+    }
+
+    private fun isBech32Data(data: String): Boolean {
+        if (data.length < 6) return false
+        val lower = data.lowercase()
+        return lower.all { it in BECH32_CHARSET }
+    }
+
+    /** Characters bech32 data may use; `1` is only the separator. */
+    private const val BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+    /**
+     * Shortest string this wallet treats as BOLT12. A real offer carries a 33-byte signing
+     * key, a description and a signature, so it is several hundred characters; this is only
+     * a sanity floor that keeps obvious junk (`lno1q`) out of the payment flow.
+     */
+    private const val MIN_BOLT12_LENGTH = 60
 
     private fun parseBip21(text: String): PaymentInput {
         val body = text.substringAfter(':').trim()

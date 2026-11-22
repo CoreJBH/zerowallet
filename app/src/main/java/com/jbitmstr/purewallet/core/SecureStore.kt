@@ -48,8 +48,18 @@ class SecureStore(context: Context) {
 
     fun hasSeed(): Boolean = prefs.contains(KEY_SEED)
 
+    /**
+     * Forgets the seed and the key that sealed it.
+     *
+     * Removing the ciphertext alone would leave the AES key in the Android Keystore, where
+     * it outlives a wipe and could decrypt any copy of the ciphertext kept elsewhere (an
+     * old backup of the preferences, for instance). The key is deleted with the seed.
+     */
     fun clear() {
         prefs.edit().remove(KEY_SEED).apply()
+        runCatching {
+            KeyStore.getInstance(KEYSTORE).apply { load(null) }.deleteEntry(KEY_ALIAS)
+        }
     }
 
     private fun secretKey(): SecretKey {

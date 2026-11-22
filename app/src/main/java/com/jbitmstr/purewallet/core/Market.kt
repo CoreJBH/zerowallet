@@ -58,11 +58,13 @@ object Market {
         val body = httpGet("$base/v1/fees/recommended") ?: return null
         return runCatching {
             val json = JSONObject(body)
+            // Clamped like every other estimate: a stray 0 or an absurd number cannot decide
+            // what this wallet pays.
             FeeRates(
-                fastestSatPerVb = json.optLong("fastestFee", 0L).coerceAtLeast(1L),
-                halfHourSatPerVb = json.optLong("halfHourFee", 0L).coerceAtLeast(1L),
-                hourSatPerVb = json.optLong("hourFee", 0L).coerceAtLeast(1L),
-                minimumSatPerVb = json.optLong("minimumFee", 1L).coerceAtLeast(1L)
+                fastestSatPerVb = FeeEstimates.clamp(json.optLong("fastestFee", 0L)),
+                halfHourSatPerVb = FeeEstimates.clamp(json.optLong("halfHourFee", 0L)),
+                hourSatPerVb = FeeEstimates.clamp(json.optLong("hourFee", 0L)),
+                minimumSatPerVb = FeeEstimates.clamp(json.optLong("minimumFee", FeeEstimates.MIN_SAT_PER_VB))
             )
         }.getOrNull()
     }

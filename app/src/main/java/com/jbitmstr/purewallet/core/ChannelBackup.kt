@@ -9,7 +9,9 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import javax.crypto.Cipher
+import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
 /** One file inside a channel backup archive, named by its path relative to the node directory. */
@@ -40,10 +42,13 @@ class BackupException(message: String, cause: Throwable? = null) : Exception(mes
  * without the 12/24 words it is indistinguishable from random bytes, and the mnemonic
  * already has 128 bits of entropy.
  *
- * The key comes from HKDF-SHA256 (extract with the label as salt, expand with a fixed info
- * string) as of format 2. Format 1 used one plain SHA-256 over the label and the phrase;
- * those files still open, because a reader can tell the two apart from the version byte,
- * while every new backup is written as format 2.
+ * The key comes from PBKDF2-HMAC-SHA256 with 210,000 iterations and a random 16-byte salt
+ * stored in the header as of format 3 - the count OWASP recommends for PBKDF2-SHA256, and the
+ * work factor matters here because the phrase is the only secret protecting the file. The
+ * salt makes each backup's key different even for the same phrase, so a precomputed table
+ * cannot be reused across files. Format 2 used HKDF-SHA256, and format 1 one plain SHA-256
+ * over the label and the phrase; both still open, because a reader tells them apart by the
+ * version byte, while every new backup is written as format 3.
  *
  * Opening a backup is bounded: a maximum file size, a maximum number of entries and a
  * maximum uncompressed total, all checked while the stream is read rather than from the
@@ -54,11 +59,20 @@ class BackupException(message: String, cause: Throwable? = null) : Exception(mes
  */
 object ChannelBackup {
 
-    /** The format this build writes. */
-    const val FORMAT_VERSION = 2
+    /** The format this build writes: PBKDF2-HMAC-SHA256 with a random salt. */
+    const val FORMAT_VERSION = 3
 
-    /** The first format, still readable because backups outlive app versions. */
+    /** Format 2 (HKDF-SHA256), still readable because backups outlive app versions. */
+    const val HKDF_FORMAT_VERSION = 2
+
+    /** Format 1 (single SHA-256), the oldest format this wallet still opens. */
     const val LEGACY_FORMAT_VERSION = 1
+
+    /** Iterations of PBKDF2-HMAC-SHA256 for format 3 (OWASP's 2023 recommendation). */
+    const val KDF_ITERATIONS = 210_000
+
+    /** Size of the random salt in a format 3 header. */
+    const val SALT_BYTES = 16
 
     /** Largest sealed file this wallet will open (64 MiB). */
     const val MAX_BACKUP_BYTES = 64 * 1024 * 1024
@@ -79,9 +93,18 @@ object ChannelBackup {
     const val NONCE_BYTES = 12
     private const val TAG_BITS = 128
     private const val KEY_BYTES = 32
+    private const val KEY_BITS = KEY_BYTES * 8
     private const val MAGIC = "ZWBK"
-    private const val HEADER_BYTES = 4 + 1 + NONCE_BYTES
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
+    private const val PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256"
+
+    /**
+     * Header size per format: `ZWBK`, the version byte, the format 3 salt when there is one,
+     * and the nonce. A reader needs the version byte first, which sits at a fixed position
+     * in every format.
+     */
+    private fun headerBytes(version: Int): Int =
+        MAGIC.length + 1 + (if (version >= 3) SALT_BYTES else 0) + NONCE_BYTES
 
     /**
      * Domain separators so the key cannot be reused as anything else derived from the
@@ -100,17 +123,25 @@ object ChannelBackup {
     /**
      * Seals [archive] with a key derived from [mnemonic].
      *
-     * Layout: `ZWBK` + version byte + 12-byte nonce + AES-256-GCM ciphertext and tag.
-     * The header is authenticated as additional data, so no byte of it can be altered.
+     * Layout: `ZWBK` + version byte + 16-byte salt + 12-byte nonce + AES-256-GCM ciphertext
+     * and tag. The whole header is authenticated as additional data, so neither the salt nor
+     * the nonce can be altered without the tag failing.
      */
-    fun encrypt(mnemonic: String, archive: ByteArray, nonce: ByteArray? = null): ByteArray {
+    fun encrypt(
+        mnemonic: String,
+        archive: ByteArray,
+        nonce: ByteArray? = null,
+        salt: ByteArray? = null
+    ): ByteArray {
         val iv = nonce ?: ByteArray(NONCE_BYTES).also { SecureRandom().nextBytes(it) }
         require(iv.size == NONCE_BYTES) { "Nonce must be $NONCE_BYTES bytes" }
+        val formatSalt = salt ?: ByteArray(SALT_BYTES).also { SecureRandom().nextBytes(it) }
+        require(formatSalt.size == SALT_BYTES) { "Salt must be $SALT_BYTES bytes" }
         require(archive.isNotEmpty()) { "Nothing to encrypt" }
 
-        val key = deriveKey(mnemonic, FORMAT_VERSION)
+        val key = deriveKey(mnemonic, FORMAT_VERSION, formatSalt)
         try {
-            val header = header(iv)
+            val header = header(FORMAT_VERSION, formatSalt, iv)
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
                 Cipher.ENCRYPT_MODE,
@@ -132,21 +163,27 @@ object ChannelBackup {
      * that unlocks it is different from the one it was sealed with.
      */
     fun decrypt(mnemonic: String, backup: ByteArray): ByteArray {
-        if (backup.size <= HEADER_BYTES) throw BackupException("This file is too small to be a backup")
+        if (backup.size <= headerBytes(LEGACY_FORMAT_VERSION)) {
+            throw BackupException("This file is too small to be a backup")
+        }
         if (backup.size > MAX_BACKUP_BYTES) {
             throw BackupException("This backup is larger than ZeroWallet opens ($MAX_BACKUP_BYTES bytes)")
         }
         if (!looksLikeBackup(backup)) throw BackupException("This is not a ZeroWallet backup file")
         val version = backup[4].toInt() and 0xFF
-        if (version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION) {
+        if (version < LEGACY_FORMAT_VERSION || version > FORMAT_VERSION) {
             throw BackupException("This backup uses format $version, which this version of ZeroWallet cannot read")
         }
 
-        val header = backup.copyOfRange(0, HEADER_BYTES)
-        val iv = backup.copyOfRange(5, HEADER_BYTES)
-        val sealed = backup.copyOfRange(HEADER_BYTES, backup.size)
+        val headerSize = headerBytes(version)
+        if (backup.size <= headerSize) throw BackupException("This file is too small to be a backup")
+        val header = backup.copyOfRange(0, headerSize)
+        val salt = if (version >= 3) backup.copyOfRange(5, 5 + SALT_BYTES) else null
+        val ivStart = 5 + (salt?.size ?: 0)
+        val iv = backup.copyOfRange(ivStart, headerSize)
+        val sealed = backup.copyOfRange(headerSize, backup.size)
 
-        val key = deriveKey(mnemonic, version)
+        val key = deriveKey(mnemonic, version, salt)
         try {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
@@ -168,7 +205,7 @@ object ChannelBackup {
 
     /** True when [bytes] starts with this format's magic and a version this build reads. */
     fun looksLikeBackup(bytes: ByteArray): Boolean {
-        if (bytes.size < HEADER_BYTES) return false
+        if (bytes.size < headerBytes(LEGACY_FORMAT_VERSION)) return false
         if (MAGIC.indices.any { bytes[it] != MAGIC[it].code.toByte() }) return false
         return (bytes[4].toInt() and 0xFF) in LEGACY_FORMAT_VERSION..FORMAT_VERSION
     }
@@ -176,11 +213,34 @@ object ChannelBackup {
     /**
      * AES-256 key for a phrase.
      *
-     * Format 2 (current): HKDF-SHA256 with the domain label as salt. Format 1 (read only):
-     * a single SHA-256 over the label and the normalized words. The caller zeroes its copy.
+     * Format 3 (current): PBKDF2-HMAC-SHA256 over the normalized words, with the file's own
+     * salt and [KDF_ITERATIONS] rounds. Format 2: HKDF-SHA256 with the domain label as salt.
+     * Format 1: a single SHA-256 over the label and the normalized words.
+     *
+     * [salt] is required for format 3 and ignored by the older formats, which carry no salt.
      */
-    fun deriveKey(mnemonic: String, version: Int = FORMAT_VERSION): ByteArray =
-        if (version >= 2) hkdfKey(mnemonic) else legacyKey(mnemonic)
+    fun deriveKey(mnemonic: String, version: Int = FORMAT_VERSION, salt: ByteArray? = null): ByteArray =
+        when {
+            version >= 3 -> pbkdf2Key(
+                mnemonic,
+                salt ?: throw IllegalArgumentException("Format $version needs the salt from its header")
+            )
+            version == 2 -> hkdfKey(mnemonic)
+            else -> legacyKey(mnemonic)
+        }
+
+    private fun pbkdf2Key(mnemonic: String, salt: ByteArray): ByteArray {
+        val normalized = Bip39.normalize(mnemonic)
+        val passphrase = normalized.toCharArray()
+        val spec = PBEKeySpec(passphrase, salt, KDF_ITERATIONS, KEY_BITS)
+        try {
+            val factory = SecretKeyFactory.getInstance(PBKDF2_ALGORITHM)
+            return factory.generateSecret(spec).encoded
+        } finally {
+            spec.clearPassword()
+            passphrase.fill('\u0000')
+        }
+    }
 
     private fun hkdfKey(mnemonic: String): ByteArray {
         val ikm = Bip39.normalize(mnemonic).toByteArray(Charsets.UTF_8)
@@ -210,11 +270,16 @@ object ChannelBackup {
         return digest.digest().copyOf(KEY_BYTES)
     }
 
-    private fun header(iv: ByteArray): ByteArray {
-        val out = ByteArray(HEADER_BYTES)
+    private fun header(version: Int, salt: ByteArray?, iv: ByteArray): ByteArray {
+        val out = ByteArray(headerBytes(version))
         MAGIC.forEachIndexed { index, char -> out[index] = char.code.toByte() }
-        out[4] = FORMAT_VERSION.toByte()
-        iv.copyInto(out, 5)
+        out[4] = version.toByte()
+        var offset = 5
+        if (version >= 3 && salt != null) {
+            salt.copyInto(out, offset)
+            offset += SALT_BYTES
+        }
+        iv.copyInto(out, offset)
         return out
     }
 

@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.FeePriority
+import com.jbitmstr.purewallet.core.OnchainFeeEstimate
 import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.PaymentInputKind
 import com.jbitmstr.purewallet.core.PaymentInputParser
@@ -66,6 +67,9 @@ fun SendSheet(
     var priority by remember { mutableStateOf(FeePriority.NORMAL) }
     var sendAll by remember { mutableStateOf(false) }
     var feeRate by remember { mutableStateOf<Long?>(null) }
+    // A BIP-21 QR can offer both an on-chain address and a Lightning invoice. Lightning is
+    // the cheaper route and the default; this lets the other one be chosen instead.
+    var viaLightning by remember { mutableStateOf(true) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var reference by remember { mutableStateOf<String?>(null) }
@@ -81,7 +85,8 @@ fun SendSheet(
         }
     }
 
-    val onchain = target?.input?.kind == PaymentInputKind.ONCHAIN
+    val lightningRoute = target?.lightning != null && viaLightning
+    val onchain = target?.input?.kind == PaymentInputKind.ONCHAIN && !lightningRoute
     val needsAmount = target?.amountEditable == true
 
     LaunchedEffect(onchain, priority) {
@@ -108,6 +113,7 @@ fun SendSheet(
                 target = resolved
                 amountText = resolved.amountSats?.toString() ?: ""
                 sendAll = false
+                viaLightning = true
             }.onFailure {
                 target = null
                 error = it.message ?: "Could not read this payment request"
@@ -127,7 +133,7 @@ fun SendSheet(
             scope.launch {
                 busy = true
                 error = null
-                val outcome = if (current.input.kind == PaymentInputKind.ONCHAIN && sendAll) {
+                val outcome = if (current.input.kind == PaymentInputKind.ONCHAIN && sendAll && !lightningRoute) {
                     vm.sendOnchain(
                         address = current.input.address.orEmpty(),
                         amountSats = null,
@@ -135,7 +141,7 @@ fun SendSheet(
                         priority = priority
                     )
                 } else {
-                    vm.pay(current, amount, priority)
+                    vm.pay(current, amount, priority, viaLightning)
                 }
                 outcome.onSuccess { reference = it }.onFailure {
                     error = it.message ?: "The payment could not be sent"
@@ -242,6 +248,13 @@ fun SendSheet(
                     .padding(16.dp)
             ) {
                 LabelRow("Type", kindLabel(current.input.kind))
+                if (current.hasLightningAlternative) {
+                    Spacer(Modifier.height(8.dp))
+                    LabelRow(
+                        "Route",
+                        if (viaLightning) "Lightning (offered by this QR)" else "On-chain address"
+                    )
+                }
                 if (current.description.isNotBlank()) {
                     Spacer(Modifier.height(8.dp))
                     LabelRow("Description", current.description)
@@ -295,6 +308,32 @@ fun SendSheet(
                 }
             }
 
+            if (current.hasLightningAlternative) {
+                Spacer(Modifier.height(16.dp))
+                Text("Route", color = Pal.TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(8.dp))
+                SegmentedOptions(
+                    options = listOf("Lightning", "On-chain"),
+                    selected = if (viaLightning) 0 else 1,
+                    onSelect = {
+                        viaLightning = it == 0
+                        if (viaLightning) sendAll = false
+                    }
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (viaLightning) {
+                        "Paid over Lightning from this QR's invoice. It settles at once and costs " +
+                            "routing fees instead of an on-chain fee."
+                    } else {
+                        "Paid to the on-chain address in this QR, with the fee below."
+                    },
+                    color = Pal.TextTertiary,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
+                )
+            }
+
             if (onchain) {
                 Spacer(Modifier.height(16.dp))
                 Text("Fee", color = Pal.TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
@@ -305,8 +344,17 @@ fun SendSheet(
                     onSelect = { priority = if (it == 0) FeePriority.NORMAL else FeePriority.FAST }
                 )
                 Spacer(Modifier.height(8.dp))
+                // Both numbers, because they answer different questions: the rate is what the
+                // network is charging now, the total is what this payment takes out of the
+                // balance. One input and one change output is the usual shape; the node
+                // computes the real fee from the transaction it signs.
+                val outputs = if (sendAll) 1 else 2
+                val vBytes = OnchainFeeEstimate.vBytes(inputs = 1, outputs = outputs)
+                val estimate = feeRate?.let { OnchainFeeEstimate.feeSats(it, inputs = 1, outputs = outputs) }
                 Text(
-                    "Network fee rate: ${feeRate ?: "…"} sat/vB. The exact fee is set by the transaction size.",
+                    "Estimated fee: ${if (estimate != null) "${Fmt.sats(estimate)} sats" else "…"} " +
+                        "(${feeRate ?: "…"} sat/vB × ~$vBytes vB). The node sets the exact fee " +
+                        "from the transaction it signs.",
                     color = Pal.TextTertiary,
                     fontSize = 11.sp,
                     lineHeight = 15.sp
@@ -338,6 +386,7 @@ fun SendSheet(
                     target = null
                     reference = null
                     error = null
+                    viaLightning = true
                 },
                 modifier = Modifier.fillMaxWidth()
             )

@@ -82,12 +82,19 @@ so a reinstall needs the previous build removed first.
   longer than 12.
 - **Encrypted channel backup.** The node store (channel manager and monitors, on-chain wallet,
   node keys) is packed into one `.zwbackup` file sealed with AES-256-GCM under a key derived
-  from the recovery phrase with HKDF-SHA256. Android's own file picker saves it to Google
+  from the recovery phrase with PBKDF2-HMAC-SHA256: 210,000 iterations and a random 16-byte
+  salt that rides in the header (format 3). Android's own file picker saves it to Google
   Drive or anywhere else, or the share sheet does, with no Google Play Services and no OAuth.
-  Restoring it on a replacement phone after entering the phrase brings the open channels
-  back, and asks for the same proof as a payment first. Importing is bounded (64 MB file,
-  4096 entries, 128 MB unpacked) so a wrong pick or a crafted archive cannot exhaust the
-  phone, and the plaintext store is zeroed as soon as it has been read or written.
+  Backups written by older builds (format 2 with HKDF-SHA256, format 1 with one SHA-256)
+  still open, because the version byte says which derivation to use. Restoring it on a
+  replacement phone after entering the phrase brings the open channels back, and asks for the
+  same proof as a payment first. Importing is bounded (64 MB file, 4096 entries, 128 MB
+  unpacked) so a wrong pick or a crafted archive cannot exhaust the phone, and the plaintext
+  store is zeroed as soon as it has been read or written.
+- **A confirmation that proves something.** Confirming a new backup asks for two words drawn
+  at random from the phrase (never a fixed pair that anyone who has seen the app would know),
+  in password fields with autocorrect off, so neither the words nor the answer reach a
+  keyboard's learned history.
 - **Never ₿0 while it starts.** A start takes seconds (the node opens its store and syncs
   with Esplora). The last known on-chain and Lightning balance, block height, sync time and
   payment list are kept on the device after every real sync and shown while the node comes
@@ -130,16 +137,41 @@ so a reinstall needs the previous build removed first.
   is accepted only for a node on the phone itself: `localhost`, `::1` or a literal address in
   `127.0.0.0/8`, checked octet by octet (a public host that merely starts with `127.` is not
   loopback). Credentials, query strings and fragments in the URL are rejected, and a stored
-  value that no longer passes is ignored in favour of the built-in default.
+  value that no longer passes is ignored in favour of the built-in default. The rule is
+  enforced twice: in `EsploraUrl` for the value the user types, and by
+  `res/xml/network_security_config.xml`, which keeps `usesCleartextTraffic="false"` for the
+  internet and permits cleartext only for `127.0.0.1` and `localhost`.
+- **Fees that cannot be talked into overpaying.** Fee estimates are parsed as JSON (a string
+  inside the reply cannot become a rate), skipped when they are not numbers, and clamped to
+  1..1000 sat/vB before the node turns them into a `FeeRate`. The send confirmation shows
+  both the rate and the estimated total (`rate × ~size` for one input and one change output),
+  so the number that leaves the balance is on screen next to the number it came from.
+- **BOLT12 stays on its chain.** A BOLT12 invoice names its chain by genesis hash and an offer
+  by the chains it accepts; both are checked against the running network before the payment
+  screen, along with the bech32 shape of the string (`lno1`/`lni1` with a valid data part), so
+  a truncated offer or an invoice from another chain is refused where it can still be fixed.
+- **A BIP-21 QR that offers both halves.** When a QR carries `lightning=` next to the address,
+  the wallet resolves that invoice too and pays over Lightning when a usable channel has the
+  outbound balance for it and both halves agree on the amount; the on-chain address stays one
+  tap away and is used unchanged whenever the Lightning half is expired, from another chain,
+  a different amount, or unpayable right now.
 - **One lock around the node.** Every JNI call into ldk-node runs on an IO thread while the
   node is held by the same mutex that serialises starts and stops, so a stop, wipe or
   restart can never destroy a node a sync or payment is still using. A stop also waits for
   the event loop to leave its blocking native call before the node is destroyed.
-- **Wipe leaves nothing readable.** Wiping the wallet deletes the seed, every chain's node
+- **Wipe leaves nothing readable.** Wiping the wallet asks for the same proof as a payment
+  first, then deletes the seed, the Android Keystore key that sealed it, every chain's node
   data, the payment notes, the settings, the node log (which names peers and channels) and
-  the cache copies of exported backups.
-- **Bounded logs.** `logs/ldk-node.log` is capped at 2 MB and rotated with two archives while
-  the node is stopped, so a long-running install cannot fill the phone with logs.
+  the cache copies of exported backups. Deleting the ciphertext alone would leave the key
+  behind for any old copy of the preferences file.
+- **No plaintext node log in a release build.** `ldk-node`'s filesystem logger writes
+  addresses, peers and channel ids to `logs/ldk-node.log`, so it is enabled only in a debug
+  build; a release build starts the node without it and removes a log left by an older
+  install. Exception logging in the node manager is behind `BuildConfig.DEBUG` for the same
+  reason, and the release build is `isMinifyEnabled`, `isShrinkResources` and not debuggable.
+- **Bounded logs.** In a debug build `logs/ldk-node.log` is capped at 2 MB and rotated with
+  two archives while the node is stopped, so a long-running install cannot fill the phone
+  with logs.
 - **No phone-home.** No analytics, no crash reporting, no remote logging. Network requests
   are limited to the configured Esplora endpoint (or another public Esplora when the saved
   one is itself a public default that did not answer) and public price endpoints.
@@ -179,9 +211,10 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
 - `core/ScreenSecurity.kt` applies `FLAG_SECURE` to the wallet window.
 - `core/EsploraUrl.kt` holds the endpoint rules; `core/Prefs.kt` refuses to store anything
   that fails them.
-- `core/FeeEstimates.kt` reads the standard Esplora `/fee-estimates` reply (confirmation
-  target to sat/vB), so fee estimates work on any Esplora endpoint rather than only on
-  mempool.space's numbered helper.
+- `core/FeeEstimates.kt` reads the standard Esplora `/fee-estimates` reply as JSON
+  (confirmation target to sat/vB, clamped to 1..1000), so fee estimates work on any Esplora
+  endpoint rather than only on mempool.space's numbered helper; `OnchainFeeEstimate` turns a
+  rate into the total shown on the confirmation screen.
 - `core/NodeLog.kt` rotates the LDK log file with a size cap.
 - `core/Bip39.kt` implements BIP-39 generation and validation in plain Kotlin, covered by
   unit tests against the official vectors.
@@ -203,7 +236,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.9`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.10`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -231,7 +264,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 178 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, backup encryption round trip, format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the strict 127.0.0.0/8 loopback check and the mainnet default, address-prefix chain matching, Esplora fee estimates, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle |
+| Unit tests | `./gradlew testDebugUnitTest` | 200 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the strict 127.0.0.0/8 loopback check and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle |
 | Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
 | Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro` |
 | English-only repository | `python3 verify-english.py` | no non-English characters |

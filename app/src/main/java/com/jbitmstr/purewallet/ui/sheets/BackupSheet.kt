@@ -26,6 +26,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.jbitmstr.purewallet.core.SeedChallenge
 import com.jbitmstr.purewallet.ui.components.Banner
 import com.jbitmstr.purewallet.ui.components.GhostButton
 import com.jbitmstr.purewallet.ui.components.PrimaryButton
@@ -46,9 +47,11 @@ fun BackupSheet(
     onDismiss: () -> Unit
 ) {
     val words = remember(mnemonic) { mnemonic.trim().split(Regex("\\s+")).filter { it.isNotEmpty() } }
-    val challenge = remember(words) {
-        if (words.size >= 8) listOf(2, 7) else listOf(0, words.size - 1)
-    }
+    // Two different words picked at random from this phrase, not a fixed pair: a fixed pair
+    // is known to anyone, so it would confirm nothing beyond the fact that the words were
+    // on screen. The draw happens once per phrase, so the question does not jump around
+    // while it is being answered.
+    val challenge = remember(words) { SeedChallenge.indices(words.size) }
     var step by remember { mutableIntStateOf(0) }
     var firstAnswer by remember { mutableStateOf("") }
     var secondAnswer by remember { mutableStateOf("") }
@@ -145,7 +148,10 @@ fun BackupSheet(
                 value = firstAnswer,
                 onValueChange = { firstAnswer = it; error = null },
                 placeholder = "Type word ${challenge[0] + 1}",
-                keyboardType = KeyboardType.Text
+                // A seed word is a secret: no suggestions, no learned history, no
+                // autocorrect rewriting it under the user's eyes.
+                keyboardType = KeyboardType.Password,
+                autoCorrectEnabled = false
             )
             Spacer(Modifier.height(16.dp))
             Text(
@@ -159,7 +165,8 @@ fun BackupSheet(
                 value = secondAnswer,
                 onValueChange = { secondAnswer = it; error = null },
                 placeholder = "Type word ${challenge[1] + 1}",
-                keyboardType = KeyboardType.Text
+                keyboardType = KeyboardType.Password,
+                autoCorrectEnabled = false
             )
 
             if (error != null) {

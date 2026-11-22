@@ -25,6 +25,21 @@ object NodeLog {
     fun file(context: Context): File = File(File(context.filesDir, "logs"), FILE_NAME)
 
     /**
+     * Removes the active log and every archive.
+     *
+     * A release build runs the node without a filesystem logger, so whatever an earlier
+     * debug build left behind would otherwise sit on the phone forever.
+     */
+    fun deleteAll(log: File, archiveCount: Int = ARCHIVE_COUNT): Boolean {
+        var removed = false
+        if (log.delete()) removed = true
+        for (index in 1..archiveCount) {
+            if (File(log.path + "." + index).delete()) removed = true
+        }
+        return removed
+    }
+
+    /**
      * Rotates [log] when it is larger than [maxBytes].
      *
      * The active file becomes `.1` and every archive shifts one number up, dropping the

@@ -25,6 +25,7 @@ class ChannelBackupTest {
         "legal winner thank year wave sausage worth useful legal winner thank yellow"
     private val otherMnemonic =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    private val salt = ByteArray(ChannelBackup.SALT_BYTES) { (it * 7 + 1).toByte() }
 
     private fun manifest(network: String = "mainnet") = BackupManifest(
         network = network,
@@ -87,15 +88,45 @@ class ChannelBackupTest {
         val archive = ChannelBackup.buildArchive(manifest(), sampleFiles())
         val sealed = ChannelBackup.encrypt(mnemonic, archive)
         assertArrayEquals(archive, ChannelBackup.decrypt(messy, sealed))
-        assertArrayEquals(ChannelBackup.deriveKey(mnemonic), ChannelBackup.deriveKey(messy))
+        assertArrayEquals(
+            ChannelBackup.deriveKey(mnemonic, salt = salt),
+            ChannelBackup.deriveKey(messy, salt = salt)
+        )
     }
 
     @Test
     fun derivedKeyIsA256BitSecretThatDiffersPerPhrase() {
-        val key = ChannelBackup.deriveKey(mnemonic)
+        val key = ChannelBackup.deriveKey(mnemonic, salt = salt)
         assertEquals(32, key.size)
-        assertArrayEquals(key, ChannelBackup.deriveKey(mnemonic))
-        assertFalse(key.contentEquals(ChannelBackup.deriveKey(otherMnemonic)))
+        assertArrayEquals(key, ChannelBackup.deriveKey(mnemonic, salt = salt))
+        assertFalse(key.contentEquals(ChannelBackup.deriveKey(otherMnemonic, salt = salt)))
+    }
+
+    @Test
+    fun theSaltIsInTheHeaderAndTheKeyFollowsIt() {
+        val archive = ChannelBackup.buildArchive(manifest(), sampleFiles())
+        val first = ChannelBackup.encrypt(mnemonic, archive)
+        val second = ChannelBackup.encrypt(mnemonic, archive)
+        // Format 3: magic, version, 16-byte salt, 12-byte nonce.
+        assertNotEquals(first.copyOfRange(5, 21).toList(), second.copyOfRange(5, 21).toList())
+        assertNotEquals(first.copyOfRange(21, 33).toList(), second.copyOfRange(21, 33).toList())
+        assertArrayEquals(archive, ChannelBackup.decrypt(mnemonic, first))
+        assertArrayEquals(archive, ChannelBackup.decrypt(mnemonic, second))
+        // Same phrase, different salt: a stolen backup cannot be compared with another one
+        // to learn whether the phrase is the same.
+        assertFalse(
+            ChannelBackup.deriveKey(mnemonic, 3, first.copyOfRange(5, 21))
+                .contentEquals(ChannelBackup.deriveKey(mnemonic, 3, second.copyOfRange(5, 21)))
+        )
+    }
+
+    @Test
+    fun aTamperedSaltFailsTheTag() {
+        val archive = ChannelBackup.buildArchive(manifest(), sampleFiles())
+        val sealed = ChannelBackup.encrypt(mnemonic, archive)
+        val damaged = sealed.copyOf().also { it[10] = (it[10].toInt() xor 0x01).toByte() }
+        val failure = runCatching { ChannelBackup.decrypt(mnemonic, damaged) }.exceptionOrNull()
+        assertTrue(failure is BackupException)
     }
 
     @Test
@@ -141,17 +172,35 @@ class ChannelBackupTest {
         val archive = ChannelBackup.buildArchive(manifest(), sampleFiles())
         val first = ChannelBackup.encrypt(mnemonic, archive)
         val second = ChannelBackup.encrypt(mnemonic, archive)
-        assertNotEquals(first[5], second[5])
+        val nonceStart = 5 + ChannelBackup.SALT_BYTES
+        assertNotEquals(
+            first.copyOfRange(nonceStart, nonceStart + ChannelBackup.NONCE_BYTES).toList(),
+            second.copyOfRange(nonceStart, nonceStart + ChannelBackup.NONCE_BYTES).toList()
+        )
         assertArrayEquals(archive, ChannelBackup.decrypt(mnemonic, second))
     }
 
     @Test
-    fun backupsAreWrittenAsFormatTwo() {
+    fun backupsAreWrittenAsFormatThree() {
         val archive = ChannelBackup.buildArchive(manifest(), sampleFiles())
         val sealed = ChannelBackup.encrypt(mnemonic, archive)
-        assertEquals(2, sealed[4].toInt())
+        assertEquals(3, sealed[4].toInt())
         assertEquals(ChannelBackup.FORMAT_VERSION, sealed[4].toInt())
         assertTrue(ChannelBackup.looksLikeBackup(sealed))
+        // header + tag + ciphertext: the archive is bigger than the header, and the file
+        // carries no plaintext of it.
+        assertTrue(sealed.size > 5 + ChannelBackup.SALT_BYTES + ChannelBackup.NONCE_BYTES + 16)
+    }
+
+    @Test
+    fun aFormatTwoBackupFromAnOlderBuildStillOpens() {
+        // Format 2 sealed with HKDF-SHA256 and an unsalted header. Those files are in
+        // people's Google Drive already, so this build must still read them.
+        val archive = ChannelBackup.buildArchive(manifest(), sampleFiles())
+        val formatTwo = sealAsFormatTwo(archive)
+        assertEquals(2, formatTwo[4].toInt())
+        assertTrue(ChannelBackup.looksLikeBackup(formatTwo))
+        assertArrayEquals(archive, ChannelBackup.decrypt(mnemonic, formatTwo))
     }
 
     @Test
@@ -166,12 +215,39 @@ class ChannelBackupTest {
     }
 
     @Test
-    fun theTwoKeyDerivationsDifferForTheSamePhrase() {
-        val current = ChannelBackup.deriveKey(mnemonic, ChannelBackup.FORMAT_VERSION)
+    fun theKeyDerivationsDifferForTheSamePhrase() {
+        val current = ChannelBackup.deriveKey(mnemonic, ChannelBackup.FORMAT_VERSION, salt)
+        val hkdf = ChannelBackup.deriveKey(mnemonic, ChannelBackup.HKDF_FORMAT_VERSION)
         val legacy = ChannelBackup.deriveKey(mnemonic, ChannelBackup.LEGACY_FORMAT_VERSION)
         assertEquals(32, current.size)
+        assertEquals(32, hkdf.size)
         assertEquals(32, legacy.size)
+        assertFalse(current.contentEquals(hkdf))
+        assertFalse(hkdf.contentEquals(legacy))
         assertFalse(current.contentEquals(legacy))
+    }
+
+    @Test
+    fun aFormatThreeKeyNeedsItsSalt() {
+        val failure = runCatching { ChannelBackup.deriveKey(mnemonic, 3) }.exceptionOrNull()
+        assertTrue(failure is IllegalArgumentException)
+    }
+
+    /** Builds the format-2 envelope by hand: magic, version 2, nonce, AES-GCM with the HKDF key. */
+    private fun sealAsFormatTwo(archive: ByteArray): ByteArray {
+        val nonce = ByteArray(ChannelBackup.NONCE_BYTES) { (it + 3).toByte() }
+        val header = ByteArray(4 + 1 + ChannelBackup.NONCE_BYTES)
+        "ZWBK".forEachIndexed { index, char -> header[index] = char.code.toByte() }
+        header[4] = 2
+        nonce.copyInto(header, 5)
+        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            javax.crypto.Cipher.ENCRYPT_MODE,
+            javax.crypto.spec.SecretKeySpec(ChannelBackup.deriveKey(mnemonic, 2), "AES"),
+            javax.crypto.spec.GCMParameterSpec(128, nonce)
+        )
+        cipher.updateAAD(header)
+        return header + cipher.doFinal(archive)
     }
 
     /** Builds the format-1 envelope by hand: magic, version 1, nonce, AES-GCM with the old key. */

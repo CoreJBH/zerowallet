@@ -533,8 +533,12 @@ fun SettingsSheet(
             confirmButton = {
                 TextButton(onClick = {
                     confirmWipe = false
-                    vm.wipeWallet()
-                    onClose()
+                    // A wipe deletes the only copy of the seed on this phone, so it asks for
+                    // the same proof as a payment before it runs.
+                    onAuthorize("Authenticate to wipe this wallet.") {
+                        vm.wipeWallet()
+                        onClose()
+                    }
                 }) {
                     Text("Wipe", color = Pal.Danger)
                 }
