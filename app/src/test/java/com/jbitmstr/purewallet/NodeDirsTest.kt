@@ -58,6 +58,14 @@ class NodeDirsTest {
     }
 
     @Test
+    fun everyHalfWrittenImportGoesWhicheverChainItWasFor() {
+        // A folder an import was writing into never became the wallet, so nothing is lost by
+        // clearing it - including one left on a chain that is not open now.
+        val names = listOf("incoming-mainnet-1", "incoming-signet-2", "mainnet", "previous-mainnet-3")
+        assertEquals(listOf("incoming-mainnet-1", "incoming-signet-2"), NodeDirs.incomingDirs(names))
+    }
+
+    @Test
     fun previousAndIncomingAreNotConfused() {
         assertTrue(NodeDirs.isPrevious("previous-mainnet-1", "mainnet"))
         assertFalse(NodeDirs.isPrevious("incoming-mainnet-1", "mainnet"))

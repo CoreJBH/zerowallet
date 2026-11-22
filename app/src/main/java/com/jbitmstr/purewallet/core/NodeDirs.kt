@@ -30,6 +30,14 @@ internal object NodeDirs {
     fun isIncoming(name: String, networkId: String): Boolean =
         name.startsWith("$INCOMING-$networkId-")
 
+    /**
+     * True for any folder an import was writing into, whichever chain it was for.
+     *
+     * Such a folder is a backup that never reached the swap, so it is never a wallet: every
+     * one of them can go, including one left by an import on a chain that is not open now.
+     */
+    fun isAnyIncoming(name: String): Boolean = name.startsWith("$INCOMING-")
+
     /** True for a folder holding a store [networkId] displaced. */
     fun isPrevious(name: String, networkId: String): Boolean =
         name.startsWith("$PREVIOUS-$networkId-")
@@ -43,4 +51,7 @@ internal object NodeDirs {
      */
     fun newestPrevious(names: List<String>, networkId: String): String? =
         names.filter { isPrevious(it, networkId) }.maxOrNull()
+
+    /** Every folder an interrupted import left half-written, for the caller to clear. */
+    fun incomingDirs(names: List<String>): List<String> = names.filter { isAnyIncoming(it) }
 }

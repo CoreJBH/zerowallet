@@ -2002,7 +2002,7 @@ class NodeManager(context: Context) {
                 }
             }
         }
-        folders.filter { NodeDirs.isIncoming(it, network.id) }.forEach { name ->
+        NodeDirs.incomingDirs(folders).forEach { name ->
             runCatching { File(root, name).deleteRecursively() }
         }
     }

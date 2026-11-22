@@ -116,7 +116,10 @@ class TenthReviewSourceTest {
         assertTrue("the start puts a missing store back", start.contains("recoverNodeDirs(network)"))
         val recover = body(text, "private fun recoverNodeDirs(")
         assertTrue("from the newest displaced folder", recover.contains("NodeDirs.newestPrevious"))
-        assertTrue("and clears the fragments of an import", recover.contains("NodeDirs.isIncoming"))
+        assertTrue(
+            "and clears the fragments of every half-written import",
+            recover.contains("NodeDirs.incomingDirs")
+        )
         assertTrue(
             "the import names its folders per chain",
             text.contains("NodeDirs.incoming(network.id, stamp)") &&
