@@ -47,7 +47,7 @@ class SealedStorageTest {
     @Test
     fun aSnapshotIsWrittenWholeWhenEveryValueCanBeSealed() {
         val store = FakeSharedPreferences()
-        val prefs = Prefs(store, ::workingSealer, { value, _ -> value.removePrefix("v1:<sealed>") })
+        val prefs = Prefs(store, ::workingSealer, { value -> value.removePrefix("v1:<sealed>") })
 
         assertTrue(prefs.saveCachedWallet(ChainNetwork.MAINNET, snapshot()))
 
@@ -61,7 +61,7 @@ class SealedStorageTest {
     @Test
     fun nothingIsWrittenInPlainTextWhenTheKeystoreRefusesToSeal() {
         val store = FakeSharedPreferences()
-        val prefs = Prefs(store, { null }, { _, _ -> null })
+        val prefs = Prefs(store, { null }, { null })
 
         assertFalse(prefs.saveCachedWallet(ChainNetwork.MAINNET, snapshot()))
 
@@ -79,7 +79,7 @@ class SealedStorageTest {
         val prefs = Prefs(
             store,
             { value -> if (sealing) workingSealer(value) else null },
-            { value, _ -> value.removePrefix("v1:<sealed>") }
+            { value -> value.removePrefix("v1:<sealed>") }
         )
 
         assertTrue(prefs.saveCachedWallet(ChainNetwork.MAINNET, snapshot(onchain = 400_000L)))
@@ -105,7 +105,7 @@ class SealedStorageTest {
                 calls += 1
                 if (calls == 3) null else workingSealer(value)
             },
-            { value, _ -> value.removePrefix("v1:<sealed>") }
+            { value -> value.removePrefix("v1:<sealed>") }
         )
 
         assertFalse(prefs.saveCachedWallet(ChainNetwork.MAINNET, snapshot()))
@@ -116,7 +116,7 @@ class SealedStorageTest {
     @Test
     fun clearingEveryCacheForgetsEachChainNotJustTheActiveOne() {
         val store = FakeSharedPreferences()
-        val prefs = Prefs(store, ::workingSealer, { value, _ -> value.removePrefix("v1:<sealed>") })
+        val prefs = Prefs(store, ::workingSealer, { value -> value.removePrefix("v1:<sealed>") })
 
         ChainNetwork.entries.forEach { network ->
             assertTrue(prefs.saveCachedWallet(network, snapshot()))
@@ -132,7 +132,7 @@ class SealedStorageTest {
     @Test
     fun clearingOneChainLeavesTheOthers() {
         val store = FakeSharedPreferences()
-        val prefs = Prefs(store, ::workingSealer, { value, _ -> value.removePrefix("v1:<sealed>") })
+        val prefs = Prefs(store, ::workingSealer, { value -> value.removePrefix("v1:<sealed>") })
         assertTrue(prefs.saveCachedWallet(ChainNetwork.MAINNET, snapshot()))
         assertTrue(prefs.saveCachedWallet(ChainNetwork.SIGNET, snapshot()))
 
@@ -165,142 +165,77 @@ class SealedStorageTest {
     }
 
     @Test
-    fun aPaymentNoteFromAnOlderBuildIsStillRead() {
+    fun aPaymentNoteFromAnOlderBuildIsRefused() {
         val store = FakeSharedPreferences()
         store.values["abc123"] = "Coffee"
         val notes = PaymentNotes(store, ::workingSealer)
 
-        // No `v1:` marker: the plain value older builds wrote reads back as it is.
-        assertEquals("Coffee", notes.get("abc123"))
+        // No `v1:` marker: not a note this build wrote, and 1.2.0 has no window in which an
+        // unsealed value is handed back. A description is the cheapest thing in the file to
+        // lose; a way to read plain values back is not.
+        assertNull(notes.get("abc123"))
     }
-    // ------------------------------------------ plain values, once the migration has run
 
-    /** The production unsealer's policy: a plain value only while the migration has not run. */
-    private val policyUnsealer: (String, Boolean) -> String? = { value, allowPlain ->
-        if (!allowPlain && !value.startsWith("v1:")) null else value.removePrefix("v1:<sealed>")
+    // ------------------------------------------------ plain values are no longer read
+
+    /** The production unsealer: only a sealed value opens. */
+    private val unsealer: (String) -> String? = { value ->
+        if (!value.startsWith("v1:")) null else value.removePrefix("v1:<sealed>")
     }
 
     @Test
-    fun anOlderBuildsPlainNumbersStillReadBeforeTheMigration() {
+    fun anOlderBuildsPlainNumbersAreNotRead() {
         val store = FakeSharedPreferences()
         store.values["cache_saved_at_mainnet"] = 1_763_000_000_000L
         store.values["cache_onchain_mainnet"] = 250_000L
         store.values["cache_lightning_mainnet"] = 1_000L
-        val prefs = Prefs(store, ::workingSealer, policyUnsealer)
+        val prefs = Prefs(store, ::workingSealer, unsealer)
 
-        // 1.1.10 stored the numbers themselves; the upgrade has not sealed them yet.
-        assertEquals(250_000L, prefs.cachedWallet(ChainNetwork.MAINNET)?.onchainSats)
+        // 1.1.10 stored the numbers themselves. Handing those back - which 1.1.18 did while
+        // it re-sealed them - made an unsealed value a balance on the screen, so 1.2.0 refuses
+        // them all. The snapshot is a cache of what the node will say on its next sync.
+        val cached = prefs.cachedWallet(ChainNetwork.MAINNET)
+        assertEquals(0L, cached?.onchainSats)
+        assertEquals(0L, cached?.lightningSats)
+        assertNull(cached?.bestHeight)
     }
 
     @Test
-    fun theMigrationSealsThemAndThenAPlainValueIsRefused() {
+    fun aTamperedPlainValueIsNotABalance() {
         val store = FakeSharedPreferences()
-        store.values["cache_saved_at_mainnet"] = 1_763_000_000_000L
-        store.values["cache_onchain_mainnet"] = 250_000L
-        store.values["cache_lightning_mainnet"] = 1_000L
-        val prefs = Prefs(store, ::workingSealer, policyUnsealer)
+        val prefs = Prefs(store, ::workingSealer, unsealer)
+        assertTrue(prefs.saveCachedWallet(ChainNetwork.MAINNET, snapshot()))
 
-        prefs.migratePlainTextValues()
-
-        assertEquals("v1:<sealed>250000", store.values["cache_onchain_mainnet"])
-        assertEquals("v1:<sealed>1000", store.values["cache_lightning_mainnet"])
-        assertEquals(250_000L, prefs.cachedWallet(ChainNetwork.MAINNET)?.onchainSats)
-
-        // Anything plain that turns up after this is not something this app wrote: a
-        // tampered or corrupted file must not become the balance on the screen.
+        // A value this app did not write never becomes what the wallet shows, in either
+        // direction: a number, or a string without the seal marker.
         store.values["cache_onchain_mainnet"] = 999_999_999L
         assertEquals(0L, prefs.cachedWallet(ChainNetwork.MAINNET)?.onchainSats)
-    }
-
-    @Test
-    fun aMigrationThatCannotSealLeavesTheMarkerForTheNextStart() {
-        val store = FakeSharedPreferences()
-        store.values["cache_saved_at_mainnet"] = 1_763_000_000_000L
-        store.values["cache_onchain_mainnet"] = 250_000L
-        val prefs = Prefs(store, { null }, policyUnsealer)
-
-        prefs.migratePlainTextValues()
-
-        assertEquals(250_000L, store.values["cache_onchain_mainnet"])
-        assertFalse(
-            "the marker is only set when every value is sealed",
-            store.values.containsKey("plain_values_migrated_1_1_18")
-        )
-        // And the value is still readable, so the history is not lost while it waits.
-        assertEquals(250_000L, prefs.cachedWallet(ChainNetwork.MAINNET)?.onchainSats)
-    }
-
-    @Test
-    fun theMigrationRunsOnce() {
-        val store = FakeSharedPreferences()
-        store.values["cache_saved_at_mainnet"] = 1_763_000_000_000L
-        store.values["cache_onchain_mainnet"] = 250_000L
-        var seals = 0
-        val prefs = Prefs(store, { value -> seals += 1; workingSealer(value) }, policyUnsealer)
-
-        prefs.migratePlainTextValues()
-        prefs.migratePlainTextValues()
-
-        assertEquals(1, seals)
+        store.values["cache_onchain_mainnet"] = "999999999"
+        assertEquals(0L, prefs.cachedWallet(ChainNetwork.MAINNET)?.onchainSats)
     }
 
     // ------------------------------------------------------ payment notes on the same rule
 
     @Test
-    fun aPlainNoteIsStillReadWhileTheMigrationHasNotRun() {
+    fun aNoteThatCannotBeReadIsNoNote() {
         val store = FakeSharedPreferences()
-        store.values["abc123"] = "Coffee"
-        val notes = PaymentNotes(store, ::workingSealer)
-        assertEquals("Coffee", notes.get("abc123"))
-    }
-
-    @Test
-    fun aPlainNoteIsRefusedOnceTheNotesAreMigrated() {
-        val store = FakeSharedPreferences()
-        store.values["plain_notes_migrated_1_1_18"] = true
-        store.values["abc123"] = "Coffee"
+        store.values["abc123"] = "not a sealed value"
         val notes = PaymentNotes(store, ::workingSealer)
         assertNull(notes.get("abc123"))
     }
 
     @Test
-    fun theNoteMigrationSealsWhatItFindsAndRecordsIt() {
+    fun theNewestNoteIsDroppedFirstWhenTheFileIsFull() {
         val store = FakeSharedPreferences()
-        store.values["abc123"] = "Coffee"
-        store.values["def456"] = "v1:<sealed>Taxi"
-        val notes = PaymentNotes(store, ::workingSealer)
-
-        notes.migratePlainTextNotes()
-
-        assertEquals("v1:<sealed>Coffee", store.values["abc123"])
-        assertEquals("v1:<sealed>Taxi", store.values["def456"])
-        assertEquals(true, store.values["plain_notes_migrated_1_1_18"])
-    }
-
-    @Test
-    fun aNoteTheKeystoreWillNotSealKeepsTheMigrationOpen() {
-        val store = FakeSharedPreferences()
-        store.values["abc123"] = "Coffee"
-        val notes = PaymentNotes(store, { null })
-
-        notes.migratePlainTextNotes()
-
-        assertEquals("Coffee", store.values["abc123"])
-        assertFalse(store.values.containsKey("plain_notes_migrated_1_1_18"))
-    }
-
-    @Test
-    fun theMigrationMarkerIsNeverEvictedToMakeRoomForANote() {
-        val store = FakeSharedPreferences()
-        store.values["plain_notes_migrated_1_1_18"] = true
         repeat(501) { index -> store.values["hash$index"] = "v1:<sealed>note" }
         val notes = PaymentNotes(store, ::workingSealer)
 
         assertTrue(notes.put("newhash", "Coffee"))
 
-        assertEquals(true, store.values["plain_notes_migrated_1_1_18"])
+        // The file stays bounded, and the note just written is not one of the ones evicted.
+        assertEquals("v1:<sealed>Coffee", store.values["newhash"])
+        assertTrue("the file grew past its limit: ${store.values.size}", store.values.size <= 500)
     }
-
 }
 
 /** In-memory [SharedPreferences] for the JVM tests; `android.jar` here is only a stub. */

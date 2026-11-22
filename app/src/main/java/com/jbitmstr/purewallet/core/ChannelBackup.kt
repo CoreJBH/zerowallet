@@ -3,6 +3,9 @@ package com.jbitmstr.purewallet.core
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FilterOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.zip.ZipEntry
@@ -56,6 +59,16 @@ class BackupException(message: String, cause: Throwable? = null) : Exception(mes
  * phone's memory or storage.
  *
  * Nothing here touches Android APIs, so the format is covered by plain JVM unit tests.
+ *
+ * **Streaming.** A node store is megabytes, and the wallet used to hold the whole thing in
+ * memory three times over on the way out - every file read into a `ByteArray`, the zip built
+ * in another, the ciphertext in a third - and twice on the way in, with the picked file
+ * copied up to 64 MiB before it was even opened. The export and the restore now go through
+ * [writeArchive], [extractTo], [encryptStream] and [decryptStream], which read and write in
+ * 64 KiB pieces: the sealed file is built straight from the node directory to disk and taken
+ * apart entry by entry into a staging directory, so the largest allocation no longer depends
+ * on how much channel state the wallet has. The in-memory functions remain for small payloads
+ * and for the tests that pin the format itself.
  */
 object ChannelBackup {
 
@@ -117,6 +130,12 @@ object ChannelBackup {
     private const val MANIFEST_ENTRY = "manifest.txt"
     private const val DATA_PREFIX = "data/"
     private const val MANIFEST_FORMAT = 1
+
+    /** Piece size for every stream copy in this file (64 KiB). */
+    private const val COPY_BUFFER_BYTES = 64 * 1024
+
+    /** Largest manifest an archive may carry: it is seven short lines, not a payload. */
+    private const val MAX_MANIFEST_BYTES = 64 * 1024
 
     // ------------------------------------------------------------------ encryption
 
@@ -201,6 +220,131 @@ object ChannelBackup {
         } finally {
             key.fill(0)
         }
+    }
+
+    /**
+     * Seals everything [input] yields into [output], piece by piece.
+     *
+     * Same header and cipher as [encrypt]; the difference is that no caller has to hold the
+     * plaintext or the ciphertext whole. The GCM tag is written when the cipher stream is
+     * closed, and only this stream is closed: [output] stays open for the caller.
+     *
+     * @return the number of plaintext bytes sealed.
+     */
+    fun encryptStream(
+        mnemonic: String,
+        input: InputStream,
+        output: OutputStream,
+        nonce: ByteArray? = null,
+        salt: ByteArray? = null
+    ): Long {
+        val iv = nonce ?: ByteArray(NONCE_BYTES).also { SecureRandom().nextBytes(it) }
+        require(iv.size == NONCE_BYTES) { "Nonce must be $NONCE_BYTES bytes" }
+        val formatSalt = salt ?: ByteArray(SALT_BYTES).also { SecureRandom().nextBytes(it) }
+        require(formatSalt.size == SALT_BYTES) { "Salt must be $SALT_BYTES bytes" }
+
+        val key = deriveKey(mnemonic, FORMAT_VERSION, formatSalt)
+        try {
+            val header = header(FORMAT_VERSION, formatSalt, iv)
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(
+                Cipher.ENCRYPT_MODE,
+                SecretKeySpec(key, "AES"),
+                GCMParameterSpec(TAG_BITS, iv)
+            )
+            cipher.updateAAD(header)
+            output.write(header)
+            var plainBytes = 0L
+            // Closing the cipher stream writes the tag; closing ours must not close the file
+            // the caller still owns.
+            val sealed = javax.crypto.CipherOutputStream(NotClosing(output), cipher)
+            val buffer = ByteArray(COPY_BUFFER_BYTES)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                sealed.write(buffer, 0, read)
+                plainBytes += read
+            }
+            buffer.fill(0)
+            sealed.close()
+            output.flush()
+            return plainBytes
+        } finally {
+            key.fill(0)
+        }
+    }
+
+    /**
+     * Opens a sealed stream into [output] while reading it, refusing more than [limit] bytes
+     * of plaintext.
+     *
+     * The header is read first, then the cipher takes over; the tag is checked when the last
+     * piece arrives, so a truncated or tampered file fails at the end rather than being
+     * written out as if it were opened.
+     */
+    fun decryptStream(
+        mnemonic: String,
+        input: InputStream,
+        output: OutputStream,
+        limit: Long = MAX_BACKUP_BYTES.toLong()
+    ): Long {
+        val prefix = readExactly(input, MAGIC.length + 1)
+        if (MAGIC.indices.any { prefix[it] != MAGIC[it].code.toByte() }) {
+            throw BackupException("This is not a ZeroWallet backup file")
+        }
+        val version = prefix[4].toInt() and 0xFF
+        if (version < LEGACY_FORMAT_VERSION || version > FORMAT_VERSION) {
+            throw BackupException("This backup uses format $version, which this version of ZeroWallet cannot read")
+        }
+        val salt = if (version >= 3) readExactly(input, SALT_BYTES) else null
+        val iv = readExactly(input, NONCE_BYTES)
+        val header = prefix + (salt ?: ByteArray(0)) + iv
+
+        val key = deriveKey(mnemonic, version, salt)
+        try {
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(key, "AES"),
+                GCMParameterSpec(TAG_BITS, iv)
+            )
+            cipher.updateAAD(header)
+            val plain = javax.crypto.CipherInputStream(input, cipher)
+            val buffer = ByteArray(COPY_BUFFER_BYTES)
+            var written = 0L
+            try {
+                while (true) {
+                    val read = plain.read(buffer)
+                    if (read < 0) break
+                    written += read
+                    if (written > limit) {
+                        throw BackupException("This backup unpacks to more than ZeroWallet will read")
+                    }
+                    output.write(buffer, 0, read)
+                }
+            } catch (b: BackupException) {
+                throw b
+            } catch (t: Throwable) {
+                throw BackupException(
+                    "Could not unlock this backup. It needs the same recovery phrase it was saved with.",
+                    t
+                )
+            } finally {
+                buffer.fill(0)
+            }
+            output.flush()
+            return written
+        } finally {
+            key.fill(0)
+        }
+    }
+
+    /** The format a backup file was written in, read from its five-byte header. */
+    fun formatOf(input: InputStream): Int? {
+        val prefix = runCatching { readExactly(input, MAGIC.length + 1) }.getOrNull() ?: return null
+        if (MAGIC.indices.any { prefix[it] != MAGIC[it].code.toByte() }) return null
+        val version = prefix[4].toInt() and 0xFF
+        return version.takeIf { it in LEGACY_FORMAT_VERSION..FORMAT_VERSION }
     }
 
     /** True when [bytes] starts with this format's magic and a version this build reads. */
@@ -379,6 +523,223 @@ object ChannelBackup {
             out.write(buffer, 0, read)
         }
         return out.toByteArray()
+    }
+
+    // ------------------------------------------------------- archive, streaming
+
+    /**
+     * Packs the store under [directory] into [out] as a zip archive, one file at a time.
+     *
+     * The manifest goes in first, then every file under the store in path order. Log files,
+     * temporary files and lock files are left out, the way [collectFiles] does; nothing is
+     * held in memory beyond one piece of one file.
+     *
+     * @return how many files went in.
+     * @throws BackupException when there is nothing to back up or the store exceeds the
+     * limits this format opens.
+     */
+    fun writeArchive(manifest: BackupManifest, directory: File, out: OutputStream): Int {
+        if (!directory.isDirectory) throw BackupException("There is no node data to back up yet")
+        val root = directory.absoluteFile
+        val zip = ZipOutputStream(NotClosing(out))
+        var count = 0
+        var total = 0L
+        zip.putNextEntry(ZipEntry(MANIFEST_ENTRY))
+        zip.write(manifestText(manifest).toByteArray(Charsets.UTF_8))
+        zip.closeEntry()
+        val files = root.walkTopDown()
+            .onEnter { it.name != "logs" }
+            .filter { file -> file.isFile && !excludedName(file.name) }
+            .map { it to it.relativeTo(root).invariantSeparatorsPath }
+            .sortedBy { (_, path) -> path }
+            .toList()
+        for ((file, path) in files) {
+            count++
+            if (count > MAX_ENTRIES) {
+                throw BackupException("This store holds too many files to be a channel backup")
+            }
+            zip.putNextEntry(ZipEntry(DATA_PREFIX + safeRelativePath(path)))
+            var entryBytes = 0L
+            file.inputStream().use { input ->
+                val buffer = ByteArray(COPY_BUFFER_BYTES)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    entryBytes += read
+                    total += read
+                    if (entryBytes > MAX_ENTRY_BYTES) {
+                        throw BackupException("A file in this store is too large to back up")
+                    }
+                    if (total > MAX_ARCHIVE_BYTES) {
+                        throw BackupException("This store is larger ({$total} bytes) than ZeroWallet backs up")
+                    }
+                    zip.write(buffer, 0, read)
+                }
+                buffer.fill(0)
+            }
+            zip.closeEntry()
+        }
+        if (count == 0) throw BackupException("There is no node data to back up yet")
+        zip.finish()
+        zip.flush()
+        return count
+    }
+
+    /**
+     * Unpacks an archive from [input] into [target], one entry at a time, and returns the
+     * manifest it carried.
+     *
+     * Every entry is checked before it is written: its path cannot escape [target]
+     * ([safeRelativePath]), its size is counted while it is read rather than taken from the
+     * header, and both the entry count and the total written are bounded. A crafted archive
+     * therefore cannot fill the disk or land a file outside the directory the caller made for
+     * it.
+     */
+    fun extractTo(input: InputStream, target: File): BackupManifest {
+        var manifest: BackupManifest? = null
+        var entries = 0
+        var total = 0L
+        var files = 0
+        try {
+            ZipInputStream(input).use { zip ->
+                var entry: ZipEntry? = zip.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        entries++
+                        if (entries > MAX_ENTRIES) {
+                            throw BackupException("This backup holds too many files to be a channel backup")
+                        }
+                        when {
+                            entry.name == MANIFEST_ENTRY -> {
+                                val bytes = readBoundedEntry(zip, MAX_MANIFEST_BYTES.toLong())
+                                manifest = parseManifest(String(bytes, Charsets.UTF_8))
+                                bytes.fill(0)
+                            }
+                            entry.name.startsWith(DATA_PREFIX) -> {
+                                val path = safeRelativePath(entry.name.removePrefix(DATA_PREFIX))
+                                val destination = File(target, path)
+                                destination.parentFile?.mkdirs()
+                                total += writeEntryBounded(zip, destination)
+                                if (total > MAX_ARCHIVE_BYTES) {
+                                    throw BackupException("This backup unpacks to more than ZeroWallet will read")
+                                }
+                                files++
+                            }
+                            else -> Unit
+                        }
+                    }
+                    zip.closeEntry()
+                    entry = zip.nextEntry
+                }
+            }
+        } catch (b: BackupException) {
+            throw b
+        } catch (t: Throwable) {
+            throw BackupException("This backup archive is damaged", t)
+        }
+        val parsed = manifest ?: throw BackupException("This backup has no manifest")
+        if (parsed.network.isBlank()) throw BackupException("This backup does not name a network")
+        if (files == 0) throw BackupException("This backup carries no node data")
+        return parsed
+    }
+
+    /**
+     * Reads only the manifest of an archive, leaving its files on the stream.
+     *
+     * The restore confirmation needs the date, the wallet and the network before the user
+     * commits, and needs nothing else; the payload is streamed to a staging directory only
+     * when they say yes.
+     */
+    fun readManifest(input: InputStream): BackupManifest {
+        try {
+            ZipInputStream(input).use { zip ->
+                var entry: ZipEntry? = zip.nextEntry
+                var entries = 0
+                var manifest: BackupManifest? = null
+                while (entry != null && manifest == null) {
+                    if (!entry.isDirectory) {
+                        entries++
+                        if (entries > MAX_ENTRIES) {
+                            throw BackupException("This backup holds too many files to be a channel backup")
+                        }
+                        if (entry.name == MANIFEST_ENTRY) {
+                            val bytes = readBoundedEntry(zip, MAX_MANIFEST_BYTES.toLong())
+                            manifest = parseManifest(String(bytes, Charsets.UTF_8))
+                            bytes.fill(0)
+                        }
+                    }
+                    zip.closeEntry()
+                    entry = zip.nextEntry
+                }
+                val parsed = manifest ?: throw BackupException("This backup has no manifest")
+                if (parsed.network.isBlank()) throw BackupException("This backup does not name a network")
+                return parsed
+            }
+        } catch (b: BackupException) {
+            throw b
+        } catch (t: Throwable) {
+            throw BackupException("This backup archive is damaged", t)
+        }
+    }
+
+    /** A stream copy that refuses to go past [limit] bytes. */
+    private fun readBoundedEntry(zip: ZipInputStream, limit: Long): ByteArray {
+        val out = ByteArrayOutputStream()
+        val buffer = ByteArray(COPY_BUFFER_BYTES)
+        var total = 0L
+        while (true) {
+            val read = zip.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > limit) throw BackupException("A file inside this backup is too large to open")
+            out.write(buffer, 0, read)
+        }
+        buffer.fill(0)
+        return out.toByteArray()
+    }
+
+    /** Streams one archive entry into [destination]; returns the bytes written. */
+    private fun writeEntryBounded(zip: ZipInputStream, destination: File): Long {
+        val buffer = ByteArray(COPY_BUFFER_BYTES)
+        var total = 0L
+        destination.outputStream().use { out ->
+            while (true) {
+                val read = zip.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > MAX_ENTRY_BYTES) {
+                    throw BackupException("A file inside this backup is too large to open")
+                }
+                out.write(buffer, 0, read)
+            }
+            out.flush()
+        }
+        buffer.fill(0)
+        return total
+    }
+
+    /** True for the store files this format leaves out: its logs, locks and half-written files. */
+    private fun excludedName(name: String): Boolean =
+        name.endsWith(".lock") || name.endsWith(".tmp") || name.startsWith(".")
+
+    /** Reads exactly [count] bytes or fails: a short header is not a backup. */
+    private fun readExactly(input: InputStream, count: Int): ByteArray {
+        val out = ByteArray(count)
+        var filled = 0
+        while (filled < count) {
+            val read = input.read(out, filled, count - filled)
+            if (read < 0) throw BackupException("This file is too small to be a backup")
+            filled += read
+        }
+        return out
+    }
+
+    /** Wraps a stream so closing the cipher around it leaves the caller's stream open. */
+    private class NotClosing(private val inner: OutputStream) : FilterOutputStream(inner) {
+        override fun write(b: ByteArray, off: Int, len: Int) = inner.write(b, off, len)
+        override fun close() {
+            inner.flush()
+        }
     }
 
     /** Rejects absolute paths and `..` segments, so a crafted archive cannot write outside the node directory. */

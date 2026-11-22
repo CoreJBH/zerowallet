@@ -135,19 +135,6 @@ fun PlusGlyph(modifier: Modifier = Modifier, color: Color = Pal.TextPrimary) {
 }
 
 @Composable
-fun SwapGlyph(modifier: Modifier = Modifier, color: Color = Pal.TextPrimary) {
-    Canvas(modifier) {
-        val stroke = size.minDimension * 0.08f
-        drawLine(color, Offset(size.width * 0.34f, size.height * 0.86f), Offset(size.width * 0.34f, size.height * 0.14f), strokeWidth = stroke, cap = StrokeCap.Round)
-        drawLine(color, Offset(size.width * 0.34f, size.height * 0.14f), Offset(size.width * 0.18f, size.height * 0.34f), strokeWidth = stroke, cap = StrokeCap.Round)
-        drawLine(color, Offset(size.width * 0.34f, size.height * 0.14f), Offset(size.width * 0.50f, size.height * 0.34f), strokeWidth = stroke, cap = StrokeCap.Round)
-        drawLine(color, Offset(size.width * 0.66f, size.height * 0.14f), Offset(size.width * 0.66f, size.height * 0.86f), strokeWidth = stroke, cap = StrokeCap.Round)
-        drawLine(color, Offset(size.width * 0.66f, size.height * 0.86f), Offset(size.width * 0.50f, size.height * 0.66f), strokeWidth = stroke, cap = StrokeCap.Round)
-        drawLine(color, Offset(size.width * 0.66f, size.height * 0.86f), Offset(size.width * 0.82f, size.height * 0.66f), strokeWidth = stroke, cap = StrokeCap.Round)
-    }
-}
-
-@Composable
 fun CloseGlyph(modifier: Modifier = Modifier, color: Color = Pal.TextPrimary) {
     Canvas(modifier) {
         val stroke = size.minDimension * 0.09f

@@ -596,7 +596,17 @@ class SecureStore(context: Context) {
 
         private const val KEYSTORE = "AndroidKeyStore"
 
-        /** The key this build seals and opens with, generated inside the Keystore. */
+        /**
+         * The key this build seals and opens with, generated inside the Keystore.
+         *
+         * The name is frozen at the app's old name and is not part of the 1.2.0 rename. A
+         * Keystore alias is the address of a key, not a label: changing it to `zerowallet_...`
+         * would leave every existing wallet's ciphertext pointing at an entry that no longer
+         * exists, and the only way back to the funds would be the recovery phrase. The app's
+         * package (`com.jbitmstr.purewallet`) and its preferences file names are kept for the
+         * same reason - an install over an older build must keep its data - while everything
+         * a user sees says ZeroWallet.
+         */
         private const val KEY_ALIAS = "purewallet_seed_aes"
 
         /** The single unbound key of builds up to 1.1.10; read once during an upgrade. */

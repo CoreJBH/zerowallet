@@ -11,10 +11,10 @@ import com.jbitmstr.purewallet.BuildConfig
  * ldk-node stores payments without the invoice description, so the wallet keeps its own
  * short note to show in the history list. Nothing here is shared with anyone, and the note
  * itself is sealed with [SecretStore] before it is written: "what did I pay this address
- * for" is as private as the payment. A note written by an older build is plain text without
- * the seal marker; [migratePlainTextNotes] seals those once, and until it has finished they
- * still read back. Afterwards a plain value is refused: nothing this build writes lacks the
- * marker.
+ * for" is as private as the payment. A note without the seal marker is refused rather than
+ * returned. An earlier build read those notes back while it re-sealed them, and 1.2.0 removes
+ * that window: a plaintext note is not a note this app wrote, and the description is the
+ * least costly thing in the file to lose.
  *
  * [put] is fail-closed like the balance cache: a Keystore that cannot seal the note means
  * the note is not saved at all. A missing description is a small loss; the same sentence in
@@ -42,9 +42,7 @@ class PaymentNotes internal constructor(
             return false
         }
         val editor = prefs.edit()
-        // The migration marker is a record of this file's state, not a note: it is never the
-        // one dropped to make room.
-        val stored = prefs.all.keys.filter { it != KEY_PLAIN_TEXT_MIGRATED }
+        val stored = prefs.all.keys.toList()
         if (stored.size > MAX_ENTRIES) {
             stored.take(stored.size - MAX_ENTRIES + 1).forEach { editor.remove(it) }
         }
@@ -52,34 +50,13 @@ class PaymentNotes internal constructor(
         return true
     }
 
+    /** The note for [key], or null when there is none or it is not a sealed one. */
     fun get(key: String?): String? {
         if (key.isNullOrEmpty()) return null
         val stored = prefs.getString(key, null) ?: return null
-        return SecretStore.open(stored, allowPlainText = plainTextStillReadable())
+        if (!SecretStore.isSealed(stored)) return null
+        return SecretStore.open(stored)
     }
-
-    /**
-     * Seals every note an older build wrote in plain text, once.
-     *
-     * The marker is written only when every note could be sealed. A Keystore that refuses one
-     * now leaves the migration for the next start rather than throwing the note away.
-     */
-    fun migratePlainTextNotes() {
-        if (!plainTextStillReadable()) return
-        val editor = prefs.edit()
-        var clean = true
-        prefs.all.forEach { (key, value) ->
-            val text = value as? String ?: return@forEach
-            if (SecretStore.isSealed(text)) return@forEach
-            val sealed = seal(text)
-            if (sealed != null) editor.putString(key, sealed) else clean = false
-        }
-        if (clean) editor.putBoolean(KEY_PLAIN_TEXT_MIGRATED, true)
-        editor.apply()
-    }
-
-    private fun plainTextStillReadable(): Boolean =
-        !prefs.getBoolean(KEY_PLAIN_TEXT_MIGRATED, false)
 
     fun clear() {
         prefs.edit().clear().apply()
@@ -90,8 +67,5 @@ class PaymentNotes internal constructor(
         private const val NAME = "purewallet_payment_notes"
         private const val MAX_ENTRIES = 500
         private const val MAX_LENGTH = 140
-
-        /** Set when every note on this phone is a sealed one; see [migratePlainTextNotes]. */
-        private const val KEY_PLAIN_TEXT_MIGRATED = "plain_notes_migrated_1_1_18"
     }
 }

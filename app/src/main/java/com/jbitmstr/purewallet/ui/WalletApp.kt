@@ -14,7 +14,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -31,7 +30,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.AppLock
-import com.jbitmstr.purewallet.core.AppLockGate
 import com.jbitmstr.purewallet.core.Authorization
 import com.jbitmstr.purewallet.core.DeviceLockSettings
 import com.jbitmstr.purewallet.core.ScreenSecurity
@@ -53,96 +51,91 @@ private enum class ActiveSheet { NONE, SETTINGS, SEND, RECEIVE, CHANNELS }
 
 private enum class ScanPurpose { SEND, PEER }
 
+/**
+ * The wallet window: which of its screens is up, and the live activity behind them.
+ *
+ * Everything that has to survive a rotation - whether the wallet is open, the draft counter
+ * the sheets watch, the lock availability a prompt depends on - lives in [WalletViewModel].
+ * What stays here is what belongs to one composition: which sheet is open, what the scanner
+ * brought back, and the recovery phrase while its sheet is on screen.
+ */
 @Composable
 fun WalletApp(vm: WalletViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val lock by vm.lock.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
     val activity = remember(context) { AppLock.activityOf(context) }
     val appLock = remember(activity) { activity?.let { AppLock(it) } }
-    // Whether the phone can authenticate is not a fact to cache: a screen lock can be
-    // removed while the app sits in the background, and the gate must not stay "available"
-    // after that. It is re-read on every resume below.
-    var lockAvailable by remember(activity) { mutableStateOf(appLock?.isAvailable() == true) }
     // Until the wallet is loaded it is not known whether one exists, so the gate stays
     // armed; after that only a real wallet is worth locking. Onboarding is never gated.
     val lockArmed = if (state.bootstrapped) state.seedPresent else true
+    // Whether the phone can authenticate, read here and not from a stored value: the gate
+    // below is decided by this answer on the very first frame, and a remembered `true` from
+    // before the screen lock was removed would open a wallet nobody can prove is theirs.
+    val deviceLockAvailable = remember(activity) { appLock?.isAvailable() == true }
+    LaunchedEffect(deviceLockAvailable) { vm.onLockAvailability(deviceLockAvailable) }
     // Locking the app every time it opens is opt-in in Settings. Sending funds and showing
     // the recovery phrase authenticate on their own, whether or not that option is on.
-    val openLockEnabled = state.lockOnOpen && lockAvailable && lockArmed
-    // Whether the wallet is open, and whether that decision has been made for this session.
-    // It is NOT keyed on the option: see [AppLockGate] for why. `unlocked` starts closed so a
-    // wallet whose option is on never shows a frame of itself before the settings arrive.
-    var unlocked by remember { mutableStateOf(false) }
-    var gateStarted by remember { mutableStateOf(false) }
-    var unlockError by remember { mutableStateOf<String?>(null) }
+    val openLockEnabled = state.lockOnOpen && deviceLockAvailable && lockArmed
     // A wallet whose key is bound to the device lock cannot be read at all until the user
     // authenticates, so the lock screen comes up before anything of the wallet is shown.
     val lockedBySeed = state.seedLocked
-    var seedUnlockError by remember { mutableStateOf<String?>(null) }
-    // Raised when a sensitive action was asked for on a phone with no screen lock.
-    var needsScreenLock by remember { mutableStateOf(false) }
 
     var sheet by remember { mutableStateOf(ActiveSheet.NONE) }
     var scanning by remember { mutableStateOf(false) }
     var scanPurpose by remember { mutableStateOf(ScanPurpose.SEND) }
     var sendPrefill by remember { mutableStateOf("") }
     var peerPrefill by remember { mutableStateOf("") }
+    // The phrase is a value of this composition on purpose: it is dropped when the sheet
+    // closes and when the app leaves the screen, and it never becomes part of the state a
+    // ViewModel (or a saved bundle) carries across a configuration change.
     var backupWords by remember { mutableStateOf<String?>(null) }
     var backupVerify by remember { mutableStateOf(false) }
-    // Bumped every time the app leaves the screen. The sheets that hold a draft watch it and
-    // drop what they hold; the counter keeps them composed, so nothing in flight (a payment
-    // waiting on its authentication, a backup waiting on the file picker) is cancelled by it.
-    var backgrounded by remember { mutableIntStateOf(0) }
 
     fun unlockWith(reason: String) {
-        val lock = appLock
-        if (lock == null || !openLockEnabled) {
-            unlocked = true
+        val appLock = appLock
+        if (appLock == null || !openLockEnabled) {
+            vm.onOpenUnlocked()
             return
         }
-        unlockError = null
-        lock.authenticate("Unlock ZeroWallet", reason) { ok ->
+        val available = appLock.isAvailable()
+        vm.onLockAvailability(available)
+        appLock.authenticate("Unlock ZeroWallet", reason) { ok ->
             if (ok) {
-                unlocked = true
-                unlockError = null
+                vm.onOpenUnlocked()
                 // The same authentication also unseals the wallet's key, so the lock screen
                 // does not have to ask a second time for what it just proved.
                 if (state.seedLocked) vm.unlockSeed()
             } else {
-                unlockError = if (lock.isAvailable()) {
-                    "Authentication was not completed."
-                } else {
-                    "This phone has no screen lock, so the wallet cannot be unlocked. Set one in Android settings first."
-                }
+                vm.onOpenLockDenied(
+                    if (appLock.isAvailable()) {
+                        "Authentication was not completed."
+                    } else {
+                        "This phone has no screen lock, so the wallet cannot be unlocked. Set one in Android settings first."
+                    }
+                )
             }
         }
     }
 
     // Ask as soon as the lock screen appears, including after a relock. Nothing is asked
-    // while the wallet is still being loaded or does not exist yet.
-    LaunchedEffect(openLockEnabled, unlocked, state.bootstrapped, lockedBySeed) {
-        // A wallet that arrived locked has its own prompt below, which also unseals its key;
-        // raising this one as well would only make the two supersede each other.
-        if (openLockEnabled && !unlocked && state.bootstrapped && !lockedBySeed) {
+    // while the wallet is still being loaded or does not exist yet. A wallet that arrived
+    // locked has its own prompt below, which also unseals its key; raising this one as well
+    // would only make the two supersede each other.
+    LaunchedEffect(openLockEnabled, lock.unlocked, state.bootstrapped, lockedBySeed) {
+        if (openLockEnabled && !lock.unlocked && state.bootstrapped && !lockedBySeed) {
             unlockWith("Authenticate to open your wallet.")
         }
     }
 
-    // The gate is settled once, when the saved option is first read: a wallet that had
-    // lock-on-open on opens behind the lock screen, one that had it off opens straight away.
-    // After that the option can be toggled in Settings without throwing the user out or
-    // counting as a pass; leaving the screen is what closes it again.
+    // The gate is settled when the saved option is first known; the ViewModel remembers that
+    // it was, so a rotation does not turn a settings change into a new session.
     LaunchedEffect(openLockEnabled, state.bootstrapped) {
         if (!state.bootstrapped) return@LaunchedEffect
-        unlocked = if (!gateStarted) {
-            gateStarted = true
-            AppLockGate.afterStart(openLockEnabled)
-        } else {
-            AppLockGate.afterOptionChanged(unlocked, openLockEnabled)
-        }
+        vm.settleOpenLock(openLockEnabled)
     }
 
     // Lock again whenever the app leaves the screen. The prompt itself keeps its own
@@ -172,10 +165,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                     // are open do the same with their own drafts, under their own names.
                     sendPrefill = ""
                     peerPrefill = ""
-                    backgrounded += 1
-                    if (gateStarted) {
-                        unlocked = AppLockGate.afterLeavingScreen(unlocked, openLockEnabled)
-                    }
+                    vm.onScreenStopped(openLockEnabled)
                 }
                 // Android can freeze or kill the node while the app is away, and a start
                 // that failed leaves nothing running. Coming back asks for it again. The
@@ -183,7 +173,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                 // outside the app takes the lock gate with it instead of leaving a prompt
                 // that can no longer succeed.
                 Lifecycle.Event.ON_RESUME -> {
-                    lockAvailable = appLock?.isAvailable() == true
+                    vm.onScreenResumed(appLock?.isAvailable() == true)
                     vm.onAppForeground()
                 }
                 else -> Unit
@@ -217,9 +207,9 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     val authorization = Authorization { reason, action ->
         val lock = appLock
         val available = lock?.isAvailable() == true
-        lockAvailable = available
+        vm.onLockAvailability(available)
         if (lock == null || !available) {
-            needsScreenLock = true
+            vm.reportScreenLockMissing()
             action(false)
         } else {
             lock.authenticate("Confirm it's you", reason) { ok ->
@@ -289,24 +279,24 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
      * needs a recent authentication, and this is the one place that provides it.
      */
     fun unlockSeed() {
-        val lock = appLock
-        if (lock == null || !lock.isAvailable()) {
-            lockAvailable = false
-            seedUnlockError = "This phone cannot authenticate right now. Set a screen lock, then try again."
+        val appLock = appLock
+        if (appLock == null || !appLock.isAvailable()) {
+            vm.onLockAvailability(false)
+            vm.onSeedUnlockDenied(
+                "This phone cannot authenticate right now. Set a screen lock, then try again."
+            )
             return
         }
-        seedUnlockError = null
-        lock.authenticate(
+        appLock.authenticate(
             "Unlock ZeroWallet",
             "Authenticate to open the wallet on this phone."
         ) { ok ->
             if (ok) {
                 // The same prompt that unseals the key also satisfies lock-on-open.
-                unlocked = true
-                unlockError = null
+                vm.onSeedUnlocked()
                 vm.unlockSeed()
             } else {
-                seedUnlockError = "Authentication was not completed."
+                vm.onSeedUnlockDenied("Authentication was not completed.")
             }
         }
     }
@@ -333,15 +323,15 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     // before the lock-on-open screen because its prompt is the one that unseals the key.
     if (lockedBySeed) {
         LockedScreen(
-            error = seedUnlockError,
+            error = lock.seedError,
             onUnlock = { unlockSeed() }
         )
         return
     }
 
-    if (openLockEnabled && !unlocked) {
+    if (openLockEnabled && !lock.unlocked) {
         LockedScreen(
-            error = unlockError,
+            error = lock.error,
             onUnlock = { unlockWith("Authenticate to open your wallet.") }
         )
         return
@@ -395,8 +385,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                     sheet = ActiveSheet.SEND
                 },
                 onReceive = { sheet = ActiveSheet.RECEIVE },
-                onChannels = { sheet = ActiveSheet.CHANNELS },
-                onSwap = { sheet = ActiveSheet.CHANNELS }
+                onChannels = { sheet = ActiveSheet.CHANNELS }
             )
         }
 
@@ -433,7 +422,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
         ActiveSheet.SETTINGS -> SettingsSheet(
             vm = vm,
             state = state,
-            lockAvailable = lockAvailable,
+            lockAvailable = lock.lockAvailable,
             onBackup = {
                 authorization.guarded("Authenticate to view your recovery phrase.") {
                     backupWords = vm.revealSeed()
@@ -447,7 +436,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
             vm = vm,
             state = state,
             initialText = sendPrefill,
-            backgrounded = backgrounded,
+            backgrounded = lock.backgrounded,
             authorization = authorization,
             onClose = { sheet = ActiveSheet.NONE },
             onScan = {
@@ -459,7 +448,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
         ActiveSheet.RECEIVE -> ReceiveSheet(
             vm = vm,
             state = state,
-            backgrounded = backgrounded,
+            backgrounded = lock.backgrounded,
             onBackup = {
                 authorization.guarded("Authenticate to view your recovery phrase.") {
                     backupWords = vm.revealSeed()
@@ -495,9 +484,9 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
 
     // A sensitive action was asked for on a phone with no screen lock. It did not run, and
     // the only way forward is the Android setting that lets the wallet ask again.
-    if (needsScreenLock) {
+    if (lock.needsScreenLock) {
         AlertDialog(
-            onDismissRequest = { needsScreenLock = false },
+            onDismissRequest = { vm.dismissScreenLockNotice() },
             containerColor = Pal.SurfaceElevated,
             titleContentColor = Pal.TextPrimary,
             textContentColor = Pal.TextSecondary,
@@ -515,14 +504,14 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
             },
             confirmButton = {
                 TextButton(onClick = {
-                    needsScreenLock = false
+                    vm.dismissScreenLockNotice()
                     DeviceLockSettings.open(context)
                 }) {
                     Text("Open settings", color = Pal.AccentBright)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { needsScreenLock = false }) {
+                TextButton(onClick = { vm.dismissScreenLockNotice() }) {
                     Text("Not now", color = Pal.TextSecondary)
                 }
             }

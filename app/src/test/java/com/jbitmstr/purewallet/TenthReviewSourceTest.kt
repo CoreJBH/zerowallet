@@ -85,23 +85,29 @@ class TenthReviewSourceTest {
         )
     }
 
-    // ------------------------------------------------- NodeManager: the endpoint restart
+    // ------------------------------------------- the node layer: the endpoint restart
+
+    /** Where the node's start, stop and settings live since the 1.2.0 layer split. */
+    private val nodeRuntime = "src/main/java/com/jbitmstr/purewallet/core/NodeRuntime.kt"
+
+    /** Where the encrypted channel backup lives since the 1.2.0 layer split. */
+    private val backupLayer = "src/main/java/com/jbitmstr/purewallet/core/BackupLayer.kt"
 
     @Test
     fun changingTheEndpointReadsTheKeystoreOffTheCallersThreadAndUnderTheLock() {
-        val text = source("src/main/java/com/jbitmstr/purewallet/core/NodeManager.kt")
+        val text = source(nodeRuntime)
         val setEsplora = body(text, "fun setEsploraUrl(")
-        assertTrue("the restart runs in a coroutine", setEsplora.contains("scope.launch {"))
-        assertTrue("under the node lock", setEsplora.contains("nodeMutex.withLock {"))
-        assertTrue("and it is checked against the wallet it was asked for", setEsplora.contains("walletEpoch.get()"))
+        assertTrue("the restart runs in a coroutine", setEsplora.contains("core.scope.launch {"))
+        assertTrue("under the node lock", setEsplora.contains("core.nodeMutex.withLock {"))
+        assertTrue("and it is checked against the wallet it was asked for", setEsplora.contains("core.walletEpoch.get()"))
 
         // The seed read must be inside the launched block, never before it: it was a Keystore
         // call on the settings sheet's (main) thread.
-        val launchAt = setEsplora.indexOf("scope.launch {")
-        val seedAt = setEsplora.indexOf("seedOrNull()")
+        val launchAt = setEsplora.indexOf("core.scope.launch {")
+        val seedAt = setEsplora.indexOf("core.seedOrNull()")
         assertTrue("no seed read before the coroutine", seedAt > launchAt)
 
-        val lockAt = setEsplora.indexOf("nodeMutex.withLock {")
+        val lockAt = setEsplora.indexOf("core.nodeMutex.withLock {")
         assertTrue("no seed read outside the lock", seedAt > lockAt)
         assertTrue(
             "and the restart is still offered only when the check says so",
@@ -111,10 +117,10 @@ class TenthReviewSourceTest {
 
     @Test
     fun aStartRepairsAnImportThatWasInterrupted() {
-        val text = source("src/main/java/com/jbitmstr/purewallet/core/NodeManager.kt")
-        val start = body(text, "private suspend fun startNodeLocked(")
+        val text = source(nodeRuntime)
+        val start = body(text, "suspend fun startNodeLocked(")
         assertTrue("the start puts a missing store back", start.contains("recoverNodeDirs(network)"))
-        val recover = body(text, "private fun recoverNodeDirs(")
+        val recover = body(text, "fun recoverNodeDirs(")
         assertTrue("from the newest displaced folder", recover.contains("NodeDirs.newestPrevious"))
         assertTrue(
             "and clears the fragments of every half-written import",
@@ -122,17 +128,20 @@ class TenthReviewSourceTest {
         )
         assertTrue(
             "the import names its folders per chain",
-            text.contains("NodeDirs.incoming(network.id, stamp)") &&
-                text.contains("NodeDirs.previous(network.id, stamp)")
+            source(backupLayer).contains("NodeDirs.incoming(network.id, stamp)") &&
+                source(backupLayer).contains("NodeDirs.previous(network.id, stamp)")
         )
     }
 
     @Test
     fun aBackupExportWithoutARunningNodeStillNamesTheWallet() {
-        val text = source("src/main/java/com/jbitmstr/purewallet/core/NodeManager.kt")
+        val text = source(backupLayer)
         val export = body(text, "suspend fun exportChannelBackup()")
         assertTrue("the identity is read for the manifest", export.contains("backupIdentity(network)"))
-        assertTrue("and it is read before the node is stopped", export.indexOf("backupIdentity(network)") < export.indexOf("stopNodeLocked"))
+        assertTrue(
+            "and it is read before the node is stopped",
+            export.indexOf("backupIdentity(network)") < export.indexOf("stopNodeLocked")
+        )
         val identity = body(text, "private fun backupIdentity(")
         assertTrue("it falls back to what this device last recorded", identity.contains("prefs.lastNodeId"))
         assertTrue("and to its channel count", identity.contains("prefs.lastKnownChannelCount"))
@@ -141,19 +150,37 @@ class TenthReviewSourceTest {
 
     @Test
     fun anOlderBackupFormatIsNamedInTheRestoreReview() {
-        val text = source("src/main/java/com/jbitmstr/purewallet/core/NodeManager.kt")
+        val text = source(backupLayer)
         assertTrue(
             "the file's format is passed to the check",
-            text.contains("formatVersion = ChannelBackup.formatOf(bytes)")
+            text.contains("formatVersion = file.inputStream().use { ChannelBackup.formatOf(it) }")
         )
-        assertTrue("twice: opening and importing", text.split("formatVersion = ChannelBackup.formatOf(bytes)").size == 3)
+        assertTrue(
+            "twice: opening and importing",
+            text.split("formatVersion = file.inputStream().use { ChannelBackup.formatOf(it) }").size == 3
+        )
     }
 
     @Test
-    fun theWalletReSealsPlainRecordsOnceAtStart() {
-        val text = source("src/main/java/com/jbitmstr/purewallet/core/NodeManager.kt")
-        assertTrue(text.contains("prefs.migratePlainTextValues()"))
-        assertTrue(text.contains("notes.migratePlainTextNotes()"))
+    fun noRecordIsEverReadBackFromPlainText() {
+        // 1.1.18 kept a one-time marker that let `Prefs` and `PaymentNotes` hand back values an
+        // older build wrote unsealed. That window is what 1.2.0 removes: a value this app did
+        // not seal is not a balance, a height or a note, and there is no flag left to make one.
+        val sources = listOf(
+            "src/main/java/com/jbitmstr/purewallet/core/Prefs.kt",
+            "src/main/java/com/jbitmstr/purewallet/core/PaymentNotes.kt",
+            "src/main/java/com/jbitmstr/purewallet/core/SecretStore.kt"
+        ).associateWith { source(it) }
+        sources.forEach { (file, text) ->
+            assertFalse("$file still knows a plaintext migration", text.contains("migratePlainText"))
+            assertFalse("$file still takes an allowPlainText flag", text.contains("allowPlainText"))
+            assertFalse("$file still names the migration marker", text.contains("KEY_PLAIN_TEXT_MIGRATED"))
+        }
+        assertTrue(
+            "a value without the seal marker is refused where it is opened",
+            sources.getValue("src/main/java/com/jbitmstr/purewallet/core/SecretStore.kt")
+                .contains("A stored value has no seal marker and was refused")
+        )
     }
 
     // ------------------------------------------------------------- the two sheets

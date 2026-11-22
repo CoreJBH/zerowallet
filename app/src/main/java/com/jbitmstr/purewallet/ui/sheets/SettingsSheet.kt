@@ -89,6 +89,8 @@ fun SettingsSheet(
     var backupNote by remember { mutableStateOf<String?>(null) }
     var backupError by remember { mutableStateOf<String?>(null) }
     var pendingRestore by remember { mutableStateOf<PendingRestore?>(null) }
+    var wiping by remember { mutableStateOf(false) }
+    var wipeError by remember { mutableStateOf<String?>(null) }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val transfer by BackupTransfer.state.collectAsStateWithLifecycle()
@@ -98,18 +100,18 @@ fun SettingsSheet(
 
     // The picked file arrives through the activity-owned picker, so it still lands even when
     // the picker backgrounded the app and lock-on-open took the wallet out of composition.
-    LaunchedEffect(transfer.restoreBytes) {
-        val bytes = transfer.restoreBytes ?: return@LaunchedEffect
-        BackupTransfer.consumeRestoreBytes()
+    LaunchedEffect(transfer.restoreFile) {
+        val file = transfer.restoreFile ?: return@LaunchedEffect
+        BackupTransfer.consumeRestoreFile()
         // Read the file before anything is asked or replaced. The date it was made, the
         // wallet it belongs to and whether it may be restored here are what the confirmation
         // is built from, and a file that cannot be opened says so without touching the store.
-        pendingRestore = PendingRestore(bytes = bytes, loading = true)
-        pendingRestore = vm.inspectChannelBackup(bytes).fold(
-            onSuccess = { review -> PendingRestore(bytes = bytes, review = review, loading = false) },
+        pendingRestore = PendingRestore(file = file, loading = true)
+        pendingRestore = vm.inspectChannelBackup(file).fold(
+            onSuccess = { review -> PendingRestore(file = file, review = review, loading = false) },
             onFailure = { failure ->
                 PendingRestore(
-                    bytes = bytes,
+                    file = file,
                     error = failure.message ?: "This backup could not be opened",
                     loading = false
                 )
@@ -629,7 +631,10 @@ fun SettingsSheet(
         val review = pending.review
         val blocked = review != null && !review.canRestore
         AlertDialog(
-            onDismissRequest = { pendingRestore = null },
+            onDismissRequest = {
+                BackupTransfer.discard(pending.file)
+                pendingRestore = null
+            },
             containerColor = Pal.SurfaceElevated,
             titleContentColor = Pal.TextPrimary,
             textContentColor = Pal.TextSecondary,
@@ -732,7 +737,7 @@ fun SettingsSheet(
                 TextButton(
                     enabled = review != null && review.canRestore && pending.acknowledged,
                     onClick = {
-                        val bytes = pending.bytes
+                        val file = pending.file
                         pendingRestore = null
                         // Replacing the channel data can cost the funds in a live channel, so
                         // it asks for the same proof as a payment before it runs.
@@ -742,7 +747,7 @@ fun SettingsSheet(
                                 backupError = null
                                 backupNote = null
                                 BackupTransfer.reset()
-                                vm.importChannelBackup(bytes)
+                                vm.importChannelBackup(file)
                                     .onSuccess { manifest: BackupManifest ->
                                         backupNote = "Restored ${manifest.channelCount} channels from a " +
                                             "${manifest.network} backup"
@@ -759,7 +764,10 @@ fun SettingsSheet(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { pendingRestore = null }) {
+                TextButton(onClick = {
+                    BackupTransfer.discard(pending.file)
+                    pendingRestore = null
+                }) {
                     Text("Cancel", color = Pal.TextSecondary)
                 }
             }
@@ -774,27 +782,58 @@ fun SettingsSheet(
             textContentColor = Pal.TextSecondary,
             title = { Text("Wipe this wallet?") },
             text = {
-                Text(
-                    "You will need your recovery phrase to restore it. This cannot be undone.",
-                    fontSize = 13.sp,
-                    lineHeight = 18.sp
-                )
+                Column {
+                    Text(
+                        "You will need your recovery phrase to restore it. This cannot be undone.",
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp
+                    )
+                    val failure = wipeError
+                    if (failure != null) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(failure, color = Pal.Danger, fontSize = 12.sp, lineHeight = 17.sp)
+                    }
+                    if (wiping) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            "Deleting the wallet and its node data…",
+                            color = Pal.TextSecondary,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    confirmWipe = false
-                    // A wipe deletes the only copy of the seed on this phone, so it asks for
-                    // the same proof as a payment before it runs.
-                    authorization.guarded("Authenticate to wipe this wallet.") {
-                        vm.wipeWallet()
-                        onClose()
+                TextButton(
+                    enabled = !wiping,
+                    onClick = {
+                        // A wipe deletes the only copy of the seed on this phone, so it asks
+                        // for the same proof as a payment before it runs. The sheet closes
+                        // only after the wipe answers: a delete that failed (a node that
+                        // would not stop, a Keystore that would not drop its key) used to
+                        // look exactly like one that worked, because the sheet was closed
+                        // before the work had even started.
+                        authorization.guarded("Authenticate to wipe this wallet.") {
+                            scope.launch {
+                                wiping = true
+                                wipeError = null
+                                val result = vm.wipeWallet()
+                                wiping = false
+                                result.onSuccess {
+                                    confirmWipe = false
+                                    onClose()
+                                }.onFailure { failure ->
+                                    wipeError = failure.message ?: "The wallet could not be wiped."
+                                }
+                            }
+                        }
                     }
-                }) {
+                ) {
                     Text("Wipe", color = Pal.Danger)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { confirmWipe = false }) {
+                TextButton(enabled = !wiping, onClick = { confirmWipe = false }) {
                     Text("Cancel", color = Pal.TextSecondary)
                 }
             }
@@ -804,7 +843,7 @@ fun SettingsSheet(
 
 /** A file picked for a restore, and what reading it said about itself. */
 private data class PendingRestore(
-    val bytes: ByteArray,
+    val file: File,
     val review: BackupReview? = null,
     val error: String? = null,
     val loading: Boolean = false,
@@ -894,29 +933,19 @@ private fun NetworkRow(network: ChainNetwork, selected: Boolean, onClick: () -> 
 
 /**
  * Hands the sealed backup to the Android share sheet, where Google Drive, Gmail and any other
- * app can take it. The bytes go to the app's own cache and leave it through a FileProvider
- * URI, so no storage permission is needed and nothing is world-readable.
+ * app can take it. The file is already in the app's cache - the export wrote it there - and
+ * leaves through a FileProvider URI, so no storage permission is needed and nothing is
+ * world-readable.
  *
- * The cached copy is the sealed archive, and it is still a copy of the wallet's channel data
- * sitting on disk. Only the file just shared is kept: every share replaces the previous one,
- * and a wipe removes the directory (see NodeManager.wipeWallet).
- *
- * The write runs on [Dispatchers.IO]: the archive is as large as the node's channel state,
- * and writing it (and deleting the previous copy) on the main thread is a stalled screen for
- * as long as the storage takes. Only handing the finished URI to the chooser stays on the
- * caller's thread, which is where the activity needs it.
+ * Nothing is copied here, and nothing is deleted here either. The receiving app reads the
+ * file after this wallet comes back to the screen, so deleting it when the chooser closes
+ * would hand Drive or Gmail an empty document; the copy is removed ten minutes later, on the
+ * next resume or the next export ([BackupTransfer.purgeStaleExports]), and a wipe takes the
+ * whole directory. Only the URI work stays on the caller's thread, which is where the
+ * activity needs it.
  */
-private suspend fun shareBackup(context: Context, export: ChannelBackupExport) {
-    val uri = withContext(Dispatchers.IO) {
-        val dir = File(context.cacheDir, "backups")
-        dir.mkdirs()
-        dir.listFiles()?.forEach { old ->
-            if (old.name != export.fileName) runCatching { old.delete() }
-        }
-        val file = File(dir, export.fileName)
-        file.writeBytes(export.bytes)
-        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-    }
+private fun shareBackup(context: Context, export: ChannelBackupExport) {
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", export.file)
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = ChannelBackup.MIME_TYPE
         putExtra(Intent.EXTRA_STREAM, uri)

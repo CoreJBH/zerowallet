@@ -82,9 +82,20 @@ class SeedKeySourceTest {
     fun theNodeNeverSealsThePhraseItself() {
         // One way in: every wallet path goes through SecureStore, so there is one place where
         // the key, the binding and the fallback are decided.
-        val manager = source("src/main/java/com/jbitmstr/purewallet/core/NodeManager.kt")
-        assertFalse(manager.contains("KeyGenerator"))
-        assertTrue(manager.contains("secureStore.saveSeed("))
-        assertTrue(manager.contains("secureStore.canSeal()"))
+        // The wallet layer since the 1.2.0 split, plus every other core file: the Keystore
+        // key is generated in SecureStore and nowhere else, and a seal goes through it.
+        val walletLayer = source("src/main/java/com/jbitmstr/purewallet/core/WalletLayer.kt")
+        assertFalse(walletLayer.contains("KeyGenerator"))
+        assertTrue(walletLayer.contains("core.secureStore.saveSeed("))
+        assertTrue(walletLayer.contains("core.secureStore.canSeal()"))
+        val coreDir = java.io.File(walletLayer.substringBefore("WalletLayer.kt"))
+        coreDir.listFiles { file -> file.extension == "kt" }
+            ?.filter { it.name != "SecureStore.kt" }
+            ?.forEach { file ->
+                assertFalse(
+                    "${file.name} seals a record outside SecureStore",
+                    file.readText().contains("KeyGenerator")
+                )
+            }
     }
 }

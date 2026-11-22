@@ -24,12 +24,11 @@ import javax.crypto.spec.GCMParameterSpec
  * a sync, never funds: every caller treats a missing or unreadable value as "nothing cached
  * yet".
  *
- * Values carry a [PREFIX] marker so a plain-text value written by an older build is still
- * readable until the one-time migration has run, and is replaced by a sealed one the next
- * time it is saved. Once that migration is complete the caller says so ([open]'s
- * `allowPlainText`), and a value without the marker is refused instead of handed back: a
- * plain-text record can only be one this build did not write, and returning it would fill the
- * screen with whatever a tampered or corrupted preference file happens to hold.
+ * Values carry a [PREFIX] marker, and a value without it is refused rather than handed back.
+ * An earlier build read unsealed values back for one upgrade, so a phone that skipped the
+ * migration could still show them; 1.2.0 removes that window entirely. A plain-text record can
+ * only be one this build did not write, and returning it would fill the screen with whatever a
+ * tampered or corrupted preference file happens to hold.
  *
  * [seal] never falls back to the value it was given: a Keystore that refuses to seal returns
  * null, and the caller writes nothing (see `Prefs.saveCachedWallet` and
@@ -64,20 +63,17 @@ object SecretStore {
     /**
      * Opens a value written by [seal].
      *
-     * A value without the marker was written before this build sealed its records. It is
-     * returned while [allowPlainText] is true - the one upgrade in which those values are
-     * still the user's own history - and refused once the caller's one-time migration has
-     * finished, because from then on nothing this app writes lacks the marker.
+     * A value without the marker is refused, not returned. Up to 1.1.18 there was a window in
+     * which unsealed text was handed back so an upgrade could re-seal it; every path that
+     * could reach that window is gone, because a value this app did not seal is not something
+     * to put on the wallet's screen or in its history.
      */
-    fun open(stored: String, allowPlainText: Boolean = false): String? {
+    fun open(stored: String): String? {
         if (!isSealed(stored)) {
-            if (!allowPlainText) {
-                if (BuildConfig.DEBUG) {
-                    Log.w(TAG, "A stored value has no seal marker and was refused")
-                }
-                return null
+            if (BuildConfig.DEBUG) {
+                Log.w(TAG, "A stored value has no seal marker and was refused")
             }
-            return stored
+            return null
         }
         val payload = runCatching {
             Base64.decode(stored.substring(PREFIX.length), Base64.NO_WRAP)

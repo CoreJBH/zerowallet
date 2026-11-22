@@ -1,3 +1,6 @@
+import java.io.File
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -15,6 +18,11 @@ plugins {
  *   ZEROWALLET_KEY_ALIAS         key alias
  *   ZEROWALLET_KEY_PASSWORD      key password
  *
+ * They may instead live in `keystore/keystore.properties` at the repository root (storeFile,
+ * storePassword, keyAlias, keyPassword), which is never committed - the same place the sibling
+ * app keeps its own key. Gradle properties and environment variables win over the file, so CI
+ * passes them as secrets and a developer's checkout keeps them on disk.
+
  * With none of them set, `assembleRelease` produces an unsigned APK: it cannot be installed
  * over an existing app, so nobody mistakes it for a shippable artifact. It is deliberately
  * never signed with the debug key, which would make a build look installable while the
@@ -23,18 +31,37 @@ plugins {
  * instead of quietly producing something that only looks right: a half-configured release
  * key is a mistake to fix, not a state to build in.
  */
+val keystorePropertiesFile = rootProject.file("keystore/keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.isFile) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+
+/** A signing value: Gradle property, then environment, then the local properties file. */
+fun signingValue(gradleProperty: String, envName: String, fileKey: String): String? =
+    (findProperty(gradleProperty) as String?)?.takeIf { it.isNotBlank() }
+        ?: System.getenv(envName)?.takeIf { it.isNotBlank() }
+        ?: keystoreProperties.getProperty(fileKey)?.takeIf { it.isNotBlank() }
+
 val releaseKeystorePath: String? =
-    (findProperty("ZEROWALLET_KEYSTORE") as String?)?.takeIf { it.isNotBlank() }
-        ?: System.getenv("ZEROWALLET_KEYSTORE")?.takeIf { it.isNotBlank() }
+    signingValue("ZEROWALLET_KEYSTORE", "ZEROWALLET_KEYSTORE", "storeFile")
 val releaseKeystorePassword: String? =
-    (findProperty("ZEROWALLET_KEYSTORE_PASSWORD") as String?)?.takeIf { it.isNotBlank() }
-        ?: System.getenv("ZEROWALLET_KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() }
+    signingValue("ZEROWALLET_KEYSTORE_PASSWORD", "ZEROWALLET_KEYSTORE_PASSWORD", "storePassword")
 val releaseKeyAlias: String? =
-    (findProperty("ZEROWALLET_KEY_ALIAS") as String?)?.takeIf { it.isNotBlank() }
-        ?: System.getenv("ZEROWALLET_KEY_ALIAS")?.takeIf { it.isNotBlank() }
+    signingValue("ZEROWALLET_KEY_ALIAS", "ZEROWALLET_KEY_ALIAS", "keyAlias")
 val releaseKeyPassword: String? =
-    (findProperty("ZEROWALLET_KEY_PASSWORD") as String?)?.takeIf { it.isNotBlank() }
-        ?: System.getenv("ZEROWALLET_KEY_PASSWORD")?.takeIf { it.isNotBlank() }
+    signingValue("ZEROWALLET_KEY_PASSWORD", "ZEROWALLET_KEY_PASSWORD", "keyPassword")
+
+/** The keystore file itself: absolute as given, or resolved from the module then the root. */
+val releaseKeystoreFile: File? = releaseKeystorePath?.let { raw ->
+    val direct = File(raw)
+    when {
+        direct.isAbsolute -> direct
+        file(raw).exists() -> file(raw)
+        else -> rootProject.file(raw)
+    }
+}
 
 val releaseSigningValues =
     listOf(releaseKeystorePath, releaseKeystorePassword, releaseKeyAlias, releaseKeyPassword)
@@ -46,11 +73,16 @@ if (!releaseSigningConfigured && releaseSigningValues.any { it != null }) {
             "(Gradle property or environment variable), or none of them for an unsigned build."
     )
 }
-if (releaseSigningConfigured && !file(releaseKeystorePath!!).exists()) {
+if (releaseSigningConfigured && releaseKeystoreFile?.exists() != true) {
     throw GradleException("ZEROWALLET_KEYSTORE points at ${releaseKeystorePath}, which does not exist.")
 }
 
 android {
+    // The package stays at the app's original name. It is the identity Android uses for an
+    // update: a new applicationId would be a different app, unable to install over an existing
+    // wallet and unable to read its data. The Keystore aliases and preference file names are
+    // frozen for the same reason (see SecureStore.KEY_ALIAS); the name on the screen is
+    // ZeroWallet.
     namespace = "com.jbitmstr.purewallet"
     compileSdk = 35
 
@@ -58,8 +90,12 @@ android {
         applicationId = "com.jbitmstr.purewallet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 20
-        versionName = "1.1.18"
+        versionCode = 21
+        versionName = "1.2.0"
+
+        // Instrumented tests (Keystore, BiometricPrompt, FileProvider) run on a device with
+        // `connectedDebugAndroidTest`; they are not part of CI, which has no device.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
             // Phones are ARM; keeping the APK to the two ARM ABIs halves its size.
@@ -70,7 +106,7 @@ android {
     signingConfigs {
         if (releaseSigningConfigured) {
             create("release") {
-                storeFile = file(releaseKeystorePath!!)
+                storeFile = releaseKeystoreFile
                 storePassword = releaseKeystorePassword
                 keyAlias = releaseKeyAlias
                 keyPassword = releaseKeyPassword
@@ -177,6 +213,14 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     testImplementation("junit:junit:4.13.2")
+
+    // On-device tests for the parts a JVM cannot have: a Keystore key, a biometric prompt and
+    // the FileProvider the backup is shared through.
+    androidTestImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:core-ktx:1.6.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
     // The real org.json, so the fee parser is tested against the same class the app uses on
     // Android instead of the unit-test stub whose methods return defaults.
     testImplementation("org.json:json:20240303")

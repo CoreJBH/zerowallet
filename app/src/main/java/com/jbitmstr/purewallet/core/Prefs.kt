@@ -11,10 +11,11 @@ import com.jbitmstr.purewallet.BuildConfig
  * The seed phrase never goes in here; it lives in [SecureStore]. The snapshot's amounts and
  * history are sealed with [SecretStore] before they are written: a balance and the list of
  * who was paid are the wallet's business even on a device where another app can read this
- * file, and they carry a `v1:` marker once sealed. A value written before that (no marker) is
- * still read until [migratePlainTextValues] has re-sealed it, and is replaced by a sealed one
- * the next time the snapshot is saved. After that one-time migration a plain value is refused
- * rather than displayed.
+ * file, and they carry a `v1:` marker. A value without that marker is refused, not read: the
+ * plaintext fallback an earlier build kept for its own upgrade path was a way to make the
+ * wallet display (and trust) a number this app did not write, and 1.2.0 removes it. A snapshot
+ * a pre-1.1.11 build wrote in plain numbers is therefore dropped - it is a cache of what the
+ * node will say on its next sync, not the history itself.
  *
  * The sealing is fail-closed: when the Keystore cannot seal a value, [saveCachedWallet]
  * writes nothing rather than the plain text. The previous snapshot stays as it was.
@@ -25,7 +26,7 @@ import com.jbitmstr.purewallet.BuildConfig
 class Prefs internal constructor(
     private val prefs: SharedPreferences,
     private val seal: (String) -> String?,
-    private val unseal: (String, Boolean) -> String?
+    private val unseal: (String) -> String?
 ) {
 
     constructor(context: Context) : this(
@@ -266,9 +267,6 @@ class Prefs internal constructor(
         KEY_CACHE_PAYMENTS + network.id
     )
 
-    /** The keys that hold sealed values; [KEY_CACHE_SAVED] is a timestamp this class writes. */
-    private fun valueKeys(network: ChainNetwork): List<String> = cacheKeys(network).drop(1)
-
     /**
      * One-time cleanup for the 1.1.4 default.
      *
@@ -289,43 +287,6 @@ class Prefs internal constructor(
         prefs.edit().putBoolean(KEY_ESPLORA_MIGRATED, true).apply()
     }
 
-    /**
-     * Re-seals the snapshot values an older build wrote in plain text, once.
-     *
-     * Up to 1.1.10 the balance and height were stored as plain numbers; the values that follow
-     * them are sealed strings. Reading plain values is allowed only until this has run: they
-     * are the user's own history during the upgrade, and afterwards a value this app did not
-     * seal is not something to put on the wallet's screen. A value that cannot be sealed right
-     * now leaves the marker unwritten, so the next start tries again instead of dropping the
-     * history.
-     */
-    fun migratePlainTextValues() {
-        if (prefs.getBoolean(KEY_PLAIN_TEXT_MIGRATED, false)) return
-        val editor = prefs.edit()
-        var clean = true
-        ChainNetwork.entries.forEach { network ->
-            valueKeys(network).forEach { recordKey ->
-                val raw = runCatching { prefs.all[recordKey] }.getOrNull() ?: return@forEach
-                val text = when (raw) {
-                    is String -> raw
-                    is Long -> raw.toString()
-                    is Int -> raw.toString()
-                    else -> {
-                        // Not a value this class ever wrote; a snapshot without it would read
-                        // as zero anyway, so it goes rather than being kept as a mystery.
-                        editor.remove(recordKey)
-                        return@forEach
-                    }
-                }
-                if (SecretStore.isSealed(text)) return@forEach
-                val resealed = seal(text)
-                if (resealed != null) editor.putString(recordKey, resealed) else clean = false
-            }
-        }
-        if (clean) editor.putBoolean(KEY_PLAIN_TEXT_MIGRATED, true)
-        editor.apply()
-    }
-
     fun clear() {
         prefs.edit().clear().apply()
     }
@@ -334,18 +295,18 @@ class Prefs internal constructor(
 
     private fun key(prefix: String, network: ChainNetwork) = prefix + network.id
 
-    /** A cached value, opened; null when there is none or it cannot be read. */
+    /**
+     * A cached value, opened; null when there is none, when it is not sealed, or when the
+     * Keystore cannot open it.
+     *
+     * `all` is read rather than `getString`, both because a value of another type must not
+     * throw and because a value this app did not seal is not a value to put on the wallet's
+     * screen. There is no plaintext path left to fall back on.
+     */
     private fun sealed(key: String): String? {
-        // `all` is read rather than getString: a snapshot written by 1.1.10 or earlier holds
-        // Longs in these keys, and getString on a Long throws. Those plain numbers are taken
-        // as they are and are replaced by sealed strings on the next save.
-        val stored = when (val raw = runCatching { prefs.all[key] }.getOrNull()) {
-            is String -> raw
-            is Long -> raw.toString()
-            is Int -> raw.toString()
-            else -> null
-        } ?: return null
-        return unseal(stored, !prefs.getBoolean(KEY_PLAIN_TEXT_MIGRATED, false))
+        val stored = runCatching { prefs.all[key] }.getOrNull() as? String ?: return null
+        if (!SecretStore.isSealed(stored)) return null
+        return unseal(stored)
     }
 
     companion object {
@@ -365,7 +326,6 @@ class Prefs internal constructor(
         private const val KEY_ESPLORA = "esplora_url_"
         private const val KEY_ESPLORA_WORKING = "esplora_working_"
         private const val KEY_ESPLORA_MIGRATED = "esplora_default_migrated_1_1_5"
-        private const val KEY_PLAIN_TEXT_MIGRATED = "plain_values_migrated_1_1_18"
         private const val KEY_CACHE_SAVED = "cache_saved_at_"
         private const val KEY_CACHE_ONCHAIN = "cache_onchain_"
         private const val KEY_CACHE_SPENDABLE = "cache_spendable_"

@@ -56,7 +56,6 @@ import com.jbitmstr.purewallet.ui.components.PlusGlyph
 import com.jbitmstr.purewallet.ui.components.RefreshGlyph
 import com.jbitmstr.purewallet.ui.components.ScanGlyph
 import com.jbitmstr.purewallet.ui.components.SectionLabel
-import com.jbitmstr.purewallet.ui.components.SwapGlyph
 import com.jbitmstr.purewallet.ui.components.fiatText
 import com.jbitmstr.purewallet.ui.theme.Pal
 
@@ -69,8 +68,7 @@ fun HomeScreen(
     onScan: () -> Unit,
     onSend: () -> Unit,
     onReceive: () -> Unit,
-    onChannels: () -> Unit,
-    onSwap: () -> Unit
+    onChannels: () -> Unit
 ) {
     var expanded by rememberSaveable { mutableStateOf(true) }
     var dismissedError by rememberSaveable { mutableStateOf<String?>(null) }
@@ -130,8 +128,7 @@ fun HomeScreen(
             BalanceCard(
                 state = state,
                 expanded = expanded,
-                onToggle = { expanded = !expanded },
-                onSwap = onSwap
+                onToggle = { expanded = !expanded }
             )
         }
 
@@ -323,8 +320,7 @@ private fun TopBar(state: WalletState, onMenu: () -> Unit, onRefresh: () -> Unit
 private fun BalanceCard(
     state: WalletState,
     expanded: Boolean,
-    onToggle: () -> Unit,
-    onSwap: () -> Unit
+    onToggle: () -> Unit
 ) {
     CardSurface {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -368,21 +364,17 @@ private fun BalanceCard(
                     sats = Fmt.sats(state.lightningBalanceSats)
                 )
                 Spacer(Modifier.height(18.dp))
+                // This row used to carry a swap button that opened the channel sheet, which
+                // is a control that lies about what it does: there is no swap in this wallet
+                // (CleanSwap is its own app), and a button that looks like one but manages
+                // channels teaches the wrong thing about both. The Channels action below the
+                // card is the real entry point and says so.
                 BalanceRow(
                     icon = { BitcoinMark(size = 18.dp) },
                     title = "On-chain",
                     subtitle = "BTC",
                     fiat = fiatText(state.onchainTotalSats, state.fiat),
-                    sats = Fmt.sats(state.onchainTotalSats),
-                    trailing = {
-                        CircleIconButton(
-                            size = 38.dp,
-                            background = Pal.SurfaceElevated,
-                            onClick = onSwap
-                        ) {
-                            SwapGlyph(Modifier.size(16.dp))
-                        }
-                    }
+                    sats = Fmt.sats(state.onchainTotalSats)
                 )
             }
         }
