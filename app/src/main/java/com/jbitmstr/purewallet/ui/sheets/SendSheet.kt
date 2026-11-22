@@ -247,11 +247,19 @@ fun SendSheet(
                     LabelRow("Description", current.description)
                 }
                 if (current.input.kind == PaymentInputKind.ONCHAIN) {
-                    Spacer(Modifier.height(8.dp))
-                    LabelRow(
-                        "Address",
-                        Fmt.shortId(current.input.address.orEmpty(), 10, 8),
-                        mono = true
+                    Spacer(Modifier.height(10.dp))
+                    // The whole destination, never an abbreviation: this is the last screen
+                    // before signing, and the middle of an address is exactly where a
+                    // substitution can hide. Monospace, wrapped over as many lines as it needs.
+                    Text("Address", color = Pal.TextSecondary, fontSize = 11.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        current.input.address.orEmpty(),
+                        color = Pal.TextPrimary,
+                        fontSize = 11.sp,
+                        lineHeight = 16.sp,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
                 if (state.fiat != null && current.amountSats != null) {

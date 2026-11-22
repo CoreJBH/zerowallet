@@ -145,6 +145,52 @@ class ChannelBackupTest {
         assertArrayEquals(archive, ChannelBackup.decrypt(mnemonic, second))
     }
 
+    @Test
+    fun backupsAreWrittenAsFormatTwo() {
+        val archive = ChannelBackup.buildArchive(manifest(), sampleFiles())
+        val sealed = ChannelBackup.encrypt(mnemonic, archive)
+        assertEquals(2, sealed[4].toInt())
+        assertEquals(ChannelBackup.FORMAT_VERSION, sealed[4].toInt())
+        assertTrue(ChannelBackup.looksLikeBackup(sealed))
+    }
+
+    @Test
+    fun aFormatOneBackupFromAnOlderBuildStillOpens() {
+        // Format 1 sealed the same archive with one SHA-256 over the label and phrase. These
+        // files are in people's Google Drive already, so a newer app must still read them.
+        val archive = ChannelBackup.buildArchive(manifest(), sampleFiles())
+        val legacy = sealAsFormatOne(archive)
+        assertEquals(1, legacy[4].toInt())
+        assertTrue(ChannelBackup.looksLikeBackup(legacy))
+        assertArrayEquals(archive, ChannelBackup.decrypt(mnemonic, legacy))
+    }
+
+    @Test
+    fun theTwoKeyDerivationsDifferForTheSamePhrase() {
+        val current = ChannelBackup.deriveKey(mnemonic, ChannelBackup.FORMAT_VERSION)
+        val legacy = ChannelBackup.deriveKey(mnemonic, ChannelBackup.LEGACY_FORMAT_VERSION)
+        assertEquals(32, current.size)
+        assertEquals(32, legacy.size)
+        assertFalse(current.contentEquals(legacy))
+    }
+
+    /** Builds the format-1 envelope by hand: magic, version 1, nonce, AES-GCM with the old key. */
+    private fun sealAsFormatOne(archive: ByteArray): ByteArray {
+        val nonce = ByteArray(ChannelBackup.NONCE_BYTES) { (it + 7).toByte() }
+        val header = ByteArray(4 + 1 + ChannelBackup.NONCE_BYTES)
+        "ZWBK".forEachIndexed { index, char -> header[index] = char.code.toByte() }
+        header[4] = 1
+        nonce.copyInto(header, 5)
+        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            javax.crypto.Cipher.ENCRYPT_MODE,
+            javax.crypto.spec.SecretKeySpec(ChannelBackup.deriveKey(mnemonic, 1), "AES"),
+            javax.crypto.spec.GCMParameterSpec(128, nonce)
+        )
+        cipher.updateAAD(header)
+        return header + cipher.doFinal(archive)
+    }
+
     // --------------------------------------------------------------- archive
 
     @Test
@@ -213,6 +259,24 @@ class ChannelBackupTest {
             zip.closeEntry()
         }
         assertTrue(runCatching { ChannelBackup.readArchive(buffer.toByteArray()) }.exceptionOrNull() is BackupException)
+    }
+
+    @Test
+    fun archiveWithTooManyEntriesIsRefused() {
+        val buffer = java.io.ByteArrayOutputStream()
+        ZipOutputStream(buffer).use { zip ->
+            zip.putNextEntry(ZipEntry("manifest.txt"))
+            zip.write(ChannelBackup.manifestText(manifest()).toByteArray())
+            zip.closeEntry()
+            for (index in 0..ChannelBackup.MAX_ENTRIES) {
+                zip.putNextEntry(ZipEntry("data/f$index"))
+                zip.write(byteArrayOf(1))
+                zip.closeEntry()
+            }
+        }
+        val failure = runCatching { ChannelBackup.readArchive(buffer.toByteArray()) }.exceptionOrNull()
+        assertTrue(failure is BackupException)
+        assertTrue(failure?.message?.contains("too many") == true)
     }
 
     @Test

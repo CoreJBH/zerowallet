@@ -32,6 +32,13 @@ data class BackupTransferState(
  */
 object BackupTransfer {
 
+    /**
+     * Largest file this wallet reads from the picker. A channel backup for a phone-sized
+     * wallet is a few megabytes at most; the cap keeps a wrong pick (a video, a huge ZIP)
+     * from being loaded into memory, and matches the limit the backup format itself opens.
+     */
+    const val MAX_BACKUP_BYTES = ChannelBackup.MAX_BACKUP_BYTES
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var host: Activity? = null
@@ -107,12 +114,33 @@ object BackupTransfer {
         if (uri == null) return
         val resolver = context.applicationContext.contentResolver
         scope.launch {
-            val bytes = runCatching { resolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
+            val bytes = runCatching { readLimited(resolver.openInputStream(uri), MAX_BACKUP_BYTES) }
+                .getOrNull()
             if (bytes == null) {
-                publish("That file could not be read", failed = true)
+                publish("That file could not be read, or it is too large to be a channel backup", failed = true)
             } else {
                 _state.update { it.copy(restoreBytes = bytes, message = null, failed = false) }
             }
+        }
+    }
+
+    /**
+     * Reads at most [limit] bytes and fails beyond that, so a document of unknown size
+     * cannot be pulled into memory whole. A `content://` stream often reports no length at
+     * all, which is why the cap is enforced while reading.
+     */
+    private fun readLimited(stream: java.io.InputStream?, limit: Int): ByteArray {
+        val input = stream ?: error("the picked file could not be opened")
+        input.use {
+            val out = java.io.ByteArrayOutputStream()
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val read = it.read(buffer)
+                if (read < 0) break
+                if (out.size() + read > limit) error("the picked file is larger than $limit bytes")
+                out.write(buffer, 0, read)
+            }
+            return out.toByteArray()
         }
     }
 

@@ -28,6 +28,14 @@ data class FeeRates(
  */
 object Market {
 
+    /**
+     * Largest reply this wallet will read from a price or fee endpoint (256 KiB). The
+     * replies it asks for are a few hundred bytes of JSON; without a cap a hostile or
+     * misconfigured endpoint could make the app buffer an arbitrarily large body in the
+     * middle of a sync loop.
+     */
+    const val MAX_BODY_BYTES = 256 * 1024
+
     suspend fun fetchFiat(): FiatQuote? = withContext(Dispatchers.IO) {
         coingecko() ?: upbit() ?: mempoolUsd()
     }
@@ -115,7 +123,17 @@ object Market {
                 setRequestProperty("Accept", "application/json")
             }
             if (connection.responseCode in 200..299) {
-                connection.inputStream.bufferedReader().use { it.readText() }
+                connection.inputStream.bufferedReader().use { reader ->
+                    val text = StringBuilder()
+                    val buffer = CharArray(8 * 1024)
+                    while (true) {
+                        val read = reader.read(buffer)
+                        if (read < 0) break
+                        text.append(buffer, 0, read)
+                        if (text.length > MAX_BODY_BYTES) return null
+                    }
+                    text.toString()
+                }
             } else {
                 null
             }

@@ -43,6 +43,32 @@ class EsploraUrlTest {
     }
 
     @Test
+    fun theWholeIpv4LoopbackRangeIsAllowed() {
+        assertTrue(EsploraUrl.isValid("http://127.0.0.1:3002"))
+        assertTrue(EsploraUrl.isValid("http://127.5.6.7:3002"))
+        assertTrue(EsploraUrl.isValid("http://127.255.255.255/api"))
+        assertTrue(EsploraUrl.isValid("http://127.0.0.2"))
+    }
+
+    @Test
+    fun aPublicHostThatMerelyStartsWith127IsRejected() {
+        // `startsWith("127.")` would let these through and the node would read chain data
+        // over plain http to an internet host.
+        assertFalse(EsploraUrl.isValid("http://127.example.com/api"))
+        assertFalse(EsploraUrl.isValid("http://127.0.0.1.example.com/api"))
+        assertFalse(EsploraUrl.isValid("http://127.attacker.net:8080/api"))
+        assertFalse(EsploraUrl.isValid("http://127.evil"))
+    }
+
+    @Test
+    fun loopbackLookalikesOutsideTheRangeAreRejected() {
+        assertFalse(EsploraUrl.isValid("http://128.0.0.1:3002"))
+        assertFalse(EsploraUrl.isValid("http://127.0.0.256:3002"))
+        assertFalse(EsploraUrl.isValid("http://127.0.0.1.nip.io:3002"))
+        assertFalse(EsploraUrl.isValid("http://126.0.0.1"))
+    }
+
+    @Test
     fun plainHttpOnALanAddressIsRejected() {
         assertFalse(EsploraUrl.isValid("http://192.168.0.10:3002"))
         assertFalse(EsploraUrl.isValid("http://10.0.2.2:3002"))

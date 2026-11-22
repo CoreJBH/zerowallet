@@ -21,6 +21,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.lightningdevkit.ldknode.BackgroundSyncConfig
 import org.lightningdevkit.ldknode.Bolt11Invoice
 import org.lightningdevkit.ldknode.Bolt11InvoiceDescription
@@ -284,24 +285,39 @@ class NodeManager(context: Context) {
         return mnemonic
     }
 
-    /** Restores an existing 12/24 word wallet. */
-    fun restoreWallet(mnemonic: String): Result<Unit> {
-        val normalized = Bip39.normalize(mnemonic)
-        val unknown = Bip39.firstUnknownWord(normalized)
-        if (unknown != null) {
-            return Result.failure(IllegalArgumentException("Unknown BIP-39 word: $unknown"))
+    /**
+     * Restores an existing 12/24 word wallet.
+     *
+     * The node that may be running belongs to the wallet being replaced, and its store holds
+     * that wallet's channels and keys. So the phrase is not simply swapped in underneath a
+     * live node: the node is stopped under [nodeMutex] first, every chain's node data is
+     * deleted (nothing from the old wallet may be read back into the new one), and only then
+     * is the new phrase saved and the node started from it.
+     */
+    suspend fun restoreWallet(mnemonic: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val normalized = Bip39.normalize(mnemonic)
+            val unknown = Bip39.firstUnknownWord(normalized)
+            if (unknown != null) {
+                throw IllegalArgumentException("Unknown BIP-39 word: $unknown")
+            }
+            if (!Bip39.isValidMnemonic(normalized)) {
+                throw IllegalArgumentException("That recovery phrase is not valid (word count or checksum)")
+            }
+            nodeMutex.withLock {
+                lifecycle.onUserStart()
+                prefs.nodeStoppedByUser = false
+                stopNodeLocked(keepState = false, nextStarting = true)
+                clearNodeData()
+                secureStore.saveSeed(normalized)
+                prefs.seedBackedUp = true
+                prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
+                // The phrase may belong to another wallet than the one this snapshot was taken from.
+                prefs.clearCachedWallet(prefs.network)
+                _state.update { it.copy(seedPresent = true, backedUp = true, setupRequired = false) }
+                startNodeLocked(normalized)
+            }
         }
-        if (!Bip39.isValidMnemonic(normalized)) {
-            return Result.failure(IllegalArgumentException("That recovery phrase is not valid (word count or checksum)"))
-        }
-        secureStore.saveSeed(normalized)
-        prefs.seedBackedUp = true
-        prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
-        // The phrase may belong to another wallet than the one this snapshot was taken from.
-        prefs.clearCachedWallet(prefs.network)
-        _state.update { it.copy(seedPresent = true, backedUp = true, setupRequired = false) }
-        startNode(normalized)
-        return Result.success(Unit)
     }
 
     fun revealSeed(): String? = secureStore.loadSeed()
@@ -343,15 +359,27 @@ class NodeManager(context: Context) {
                         appVersion = BuildConfig.VERSION_NAME,
                         wordCount = Bip39.wordCount(mnemonic)
                     )
-                    val archive = ChannelBackup.buildArchive(manifest, files)
-                    val sealed = ChannelBackup.encrypt(mnemonic, archive)
-                    ChannelBackupExport(
-                        bytes = sealed,
-                        fileName = ChannelBackup.suggestedFileName(network.id, manifest.createdAtEpochSecs),
-                        manifest = manifest,
-                        fileCount = files.size,
-                        sizeBytes = sealed.size.toLong()
-                    )
+                    val archive: ByteArray
+                    try {
+                        archive = ChannelBackup.buildArchive(manifest, files)
+                        // The archive is the node's plaintext store in memory; only the
+                        // sealed copy below may outlive this block.
+                        val sealed = try {
+                            ChannelBackup.encrypt(mnemonic, archive)
+                        } finally {
+                            archive.fill(0)
+                        }
+                        ChannelBackupExport(
+                            bytes = sealed,
+                            fileName = ChannelBackup.suggestedFileName(network.id, manifest.createdAtEpochSecs),
+                            manifest = manifest,
+                            fileCount = files.size,
+                            sizeBytes = sealed.size.toLong()
+                        )
+                    } finally {
+                        // Every file that was read off disk is plaintext too.
+                        files.forEach { it.bytes.fill(0) }
+                    }
                 } finally {
                     _state.update { it.copy(busy = null) }
                     if (wasRunning) startNodeLocked(mnemonic)
@@ -374,7 +402,14 @@ class NodeManager(context: Context) {
                     ?: throw IllegalStateException("Restore your recovery phrase first, then import the backup")
                 _state.update { it.copy(busy = "Opening channel backup") }
                 val payload = try {
-                    ChannelBackup.readArchive(ChannelBackup.decrypt(mnemonic, bytes))
+                    // The decrypted archive is the node's plaintext store as well: read it
+                    // once and wipe the bytes rather than leaving them in the heap.
+                    val archive = ChannelBackup.decrypt(mnemonic, bytes)
+                    try {
+                        ChannelBackup.readArchive(archive)
+                    } finally {
+                        archive.fill(0)
+                    }
                 } finally {
                     _state.update { it.copy(busy = null) }
                 }
@@ -391,7 +426,11 @@ class NodeManager(context: Context) {
                 val incoming = File(appContext.filesDir, "ldk-node/incoming-$stamp").apply { mkdirs() }
                 val previous = File(appContext.filesDir, "ldk-node/previous-$stamp")
                 try {
-                    ChannelBackup.writeFiles(incoming, payload.files)
+                    try {
+                        ChannelBackup.writeFiles(incoming, payload.files)
+                    } finally {
+                        payload.files.forEach { it.bytes.fill(0) }
+                    }
                     if (dir.exists() && !dir.renameTo(previous)) {
                         throw IllegalStateException("The current node data could not be moved aside")
                     }
@@ -474,7 +513,9 @@ class NodeManager(context: Context) {
             }
             startEventLoop(built)
             startFiatLoop()
-            refreshInternal(userInitiated = false)
+            // Already under [nodeMutex] here: the refreshing variant that takes it would
+            // deadlock against this very start.
+            refreshLocked(userInitiated = false)
         } catch (c: CancellationException) {
             throw c
         } catch (t: Throwable) {
@@ -715,8 +756,15 @@ class NodeManager(context: Context) {
 
     /** Stops the node; callers already holding [nodeMutex] use this. */
     private suspend fun stopNodeLocked(keepState: Boolean, nextStarting: Boolean = false) {
-        eventJob?.cancel()
+        val loop = eventJob
         eventJob = null
+        loop?.cancel()
+        // The event loop holds the node across a blocking `nextEventAsync()`. Destroying the
+        // node while that call is still in flight is exactly the native use-after-free this
+        // guard exists for, so the loop is given a moment to leave before the node goes.
+        // The wait is bounded: a loop that will not stop is still cancelled below, and
+        // stopping the node is the only way left to get it back.
+        withTimeoutOrNull(EVENT_LOOP_STOP_MILLIS) { loop?.join() }
         val current = node
         node = null
         if (current != null) {
@@ -745,9 +793,12 @@ class NodeManager(context: Context) {
         scope.launch {
             nodeMutex.withLock {
                 stopNodeLocked(keepState = false)
-                ChainNetwork.values().forEach { network ->
-                    runCatching { networkDir(network).deleteRecursively() }
-                }
+                clearNodeData()
+                // The LDK log lines name peers, channels and addresses, and the cache keeps
+                // copies of exported backups. Neither is the wallet's money, but both are
+                // the wallet's business, so a wipe takes them too.
+                runCatching { File(appContext.filesDir, "logs").deleteRecursively() }
+                runCatching { File(appContext.cacheDir, "backups").deleteRecursively() }
                 runCatching { secureStore.clear() }
                 runCatching { notes.clear() }
                 runCatching { prefs.clear() }
@@ -854,7 +905,16 @@ class NodeManager(context: Context) {
         scope.launch { refreshInternal(userInitiated = true) }
     }
 
-    private suspend fun refreshInternal(userInitiated: Boolean) {
+    /**
+     * Reads the wallet from the node under [nodeMutex], so a stop, wipe or restart cannot
+     * pull the node out from under the sync (a native use-after-free that crashes the app).
+     */
+    private suspend fun refreshInternal(userInitiated: Boolean) = withContext(Dispatchers.IO) {
+        nodeMutex.withLock { refreshLocked(userInitiated) }
+    }
+
+    /** The body of a refresh; callers already hold [nodeMutex]. */
+    private suspend fun refreshLocked(userInitiated: Boolean) {
         val n = node ?: return
         if (_state.value.syncing) return
         _state.update { it.copy(syncing = true) }
@@ -906,109 +966,121 @@ class NodeManager(context: Context) {
 
     suspend fun createBolt11Invoice(amountSats: Long?, description: String): Result<InvoiceResult> =
         runCatching {
-            val n = requireNode()
-            val desc = Bolt11InvoiceDescription.Direct(description.trim())
-            val invoice = if (amountSats == null || amountSats <= 0L) {
-                n.bolt11Payment().receiveVariableAmount(desc, invoiceExpirySecs)
-            } else {
-                n.bolt11Payment().receive((amountSats * 1000L).toULong(), desc, invoiceExpirySecs)
+            withNode { n ->
+                val desc = Bolt11InvoiceDescription.Direct(description.trim())
+                val invoice = if (amountSats == null || amountSats <= 0L) {
+                    n.bolt11Payment().receiveVariableAmount(desc, invoiceExpirySecs)
+                } else {
+                    n.bolt11Payment().receive(millisats(amountSats), desc, invoiceExpirySecs)
+                }
+                val hash = invoice.paymentHash()
+                notes.put(hash, description)
+                InvoiceResult(invoice = invoice.toString(), paymentHash = hash)
             }
-            val hash = invoice.paymentHash()
-            notes.put(hash, description)
-            InvoiceResult(invoice = invoice.toString(), paymentHash = hash)
         }
 
     suspend fun createBolt12Offer(amountSats: Long?, description: String): Result<String> =
         runCatching {
-            val n = requireNode()
-            val trimmed = description.trim()
-            val offer = if (amountSats == null || amountSats <= 0L) {
-                n.bolt12Payment().receiveVariableAmount(trimmed, null)
-            } else {
-                n.bolt12Payment().receive((amountSats * 1000L).toULong(), trimmed, null, null)
+            withNode { n ->
+                val trimmed = description.trim()
+                val offer = if (amountSats == null || amountSats <= 0L) {
+                    n.bolt12Payment().receiveVariableAmount(trimmed, null)
+                } else {
+                    n.bolt12Payment().receive(millisats(amountSats), trimmed, null, null)
+                }
+                offer.toString()
             }
-            offer.toString()
         }
 
     suspend fun newOnchainAddress(): Result<String> = runCatching {
-        requireNode().onchainPayment().newAddress()
+        withNode { n -> n.onchainPayment().newAddress() }
     }
 
     // ------------------------------------------------------------- sending
 
     /** Reads the amount and description of a pasted/scanned payment request. */
     suspend fun resolveTarget(input: PaymentInput): Result<ResolvedTarget> = runCatching {
-        val n = requireNode()
-        when (input.kind) {
-            PaymentInputKind.BOLT11 -> {
-                val raw = input.bolt11 ?: input.raw
-                val invoice = Bolt11Invoice.fromStr(raw)
-                if (invoice.network() != n.config().network) {
-                    throw IllegalArgumentException("This invoice belongs to a different network")
-                }
-                if (invoice.isExpired()) {
-                    throw IllegalArgumentException("This invoice has expired")
-                }
-                val description = when (val d = invoice.invoiceDescription()) {
-                    is Bolt11InvoiceDescription.Direct -> d.description
-                    is Bolt11InvoiceDescription.Hash -> ""
-                }
-                val amountSats = invoice.amountMilliSatoshis()?.toLong()?.let { it / 1000L }
-                ResolvedTarget(
-                    input = input.copy(bolt11 = raw),
-                    description = description,
-                    amountSats = amountSats,
-                    amountEditable = amountSats == null
-                )
-            }
-            PaymentInputKind.BOLT12_OFFER -> {
-                val raw = input.bolt12Offer ?: input.raw
-                val offer = Offer.fromStr(raw)
-                if (offer.isExpired()) {
-                    throw IllegalArgumentException("This offer has expired")
-                }
-                val fixed = when (val amount = offer.amount()) {
-                    is OfferAmount.Bitcoin -> amount.amountMsats.toLong() / 1000L
-                    is OfferAmount.Currency -> throw IllegalArgumentException(
-                        "This offer is priced in ${amount.iso4217Code} and cannot be paid from here"
+        withNode { n ->
+            when (input.kind) {
+                PaymentInputKind.BOLT11 -> {
+                    val raw = input.bolt11 ?: input.raw
+                    val invoice = Bolt11Invoice.fromStr(raw)
+                    if (invoice.network() != n.config().network) {
+                        throw IllegalArgumentException("This invoice belongs to a different network")
+                    }
+                    if (invoice.isExpired()) {
+                        throw IllegalArgumentException("This invoice has expired")
+                    }
+                    val description = when (val d = invoice.invoiceDescription()) {
+                        is Bolt11InvoiceDescription.Direct -> d.description
+                        is Bolt11InvoiceDescription.Hash -> ""
+                    }
+                    val amountSats = invoice.amountMilliSatoshis()?.toLong()?.let { it / 1000L }
+                    ResolvedTarget(
+                        input = input.copy(bolt11 = raw),
+                        description = description,
+                        amountSats = amountSats,
+                        amountEditable = amountSats == null
                     )
-                    null -> null
                 }
-                ResolvedTarget(
-                    input = input.copy(bolt12Offer = raw),
-                    description = offer.offerDescription() ?: "",
-                    amountSats = fixed,
-                    amountEditable = fixed == null
-                )
-            }
-            PaymentInputKind.BOLT12_INVOICE -> {
-                val raw = input.bolt12Invoice ?: input.raw
-                val invoice = Bolt12Invoice.fromStr(raw)
-                if (invoice.isExpired()) {
-                    throw IllegalArgumentException("This invoice has expired")
+                PaymentInputKind.BOLT12_OFFER -> {
+                    val raw = input.bolt12Offer ?: input.raw
+                    val offer = Offer.fromStr(raw)
+                    if (offer.isExpired()) {
+                        throw IllegalArgumentException("This offer has expired")
+                    }
+                    val fixed = when (val amount = offer.amount()) {
+                        is OfferAmount.Bitcoin -> amount.amountMsats.toLong() / 1000L
+                        is OfferAmount.Currency -> throw IllegalArgumentException(
+                            "This offer is priced in ${amount.iso4217Code} and cannot be paid from here"
+                        )
+                        null -> null
+                    }
+                    ResolvedTarget(
+                        input = input.copy(bolt12Offer = raw),
+                        description = offer.offerDescription() ?: "",
+                        amountSats = fixed,
+                        amountEditable = fixed == null
+                    )
                 }
-                ResolvedTarget(
-                    input = input.copy(bolt12Invoice = raw),
-                    description = invoice.invoiceDescription() ?: "",
-                    amountSats = invoice.amountMsats().toLong() / 1000L,
-                    amountEditable = false
+                PaymentInputKind.BOLT12_INVOICE -> {
+                    val raw = input.bolt12Invoice ?: input.raw
+                    val invoice = Bolt12Invoice.fromStr(raw)
+                    if (invoice.isExpired()) {
+                        throw IllegalArgumentException("This invoice has expired")
+                    }
+                    ResolvedTarget(
+                        input = input.copy(bolt12Invoice = raw),
+                        description = invoice.invoiceDescription() ?: "",
+                        amountSats = invoice.amountMsats().toLong() / 1000L,
+                        amountEditable = false
+                    )
+                }
+                PaymentInputKind.ONCHAIN -> {
+                    val address = input.address ?: throw IllegalArgumentException("No Bitcoin address found")
+                    // A test-chain address on mainnet (or the reverse) can only fail, and the
+                    // failure would come after signing. Refuse it while it can still be
+                    // fixed, naming the chain the wallet is on.
+                    val network = prefs.network
+                    if (!PaymentInputParser.matchesNetwork(address, network.isMainnet)) {
+                        throw IllegalArgumentException(
+                            "That is not a ${network.title} address. Check the address or switch networks in Settings."
+                        )
+                    }
+                    ResolvedTarget(
+                        input = input,
+                        description = input.label ?: input.message ?: "",
+                        amountSats = input.amountSats?.let { checkedSats(it) },
+                        amountEditable = input.amountSats == null
+                    )
+                }
+                PaymentInputKind.PEER -> throw IllegalArgumentException(
+                    "That is a peer address. Use Channels to connect to it."
+                )
+                PaymentInputKind.UNKNOWN -> throw IllegalArgumentException(
+                    "Unrecognized payment request"
                 )
             }
-            PaymentInputKind.ONCHAIN -> {
-                val address = input.address ?: throw IllegalArgumentException("No Bitcoin address found")
-                ResolvedTarget(
-                    input = input,
-                    description = input.label ?: input.message ?: "",
-                    amountSats = input.amountSats,
-                    amountEditable = input.amountSats == null
-                )
-            }
-            PaymentInputKind.PEER -> throw IllegalArgumentException(
-                "That is a peer address. Use Channels to connect to it."
-            )
-            PaymentInputKind.UNKNOWN -> throw IllegalArgumentException(
-                "Unrecognized payment request"
-            )
         }
     }
 
@@ -1021,42 +1093,44 @@ class NodeManager(context: Context) {
         amountSats: Long?,
         priority: FeePriority
     ): Result<String> = runCatching {
-        val n = requireNode()
-        val input = target.input
-        when (input.kind) {
-            PaymentInputKind.BOLT11 -> {
-                val invoice = Bolt11Invoice.fromStr(input.bolt11 ?: input.raw)
-                val amount = amountSats ?: target.amountSats
-                if (invoice.amountMilliSatoshis() == null) {
-                    val sats = amount ?: throw IllegalArgumentException("Enter an amount")
-                    n.bolt11Payment().sendUsingAmount(invoice, (sats * 1000L).toULong(), null)
-                } else {
-                    n.bolt11Payment().send(invoice, null)
+        withNode { n ->
+            val input = target.input
+            when (input.kind) {
+                PaymentInputKind.BOLT11 -> {
+                    val invoice = Bolt11Invoice.fromStr(input.bolt11 ?: input.raw)
+                    val amount = amountSats ?: target.amountSats
+                    if (invoice.amountMilliSatoshis() == null) {
+                        val sats = amount ?: throw IllegalArgumentException("Enter an amount")
+                        n.bolt11Payment().sendUsingAmount(invoice, millisats(sats), null)
+                    } else {
+                        n.bolt11Payment().send(invoice, null)
+                    }
                 }
-            }
-            PaymentInputKind.BOLT12_OFFER -> {
-                val offer = Offer.fromStr(input.bolt12Offer ?: input.raw)
-                val amount = amountSats ?: target.amountSats
-                if (offer.amount() == null) {
-                    val sats = amount ?: throw IllegalArgumentException("Enter an amount")
-                    n.bolt12Payment().sendUsingAmount(offer, (sats * 1000L).toULong(), null, null, null)
-                } else {
-                    n.bolt12Payment().send(offer, null, null, null)
+                PaymentInputKind.BOLT12_OFFER -> {
+                    val offer = Offer.fromStr(input.bolt12Offer ?: input.raw)
+                    val amount = amountSats ?: target.amountSats
+                    if (offer.amount() == null) {
+                        val sats = amount ?: throw IllegalArgumentException("Enter an amount")
+                        n.bolt12Payment().sendUsingAmount(offer, millisats(sats), null, null, null)
+                    } else {
+                        n.bolt12Payment().send(offer, null, null, null)
+                    }
                 }
-            }
-            PaymentInputKind.BOLT12_INVOICE, PaymentInputKind.UNKNOWN -> {
-                when (val result = n.unifiedQrPayment().send(input.raw, null)) {
-                    is QrPaymentResult.Onchain -> result.txid
-                    is QrPaymentResult.Bolt11 -> result.paymentId
-                    is QrPaymentResult.Bolt12 -> result.paymentId
+                PaymentInputKind.BOLT12_INVOICE, PaymentInputKind.UNKNOWN -> {
+                    when (val result = n.unifiedQrPayment().send(input.raw, null)) {
+                        is QrPaymentResult.Onchain -> result.txid
+                        is QrPaymentResult.Bolt11 -> result.paymentId
+                        is QrPaymentResult.Bolt12 -> result.paymentId
+                    }
                 }
+                PaymentInputKind.ONCHAIN -> {
+                    val address = input.address ?: throw IllegalArgumentException("No Bitcoin address found")
+                    val sats = amountSats ?: target.amountSats
+                        ?: throw IllegalArgumentException("Enter an amount")
+                    sendOnchainInternal(n, address, checkedSats(sats), priority)
+                }
+                PaymentInputKind.PEER -> throw IllegalArgumentException("Use Channels to connect to this peer")
             }
-            PaymentInputKind.ONCHAIN -> {
-                val address = input.address ?: throw IllegalArgumentException("No Bitcoin address found")
-                val sats = amountSats ?: target.amountSats ?: throw IllegalArgumentException("Enter an amount")
-                sendOnchainInternal(n, address, sats, priority)
-            }
-            PaymentInputKind.PEER -> throw IllegalArgumentException("Use Channels to connect to this peer")
         }
     }
 
@@ -1066,14 +1140,15 @@ class NodeManager(context: Context) {
         sendAll: Boolean,
         priority: FeePriority
     ): Result<String> = runCatching {
-        val n = requireNode()
-        if (sendAll) {
-            val rates = Market.fetchFeeRates(currentEsploraUrl(prefs.network))
-            val feeRate = FeeRate.fromSatPerVbUnchecked(priority.satPerVb(rates).toULong())
-            n.onchainPayment().sendAllToAddress(address, true, feeRate)
-        } else {
-            val sats = amountSats ?: throw IllegalArgumentException("Enter an amount")
-            sendOnchainInternal(n, address, sats, priority)
+        withNode { n ->
+            if (sendAll) {
+                val rates = Market.fetchFeeRates(currentEsploraUrl(prefs.network))
+                val feeRate = FeeRate.fromSatPerVbUnchecked(priority.satPerVb(rates).toULong())
+                n.onchainPayment().sendAllToAddress(address, true, feeRate)
+            } else {
+                val sats = amountSats ?: throw IllegalArgumentException("Enter an amount")
+                sendOnchainInternal(n, address, checkedSats(sats), priority)
+            }
         }
     }
 
@@ -1096,47 +1171,82 @@ class NodeManager(context: Context) {
     // ------------------------------------------------------------- channels
 
     suspend fun connectPeer(uri: String): Result<Unit> = runCatching {
-        val n = requireNode()
-        val peer = PaymentInputParser.parsePeer(uri)
-            ?: throw IllegalArgumentException("Enter a peer as pubkey@host:port")
-        n.connect(peer.peerNodeId!!, peer.peerAddress!!, true)
+        withNode { n ->
+            val peer = PaymentInputParser.parsePeer(uri)
+                ?: throw IllegalArgumentException("Enter a peer as pubkey@host:port")
+            n.connect(peer.peerNodeId!!, peer.peerAddress!!, true)
+        }
     }
 
     suspend fun openChannel(uri: String, amountSats: Long, pushMsat: Long): Result<String> = runCatching {
-        val n = requireNode()
-        val peer = PaymentInputParser.parsePeer(uri)
-            ?: throw IllegalArgumentException("Enter a peer as pubkey@host:port")
-        if (amountSats <= 0L) throw IllegalArgumentException("Enter a channel size in sats")
+        withNode { n ->
+            val peer = PaymentInputParser.parsePeer(uri)
+                ?: throw IllegalArgumentException("Enter a peer as pubkey@host:port")
+            val capacity = checkedSats(amountSats, "Enter a channel size in sats")
+            if (pushMsat < 0L) throw IllegalArgumentException("The push amount cannot be negative")
+            if (pushMsat > Fmt.MAX_SATS * 1000L) {
+                throw IllegalArgumentException("That push amount is larger than any channel")
+            }
 
-        val connected = runCatching {
-            n.listPeers().any { it.nodeId.equals(peer.peerNodeId, ignoreCase = true) && it.isConnected }
-        }.getOrDefault(false)
-        if (!connected) {
-            n.connect(peer.peerNodeId!!, peer.peerAddress!!, true)
+            val connected = runCatching {
+                n.listPeers().any { it.nodeId.equals(peer.peerNodeId, ignoreCase = true) && it.isConnected }
+            }.getOrDefault(false)
+            if (!connected) {
+                n.connect(peer.peerNodeId!!, peer.peerAddress!!, true)
+            }
+            n.openChannel(
+                peer.peerNodeId!!,
+                peer.peerAddress!!,
+                capacity.toULong(),
+                pushMsat.takeIf { it > 0L }?.toULong(),
+                null
+            )
         }
-        n.openChannel(
-            peer.peerNodeId!!,
-            peer.peerAddress!!,
-            amountSats.toULong(),
-            pushMsat.takeIf { it > 0L }?.toULong(),
-            null
-        )
     }
 
     suspend fun closeChannel(channel: ChannelRow, force: Boolean): Result<Unit> = runCatching {
-        val n = requireNode()
-        if (force) {
-            n.forceCloseChannel(channel.userChannelId, channel.peer, "Closed from ZeroWallet")
-        } else {
-            n.closeChannel(channel.userChannelId, channel.peer)
+        withNode { n ->
+            if (force) {
+                n.forceCloseChannel(channel.userChannelId, channel.peer, "Closed from ZeroWallet")
+            } else {
+                n.closeChannel(channel.userChannelId, channel.peer)
+            }
         }
     }
 
     // ------------------------------------------------------------- helpers
 
-    fun requireNode(): Node = node ?: throw IllegalStateException(
-        "The node is not running. Wait for it to start and try again."
-    )
+    /**
+     * Runs [block] against the running node while no stop, wipe, import or restart can take
+     * that node away, on an IO thread because every one of these calls blocks.
+     *
+     * Node access without this lock is what makes a native use-after-free: a refresh or a
+     * payment that already holds the `Node` while `stopNodeLocked()` destroys it touches
+     * freed memory and takes the process down. Callers already holding [nodeMutex] must not
+     * call this (the mutex is not re-entrant); they use the `*Locked` helpers instead.
+     */
+    private suspend fun <T> withNode(block: suspend (Node) -> T): T = nodeMutex.withLock {
+        val n = node ?: throw IllegalStateException(
+            "The node is not running. Wait for it to start and try again."
+        )
+        withContext(Dispatchers.IO) { block(n) }
+    }
+
+    /**
+     * A satoshi amount that can actually be paid: positive and no larger than the 21 million
+     * BTC that exist. Anything else is refused here rather than silently wrapping when it is
+     * turned into millisatoshis for the node.
+     */
+    private fun checkedSats(sats: Long, message: String = "Enter an amount in sats"): Long {
+        if (sats <= 0L) throw IllegalArgumentException(message)
+        if (sats > Fmt.MAX_SATS) {
+            throw IllegalArgumentException("That is more than the 21 million BTC that exist")
+        }
+        return sats
+    }
+
+    /** Satoshis to millisatoshis. Safe because [checkedSats] has already capped the value. */
+    private fun millisats(sats: Long): ULong = (checkedSats(sats) * 1000L).toULong()
 
     /**
      * The endpoint fee estimates are read from: the one the node is running on, which is the
@@ -1147,6 +1257,14 @@ class NodeManager(context: Context) {
 
     private fun networkDir(network: ChainNetwork): File =
         File(appContext.filesDir, "ldk-node/${network.id}")
+
+    /** Everything ldk-node writes under `files/`: every chain's store and import leftovers. */
+    private fun ldkRoot(): File = File(appContext.filesDir, "ldk-node")
+
+    /** Deletes all node data, leaving no store from a previous wallet behind. */
+    private fun clearNodeData() {
+        runCatching { ldkRoot().deleteRecursively() }
+    }
 
     private fun startFiatLoop() {
         if (fiatJob?.isActive == true) return
@@ -1249,6 +1367,9 @@ class NodeManager(context: Context) {
         private const val NODE_ALIAS = "purewallet"
         private const val RGS_URL = "https://rapidsync.lightningdevkit.org/snapshot/"
         private val invoiceExpirySecs: UInt = 3600u
+
+        /** How long a stopping node waits for its event loop to leave the native call. */
+        private const val EVENT_LOOP_STOP_MILLIS = 2_000L
     }
 }
 

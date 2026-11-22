@@ -12,8 +12,8 @@ android {
         applicationId = "com.jbitmstr.purewallet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "1.1.8"
+        versionCode = 11
+        versionName = "1.1.9"
 
         ndk {
             // Phones are ARM; keeping the APK to the two ARM ABIs halves its size.
@@ -26,7 +26,11 @@ android {
             isMinifyEnabled = false
         }
         release {
-            isMinifyEnabled = false
+            // The shipped APK is the debug build (no signing key lives in this repository),
+            // but a release build still has to work: ldk-node's JNI bridge, the UniFFI
+            // bindings and JNA are kept by proguard-rules.pro, and the rest is shrunk.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

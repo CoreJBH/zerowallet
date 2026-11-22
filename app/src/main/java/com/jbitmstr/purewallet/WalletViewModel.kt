@@ -29,7 +29,7 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
     fun createWallet(wordCount: Int = 12): String = manager.createWallet(wordCount)
 
-    fun restoreWallet(mnemonic: String): Result<Unit> = manager.restoreWallet(mnemonic)
+    suspend fun restoreWallet(mnemonic: String): Result<Unit> = manager.restoreWallet(mnemonic)
 
     fun revealSeed(): String? = manager.revealSeed()
 

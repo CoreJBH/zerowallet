@@ -6,7 +6,6 @@ import android.content.ContextWrapper
 import android.os.Build
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
-import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
@@ -19,11 +18,22 @@ import androidx.lifecycle.LifecycleEventObserver
  *
  * On Android 11 and later one prompt accepts either a strong biometric or the device
  * screen lock (PIN, pattern, password). On older versions Android does not allow the two
- * in a single prompt, so the wallet asks for a fingerprint first and offers the screen
- * lock as the fallback button; phones with no biometrics go straight to the screen lock.
+ * in a single prompt, so the wallet asks for a strong biometric first and offers the
+ * screen lock as the fallback button; phones with no strong biometric go straight to the
+ * screen lock. Class 2 (weak) biometrics are never accepted on their own: on those
+ * versions Android reports them as BIOMETRIC_WEAK, and a weak face unlock is not the proof
+ * a wallet wants in front of spending.
  *
- * Nothing here holds key material: this is a gate in front of the UI. The seed itself
- * stays encrypted by an Android Keystore key in [SecureStore].
+ * Failure is closed. When the phone has no screen lock, or the system reports that it
+ * cannot authenticate right now, [authenticate] answers false instead of waving the gate
+ * open; the caller shows a locked screen and the user can retry.
+ *
+ * No CryptoObject is bound to these prompts, on purpose: an auth-bound Keystore cipher
+ * cannot be used together with the device-credential fallback on API 28-29 (the platform
+ * rejects a CryptoObject for that authenticator), and on newer versions a key invalidated
+ * by a screen-lock change would lock a working wallet out of its own UI. This gate guards
+ * the screens, while the secret itself is already sealed by a Keystore key in
+ * [SecureStore]; the phrase never travels through this class.
  *
  * Prompt state is lifecycle-driven, never a one-way flag. Every request replaces any
  * earlier attempt, and a request made while the activity is not resumed waits for the
@@ -63,7 +73,10 @@ class AppLock(private val activity: FragmentActivity) {
         activity.lifecycle.addObserver(observer)
     }
 
-    /** True when the phone can authenticate at all, which needs a screen lock. */
+    /**
+     * True when the phone can authenticate right now, which needs a screen lock. Read it
+     * again after every resume: a lock can be removed while the app is in the background.
+     */
     fun isAvailable(): Boolean = isAvailable(activity)
 
     /** True while a prompt or the system credential screen is in charge. */
@@ -71,8 +84,11 @@ class AppLock(private val activity: FragmentActivity) {
 
     /**
      * Shows the prompt. [onResult] runs on the main thread with true only after the
-     * system confirmed the user. When the phone has no screen lock the app cannot ask for
-     * anything, so the call reports success and the caller stays usable.
+     * system confirmed the user.
+     *
+     * When the phone cannot authenticate (no screen lock, or the system says it is not
+     * available right now) the call reports false. The gate stays shut rather than opening
+     * on an unproven claim: the caller keeps its locked screen and says what is missing.
      *
      * A request that arrives while the activity is not resumed (for example right after
      * the app returns from the background) is held until the next resume instead of being
@@ -80,7 +96,7 @@ class AppLock(private val activity: FragmentActivity) {
      */
     fun authenticate(title: String, subtitle: String, onResult: (Boolean) -> Unit) {
         if (!isAvailable()) {
-            onResult(true)
+            onResult(false)
             return
         }
         // The keyguard screen owns the attempt; a second prompt here would race it.
@@ -107,8 +123,8 @@ class AppLock(private val activity: FragmentActivity) {
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.R ->
                 show(BIOMETRIC_STRONG or DEVICE_CREDENTIAL, title, subtitle, null, token, onResult)
 
-            biometricsEnrolled(activity) ->
-                show(BIOMETRIC_WEAK, title, subtitle, FALLBACK_LABEL, token, onResult)
+            strongBiometricsEnrolled(activity) ->
+                show(BIOMETRIC_STRONG, title, subtitle, FALLBACK_LABEL, token, onResult)
 
             else ->
                 show(DEVICE_CREDENTIAL, title, subtitle, null, token, onResult)
@@ -212,8 +228,13 @@ class AppLock(private val activity: FragmentActivity) {
             return keyguard?.isDeviceSecure == true
         }
 
-        private fun biometricsEnrolled(context: Context): Boolean =
-            BiometricManager.from(context).canAuthenticate(BIOMETRIC_WEAK) ==
+        /**
+         * True only for a class 3 biometric. A weak (class 2) face or finger sensor is not
+         * offered here: on API 26-29 it would be the whole proof, which is not enough for
+         * a wallet. Those phones fall back to the device credential instead.
+         */
+        private fun strongBiometricsEnrolled(context: Context): Boolean =
+            BiometricManager.from(context).canAuthenticate(BIOMETRIC_STRONG) ==
                 BiometricManager.BIOMETRIC_SUCCESS
     }
 }

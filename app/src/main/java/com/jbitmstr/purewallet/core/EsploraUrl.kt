@@ -18,6 +18,17 @@ object EsploraUrl {
     private val LOOPBACK_HOSTS = setOf("127.0.0.1", "::1", "[::1]", "localhost")
 
     /**
+     * Any address in 127.0.0.0/8, and nothing else.
+     *
+     * A prefix test such as `startsWith("127.")` also matches a host like
+     * `127.example.com`, which is an ordinary internet name: plain http to it would leave the
+     * phone. Each octet is checked as a number here, so only a genuine IPv4 loopback literal
+     * gets through.
+     */
+    private const val OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+    private val IPV4_LOOPBACK = Regex("^127\\.$OCTET\\.$OCTET\\.$OCTET$")
+
+    /**
      * Returns the normalized URL, or a [Result.failure] carrying a message that can be
      * shown to the user as-is.
      */
@@ -48,7 +59,7 @@ object EsploraUrl {
             return failure("Remove the query string or fragment from the endpoint URL.")
         }
 
-        val loopback = host in LOOPBACK_HOSTS || host.startsWith("127.")
+        val loopback = host in LOOPBACK_HOSTS || IPV4_LOOPBACK.matches(host)
         val allowed = scheme == "https" || (scheme == "http" && loopback)
         if (!allowed) {
             return failure(

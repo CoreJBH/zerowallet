@@ -487,18 +487,22 @@ fun SettingsSheet(
             confirmButton = {
                 TextButton(onClick = {
                     pendingRestore = null
-                    scope.launch {
-                        backupBusy = true
-                        backupError = null
-                        backupNote = null
-                        BackupTransfer.reset()
-                        vm.importChannelBackup(bytes)
-                            .onSuccess { manifest: BackupManifest ->
-                                backupNote = "Restored ${manifest.channelCount} channels from a " +
-                                    "${manifest.network} backup"
-                            }
-                            .onFailure { backupError = it.message ?: "The backup could not be restored" }
-                        backupBusy = false
+                    // Replacing the channel data can cost the funds in a live channel, so it
+                    // asks for the same proof as a payment before it runs.
+                    onAuthorize("Authenticate to restore a channel backup.") {
+                        scope.launch {
+                            backupBusy = true
+                            backupError = null
+                            backupNote = null
+                            BackupTransfer.reset()
+                            vm.importChannelBackup(bytes)
+                                .onSuccess { manifest: BackupManifest ->
+                                    backupNote = "Restored ${manifest.channelCount} channels from a " +
+                                        "${manifest.network} backup"
+                                }
+                                .onFailure { backupError = it.message ?: "The backup could not be restored" }
+                            backupBusy = false
+                        }
                     }
                 }) {
                     Text("Restore", color = Pal.AccentBright)

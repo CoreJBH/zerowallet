@@ -56,6 +56,7 @@ import com.jbitmstr.purewallet.ui.components.CloseGlyph
 import com.jbitmstr.purewallet.ui.components.PrimaryButton
 import com.jbitmstr.purewallet.ui.theme.Pal
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Full-screen QR scanner built directly on CameraX and ZXing. No Google Play services
@@ -141,7 +142,10 @@ private fun CameraPreview(onResult: (String) -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val executor = remember { Executors.newSingleThreadExecutor() }
-    var handled by remember { mutableStateOf(false) }
+    // The analyzer runs on its own thread, and more than one frame can be in flight before
+    // the first result reaches the main thread. A plain box read from two threads can miss
+    // that hand-off; an atomic flag cannot, so one code opens one send and not two.
+    val handled = remember { AtomicBoolean(false) }
 
     DisposableEffect(Unit) {
         onDispose { executor.shutdown() }
@@ -163,10 +167,9 @@ private fun CameraPreview(onResult: (String) -> Unit) {
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                 analysis.setAnalyzer(executor) { image ->
-                    if (!handled) {
+                    if (!handled.get()) {
                         val value = decodeQr(image)
-                        if (value != null) {
-                            handled = true
+                        if (value != null && handled.compareAndSet(false, true)) {
                             previewView.post { onResult(value) }
                         }
                     }

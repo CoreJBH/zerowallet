@@ -92,6 +92,36 @@ object PaymentInputParser {
         return false
     }
 
+    /**
+     * True when [address] carries the prefix of the chain it is meant for.
+     *
+     * Mainnet addresses start with `bc1` (bech32) or `1`/`3` (base58); testnet and signet
+     * addresses start with `tb1` or `m`/`n`/`2`. Paying a mainnet address on a test chain (or
+     * the other way round) can only fail, and a mistyped chain marker is exactly the kind of
+     * mistake this check catches before the payment screen is reached. It is a shape check:
+     * the node still decodes and verifies the address itself.
+     */
+    fun matchesNetwork(address: String, mainnet: Boolean): Boolean {
+        val candidate = address.trim()
+        if (candidate.isEmpty() || candidate.any { it.isWhitespace() }) return false
+        val lower = candidate.lowercase()
+        return if (mainnet) {
+            when {
+                lower.startsWith("bc1") -> candidate.length in 14..90
+                candidate.startsWith("1") || candidate.startsWith("3") ->
+                    candidate.length in 26..62 && candidate.all { it.isLetterOrDigit() }
+                else -> false
+            }
+        } else {
+            when {
+                lower.startsWith("tb1") -> candidate.length in 14..90
+                candidate.startsWith("m") || candidate.startsWith("n") || candidate.startsWith("2") ->
+                    candidate.length in 26..62 && candidate.all { it.isLetterOrDigit() }
+                else -> false
+            }
+        }
+    }
+
     private fun parseLightning(value: String): PaymentInput {
         val text = value.trim()
         val lower = text.lowercase()

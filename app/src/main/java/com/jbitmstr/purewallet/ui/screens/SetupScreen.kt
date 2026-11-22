@@ -36,6 +36,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,6 +67,7 @@ import com.jbitmstr.purewallet.ui.components.GhostButton
 import com.jbitmstr.purewallet.ui.components.PrimaryButton
 import com.jbitmstr.purewallet.ui.components.SegmentedOptions
 import com.jbitmstr.purewallet.ui.theme.Pal
+import kotlinx.coroutines.launch
 
 /**
  * First run: create a wallet with one tap, or restore an existing recovery phrase.
@@ -80,7 +82,7 @@ import com.jbitmstr.purewallet.ui.theme.Pal
 fun SetupScreen(
     unlockError: Boolean = false,
     onCreate: (Int) -> Unit,
-    onRestore: (String) -> Result<Unit>
+    onRestore: suspend (String) -> Result<Unit>
 ) {
     var mode by remember { mutableStateOf(if (unlockError) 1 else 0) }
     var createWordCount by remember { mutableStateOf(12) }
@@ -90,6 +92,9 @@ fun SetupScreen(
     var jumpTo by remember { mutableStateOf(0) }
     var jumpTick by remember { mutableStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
+    var restoring by remember { mutableStateOf(false) }
+
+    val scope = rememberCoroutineScope()
 
     val requesters = remember(wordCount) { List(wordCount) { FocusRequester() } }
     val viewers = remember(wordCount) { List(wordCount) { BringIntoViewRequester() } }
@@ -279,12 +284,22 @@ fun SetupScreen(
                     Spacer(Modifier.height(8.dp))
                 }
                 PrimaryButton(
-                    text = "Restore wallet",
+                    text = if (restoring) "Restoring" else "Restore wallet",
                     onClick = {
-                        val result = onRestore(phrase ?: "")
-                        result.onFailure { error = it.message ?: "Could not restore this phrase" }
+                        val words = phrase ?: return@PrimaryButton
+                        scope.launch {
+                            // Stopping the node and replacing its store happens off the main
+                            // thread, so the button waits instead of the screen freezing.
+                            restoring = true
+                            error = null
+                            onRestore(words).onFailure {
+                                error = it.message ?: "Could not restore this phrase"
+                            }
+                            restoring = false
+                        }
                     },
-                    enabled = phrase != null
+                    enabled = phrase != null && !restoring,
+                    loading = restoring
                 )
                 if (suggestions.isNotEmpty()) {
                     Spacer(Modifier.height(10.dp))
@@ -419,7 +434,11 @@ private fun SeedWordBox(
             cursorBrush = SolidColor(Pal.AccentBright),
             interactionSource = interaction,
             keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Ascii,
+                // A recovery phrase must never reach an IME's learned words, clipboard
+                // history or suggestion strip, so it is typed into a password field: no
+                // suggestions, no autocorrect, no personalised dictionary entry.
+                keyboardType = KeyboardType.Password,
+                autoCorrectEnabled = false,
                 capitalization = KeyboardCapitalization.None,
                 imeAction = ImeAction.Next
             ),

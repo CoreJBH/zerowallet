@@ -52,7 +52,13 @@ so a reinstall needs the previous build removed first.
   one. A different Esplora endpoint can be typed into Settings, and saving it restarts the
   node so the new source is in use right away instead of waiting for the next start.
 - **On-chain wallet.** Receive to a freshly derived address, send with Normal/Fast fee
-  priorities taken from the network fee estimator, or sweep the whole balance.
+  priorities taken from the network fee estimator, or sweep the whole balance. The
+  confirmation screen shows the entire destination address in monospace, wrapped over as
+  many lines as it needs, never an abbreviation. The address must carry the prefix of the
+  chain the wallet is on (`bc1`/`1`/`3` on mainnet, `tb1`/`m`/`n`/`2` on the test chains),
+  so a test-chain address pasted on mainnet is refused before anything is signed. Amounts
+  are read as exact decimals: more than the 21 million BTC supply, a sub-satoshi remainder
+  or a value that would overflow is refused instead of paid.
 - **Lightning.** Create BOLT11 invoices and BOLT12 offers, pay BOLT11 invoices, BOLT12
   offers and BOLT12 invoices, and use unified BIP-21 / Lightning QR requests.
 - **Direct P2P channels.** Connect to a peer with `pubkey@host:port`, open a channel from
@@ -76,9 +82,12 @@ so a reinstall needs the previous build removed first.
   longer than 12.
 - **Encrypted channel backup.** The node store (channel manager and monitors, on-chain wallet,
   node keys) is packed into one `.zwbackup` file sealed with AES-256-GCM under a key derived
-  from the recovery phrase. Android's own file picker saves it to Google Drive or anywhere
-  else, or the share sheet does, with no Google Play Services and no OAuth. Restoring it on a
-  replacement phone after entering the phrase brings the open channels back.
+  from the recovery phrase with HKDF-SHA256. Android's own file picker saves it to Google
+  Drive or anywhere else, or the share sheet does, with no Google Play Services and no OAuth.
+  Restoring it on a replacement phone after entering the phrase brings the open channels
+  back, and asks for the same proof as a payment first. Importing is bounded (64 MB file,
+  4096 entries, 128 MB unpacked) so a wrong pick or a crafted archive cannot exhaust the
+  phone, and the plaintext store is zeroed as soon as it has been read or written.
 - **Never ₿0 while it starts.** A start takes seconds (the node opens its store and syncs
   with Esplora). The last known on-chain and Lightning balance, block height, sync time and
   payment list are kept on the device after every real sync and shown while the node comes
@@ -97,25 +106,38 @@ so a reinstall needs the previous build removed first.
 
 ## Security
 
-- **Authentication before money moves.** Sending a payment, funding or closing a channel
-  and showing the recovery phrase always ask for a biometric or the device screen lock
-  first. One prompt accepts either a strong biometric or the screen lock on Android 11+;
-  older versions ask for the fingerprint and offer the screen lock as the fallback. A phone
-  with no screen lock cannot ask, and says so in Settings.
+- **Authentication before money moves, and a gate that fails closed.** Sending a payment,
+  funding or closing a channel, restoring a channel backup and showing the recovery phrase
+  always ask for a biometric or the device screen lock first. One prompt accepts a strong
+  biometric or the screen lock on Android 11+; on older versions only a class-3 biometric is
+  accepted, with the screen lock as the fallback button, and a weak face unlock is never the
+  whole proof. When the phone has no screen lock, or the system reports it cannot
+  authenticate right now, the answer is "not authenticated": the wallet says what is
+  missing instead of opening. Whether a lock exists is re-read on every resume, so removing
+  it outside the app is noticed at once rather than after a restart.
 - **Optional lock on open.** Off by default, a switch in Settings makes the app ask every
   time it opens and after coming back from the background. The prompt is lifecycle-driven:
   it restarts cleanly on resume, so the Unlock button cannot go dead after backgrounding.
 - **No screenshots, no Recents thumbnail.** The window is `FLAG_SECURE`, so the wallet is
   blocked from screenshots and screen recording and blanked in the recent-apps list. The
-  recovery phrase forces it on even if the setting is off.
+  recovery phrase and the setup/restore screens force it on even if the setting is off.
 - **Seed at rest.** The BIP-39 mnemonic is generated with `java.security.SecureRandom`,
   its entropy buffer is zeroed right after the words exist, and it is stored only as
   AES-256-GCM ciphertext under a non-exportable Android Keystore key. Android backup is
-  disabled for the app.
+  disabled for the app. The restore boxes are password fields with autocorrect off, so the
+  phrase never reaches a keyboard's learned words or suggestion strip.
 - **HTTPS-only chain source.** A custom Esplora endpoint must be `https://`; plain `http://`
-  is accepted only for a node on the phone itself (`127.0.0.1`, `::1`, `localhost`).
-  Credentials, query strings and fragments in the URL are rejected, and a stored value that
-  no longer passes is ignored in favour of the built-in default.
+  is accepted only for a node on the phone itself: `localhost`, `::1` or a literal address in
+  `127.0.0.0/8`, checked octet by octet (a public host that merely starts with `127.` is not
+  loopback). Credentials, query strings and fragments in the URL are rejected, and a stored
+  value that no longer passes is ignored in favour of the built-in default.
+- **One lock around the node.** Every JNI call into ldk-node runs on an IO thread while the
+  node is held by the same mutex that serialises starts and stops, so a stop, wipe or
+  restart can never destroy a node a sync or payment is still using. A stop also waits for
+  the event loop to leave its blocking native call before the node is destroyed.
+- **Wipe leaves nothing readable.** Wiping the wallet deletes the seed, every chain's node
+  data, the payment notes, the settings, the node log (which names peers and channels) and
+  the cache copies of exported backups.
 - **Bounded logs.** `logs/ldk-node.log` is capped at 2 MB and rotated with two archives while
   the node is stopped, so a long-running install cannot fill the phone with logs.
 - **No phone-home.** No analytics, no crash reporting, no remote logging. Network requests
@@ -181,7 +203,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.8`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.9`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -209,8 +231,9 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 157 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), backup encryption round trip and refusals, endpoint rules and the mainnet default, Esplora fee estimates, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle |
-| Android lint | `./gradlew lintDebug` | no errors |
+| Unit tests | `./gradlew testDebugUnitTest` | 178 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, backup encryption round trip, format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the strict 127.0.0.0/8 loopback check and the mainnet default, address-prefix chain matching, Esplora fee estimates, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle |
+| Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
+| Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro` |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
 | Package / label | `aapt2 dump badging app-debug.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |
 

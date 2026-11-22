@@ -51,7 +51,10 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
 
     val activity = remember(context) { AppLock.activityOf(context) }
     val appLock = remember(activity) { activity?.let { AppLock(it) } }
-    val lockAvailable = remember(activity) { appLock?.isAvailable() == true }
+    // Whether the phone can authenticate is not a fact to cache: a screen lock can be
+    // removed while the app sits in the background, and the gate must not stay "available"
+    // after that. It is re-read on every resume below.
+    var lockAvailable by remember(activity) { mutableStateOf(appLock?.isAvailable() == true) }
     // Until the wallet is loaded it is not known whether one exists, so the gate stays
     // armed; after that only a real wallet is worth locking. Onboarding is never gated.
     val lockArmed = if (state.bootstrapped) state.seedPresent else true
@@ -81,7 +84,11 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                 unlocked = true
                 unlockError = null
             } else {
-                unlockError = "Authentication was not completed."
+                unlockError = if (lock.isAvailable()) {
+                    "Authentication was not completed."
+                } else {
+                    "This phone has no screen lock, so the wallet cannot be unlocked. Set one in Android settings first."
+                }
             }
         }
     }
@@ -106,8 +113,14 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                     backupWords = null
                 }
                 // Android can freeze or kill the node while the app is away, and a start
-                // that failed leaves nothing running. Coming back asks for it again.
-                Lifecycle.Event.ON_RESUME -> vm.onAppForeground()
+                // that failed leaves nothing running. Coming back asks for it again. The
+                // authentication options are re-read here too, so removing the screen lock
+                // outside the app takes the lock gate with it instead of leaving a prompt
+                // that can no longer succeed.
+                Lifecycle.Event.ON_RESUME -> {
+                    lockAvailable = appLock?.isAvailable() == true
+                    vm.onAppForeground()
+                }
                 else -> Unit
             }
         }
@@ -141,8 +154,9 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     }
 
     // Screenshots and the Recents thumbnail stay blocked. With the setting on the whole
-    // wallet is covered; the recovery phrase forces it on even when the setting is off.
-    val secureScreen = state.screenProtection || backupWords != null
+    // wallet is covered; the recovery phrase and the setup/restore screens force it on even
+    // when the setting is off, because both show words of the seed.
+    val secureScreen = state.screenProtection || backupWords != null || state.setupRequired
     LaunchedEffect(activity, secureScreen) {
         activity?.let { ScreenSecurity.apply(it, secureScreen) }
     }

@@ -12,6 +12,13 @@ object Fmt {
 
     const val SATS_PER_BTC = 100_000_000.0
 
+    /** Satoshis in 21 million BTC, the whole supply: more than this is not an amount. */
+    const val MAX_SATS: Long = 21_000_000L * 100_000_000L
+
+    private val SATS_PER_BTC_DECIMAL: java.math.BigDecimal =
+        java.math.BigDecimal.valueOf(100_000_000L)
+    private val MAX_BTC: java.math.BigDecimal = java.math.BigDecimal.valueOf(21_000_000L)
+
     fun sats(value: Long): String = "₿" + String.format(Locale.US, "%,d", value)
 
     fun btc(satoshis: Long): String = String.format(Locale.US, "%.8f", satoshis / SATS_PER_BTC)
@@ -58,12 +65,28 @@ object Fmt {
         return cleaned.toLongOrNull()?.takeIf { it > 0 }
     }
 
-    /** Parses a BTC amount typed by the user ("0.001") into satoshis. */
+    /**
+     * Parses a BTC amount typed by the user ("0.001") into satoshis.
+     *
+     * Exact decimal arithmetic, not [Double]: `0.1 + 0.2` style error and values such as
+     * `0.00000001` rounding the wrong way have no place in an amount that gets signed. More
+     * than the 21 million supply, or a value whose satoshi count would overflow, is refused
+     * (null) instead of wrapping into a small or negative amount. Sub-satoshi digits are
+     * dropped, never rounded up: the wallet never pays more than the user typed.
+     */
     fun parseBtcToSats(input: String): Long? {
         val cleaned = input.replace(",", "").replace(" ", "").trim()
         if (cleaned.isEmpty()) return null
-        val btc = cleaned.toDoubleOrNull() ?: return null
-        if (btc <= 0.0) return null
-        return Math.round(btc * SATS_PER_BTC)
+        val btc = try {
+            java.math.BigDecimal(cleaned)
+        } catch (e: NumberFormatException) {
+            return null
+        }
+        if (btc.signum() <= 0) return null
+        if (btc > MAX_BTC) return null
+        val sats = btc.multiply(SATS_PER_BTC_DECIMAL).setScale(0, java.math.RoundingMode.DOWN)
+        if (sats.signum() <= 0) return null
+        if (sats > java.math.BigDecimal.valueOf(MAX_SATS)) return null
+        return sats.toLong()
     }
 }
