@@ -145,19 +145,25 @@ so a reinstall needs the previous build removed first.
   biometric dialog when the app goes to the background and may never call back, and the
   system's error for a prompt this app cancelled belongs to a stale token; both are reported
   as "not authenticated" instead of leaving the sheet busy with no prompt on screen.
-- **The seed is bound to the phone's lock, in the Keystore itself.** On Android 8 and later
-  (this app's minimum is API 26) on a phone with a screen lock, the key that decrypts the
-  recovery phrase is created with `setUserAuthenticationRequired(true)` and a 60-second
+- **The seed's key is made inside the Keystore, and bound to the phone's lock there.** The
+  AES-256 key comes from `KeyGenerator.getInstance(AES, "AndroidKeyStore")`, so its material
+  is created in the Keystore and never exists as bytes this process can hold; 1.1.17 replaced
+  the imported key pair of earlier builds, which kept the material in software for the length
+  of the import. On Android 8 and later (this app's minimum is API 26) on a phone with a
+  screen lock the key is created with `setUserAuthenticationRequired(true)` and a 60-second
   validity window: the Keystore only releases it shortly after the user authenticated, so a
   shell, a hooked callback or a bypassed screen cannot read the phrase, and a process that
   has been sitting in the background has to ask again. Android 11+ gets the window through
   `setUserAuthenticationParameters` (device credential or a strong biometric), Android 8-10
-  through `setUserAuthenticationValidityDurationSeconds`. The same AES material is imported
-  twice - an encrypt-only alias with no such requirement (sealing a new or restored phrase
-  asks nothing) and the decrypt-only alias above - so nothing can read the phrase with the
-  alias that writes it. Opening the wallet after Android closed the app can therefore ask for
-  the screen lock even with lock-on-open off; the prompt is the same one. A wallet written by
-  1.1.10 or earlier is moved onto this pair the first time it is opened.
+  through `setUserAuthenticationValidityDurationSeconds`. Enrolling another fingerprint does
+  not invalidate the key, so adding a finger cannot cost the user a restore of their phrase.
+  Sealing a new or restored phrase uses that same key, which means a seal can land outside
+  the window: the Keystore then refuses, nothing is written, and the setup screen asks for
+  the device lock and finishes the job - a wallet is never sealed with a weaker key to avoid
+  the prompt. Opening the wallet after Android closed the app can ask for the screen lock
+  even with lock-on-open off; the prompt is the same one. A wallet written by 1.1.16 or
+  earlier is opened with whichever key sealed it and moved onto this key the first time it is
+  opened after an authentication.
 - **When the key cannot be bound, the wallet says so.** A phone with no screen lock, a
   Keystore that refuses the bound key, or a wallet sealed before the lock existed leaves the
   phrase sealed with a key that opens without the device lock. That state is read back from
@@ -307,7 +313,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
                                         │
                                         ├── Esplora chain source (HTTPS)
                                         ├── gossip: Lightning P2P (default) or RGS snapshot
-                                        ├── seed: AES-256-GCM, split Keystore keys (read = device lock)
+                                        ├── seed: AES-256-GCM, one Keystore-generated key (lock-bound)
                                         ├── app lock: BiometricPrompt + device credential
                                         └── sealed cache: balance snapshot and notes (Prefs)
 ```
@@ -324,11 +330,16 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   failure from a Lightning-port failure, with no Android APIs so it is unit tested.
 - `core/WalletCache.kt` encodes the last known balances and history and hydrates the wallet
   state with them while the node starts.
-- `core/SecureStore.kt` encrypts the BIP-39 mnemonic with a non-exportable Keystore key pair
-  (encrypt-only alias, decrypt-only alias bound to the device lock) and Android backup is
-  disabled for the app, so the ciphertext never leaves the device. `core/SecretStore.kt`
-  seals the balance cache and the payment notes with a separate Keystore key; both stores are
-  fail-closed, so a value the Keystore cannot seal is never written in its place.
+- `core/SecureStore.kt` encrypts the BIP-39 mnemonic with an AES-256 key generated inside the
+  Android Keystore and bound to the device lock where the phone has one, and Android backup is
+  disabled for the app, so the ciphertext never leaves the device. A seal that lands outside
+  the key's validity window returns "authenticate first" instead of writing anything, and a
+  phone that cannot bind the key at all is reported as unbound rather than passing for
+  stronger. `core/SeedStorage.kt` carries the rules for the three generations of stored file
+  (which key is tried in which order, what each one says about its protection) as plain
+  Kotlin, so they are unit tested. `core/SecretStore.kt` seals the balance cache and the
+  payment notes with a separate Keystore key; both stores are fail-closed, so a value the
+  Keystore cannot seal is never written in its place.
 - `core/AppLock.kt` wraps `BiometricPrompt` with the screen-lock fallback and exposes the
   availability check the UI uses to explain the setting on phones without a lock; without a
   lock the sensitive actions are refused rather than let through.
@@ -354,8 +365,15 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   writes a channel backup when the user saves one (Settings, encrypted with the phrase), and
   nobody recovers it for them. Without such a file a lost phone loses the funds in open
   channels. A backup is a snapshot too, so a channel that changed after it was saved may close
-  when restored. The app says so before showing the phrase and at the top of the channel
-  screen; keep channel amounts small. Restoring a backup replaces the node data in place and
+  when restored. ldk-node 0.7.0 exposes no Static Channel Backup export (`Node` has no
+  `export_channel_backup`, only `exportPathfindingScores`), so there is nothing smaller and
+  safer to write: the store is the whole channel state or nothing, and a restore replaces it
+  in place. The restore confirmation therefore opens the file first and shows the date it was
+  made, how old that is, the chain, the channel count and the wallet's node id, refuses a file
+  from another chain or another wallet, and asks the user to acknowledge that an older state
+  force-closes the channels that moved before the Restore button becomes available. Settings
+  also shows how old the last backup from this phone is, because a snapshot nobody refreshed
+  is the one that costs a force-close. Keep channel amounts small. Restoring a backup replaces the node data in place and
   keeps it: if the node cannot start afterwards because the chain source is unreachable, the
   restored data stays and the node is started again when the connection is back, rather than
   the restore being rolled back over a network problem. Only a backup that cannot be read or
@@ -367,7 +385,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.16`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.17`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -402,7 +420,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 268 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate and unreadable BIP-21 amounts, the authorization gate that runs a privileged action only on a reported success, an abandoned prompt answering its caller, the per-chain RGS URL, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate |
+| Unit tests | `./gradlew testDebugUnitTest` | 317 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate and unreadable BIP-21 amounts, the authorization gate that runs a privileged action only on a reported success, an abandoned prompt answering its caller, the per-chain RGS URL, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate, the recommended-fee parser refusing a reply with a missing or non-numeric field instead of inventing 1 sat/vB, the send sheet's fee read as a state that ends in Retry, the BIP-21 amount URI of the on-chain receive tab, the three generations of stored seed file and what each says about its protection, the rule that the seed key is generated in the Keystore rather than imported, and the restore confirmation's refusals and stale-backup warning |
 | Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
 | Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
@@ -417,7 +435,7 @@ app/src/main/java/com/jbitmstr/purewallet/
   WalletViewModel.kt         UI bridge
   core/                      node, node lifecycle rules, seed, app lock, channel backup, endpoint rules, log rotation, market data
   ui/                        home screen, lock screen, sheets, word-box setup and scanner
-app/src/test/                BIP-39, restore-word grid, channel backup, endpoint, node lifecycle, send draft, log rotation and lock lifecycle tests
+app/src/test/                BIP-39, restore-word grid, channel backup and its restore review, fee parsing and the fee-read state, BIP-21 URIs, seed key storage, endpoint, node lifecycle, send draft, log rotation and lock lifecycle tests
 docs/icon.png                launcher icon artwork
 docs/preview.jpg             the screenshot above
 .github/workflows/apk.yml    CI build
@@ -425,9 +443,11 @@ verify-english.py            English-only guard
 ```
 
 The Kotlin package and `applicationId` stay `com.jbitmstr.purewallet` so an install over an
-older build keeps the same app data. The seed's Keystore keys changed shape in 1.1.11 (a
-split encrypt/decrypt pair), so the stored seed of an older install is opened once with its
-old key and re-sealed under the new one on first launch instead of asking to restore.
+older build keeps the same app data. The seed's Keystore key changed shape twice: 1.1.11
+split the material into an encrypt/decrypt pair, and 1.1.17 replaced that pair with a single
+key generated inside the Keystore. Both older shapes are still read - a stored seed is tried
+with its own key first, and the first successful open after an authentication re-seals it
+onto the current key and deletes the old ones, so an upgrade never asks for the phrase.
 
 ## Contributors
 

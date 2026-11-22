@@ -15,9 +15,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -43,9 +47,11 @@ import androidx.core.content.FileProvider
 import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.Authorization
 import com.jbitmstr.purewallet.core.BackupManifest
+import com.jbitmstr.purewallet.core.BackupReview
 import com.jbitmstr.purewallet.core.BackupTransfer
 import com.jbitmstr.purewallet.core.ChannelBackup
 import com.jbitmstr.purewallet.core.ChannelBackupExport
+import com.jbitmstr.purewallet.core.ChannelBackupReview
 import com.jbitmstr.purewallet.core.ChainNetwork
 import com.jbitmstr.purewallet.core.DeviceLockSettings
 import com.jbitmstr.purewallet.core.Fmt
@@ -82,17 +88,33 @@ fun SettingsSheet(
     var backupBusy by remember { mutableStateOf(false) }
     var backupNote by remember { mutableStateOf<String?>(null) }
     var backupError by remember { mutableStateOf<String?>(null) }
-    var pendingRestore by remember { mutableStateOf<ByteArray?>(null) }
+    var pendingRestore by remember { mutableStateOf<PendingRestore?>(null) }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val transfer by BackupTransfer.state.collectAsStateWithLifecycle()
+    // The age of the last backup is shown against the moment the sheet opened; a snapshot is
+    // judged in days, so a second one way or the other is not what this screen is for.
+    val nowEpochSecs = remember { System.currentTimeMillis() / 1000L }
 
     // The picked file arrives through the activity-owned picker, so it still lands even when
     // the picker backgrounded the app and lock-on-open took the wallet out of composition.
     LaunchedEffect(transfer.restoreBytes) {
         val bytes = transfer.restoreBytes ?: return@LaunchedEffect
-        pendingRestore = bytes
         BackupTransfer.consumeRestoreBytes()
+        // Read the file before anything is asked or replaced. The date it was made, the
+        // wallet it belongs to and whether it may be restored here are what the confirmation
+        // is built from, and a file that cannot be opened says so without touching the store.
+        pendingRestore = PendingRestore(bytes = bytes, loading = true)
+        pendingRestore = vm.inspectChannelBackup(bytes).fold(
+            onSuccess = { review -> PendingRestore(bytes = bytes, review = review, loading = false) },
+            onFailure = { failure ->
+                PendingRestore(
+                    bytes = bytes,
+                    error = failure.message ?: "This backup could not be opened",
+                    loading = false
+                )
+            }
+        )
     }
 
     val statusText = backupError ?: transfer.message ?: backupNote
@@ -439,6 +461,38 @@ fun SettingsSheet(
                 }
             }
         }
+        Spacer(Modifier.height(12.dp))
+        // Where the node's own data lives, and what actually protects it. The phrase above is
+        // sealed with a Keystore key; this store is not sealed at all, so the user should know
+        // that the sandbox is the boundary rather than assume a second lock exists.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(Pal.Surface)
+                .border(1.dp, Pal.Border, RoundedCornerShape(16.dp))
+                .padding(14.dp)
+        ) {
+            Text(
+                "Node data on this phone",
+                color = Pal.TextPrimary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Channels, the on-chain wallet and the node's store live in this app's own " +
+                    "storage (files/ldk-node/). That copy is not sealed with your recovery " +
+                    "phrase the way the phrase is: what protects it is the app sandbox - no " +
+                    "other app can read it, it is left out of cloud backups, and a release " +
+                    "build is not debuggable. A rooted phone or a compromise of the whole " +
+                    "device is outside what this app can stop, which is why the phrase on " +
+                    "paper, not the phone, is what you keep.",
+                color = Pal.TextTertiary,
+                fontSize = 11.sp,
+                lineHeight = 15.sp
+            )
+        }
         Spacer(Modifier.height(10.dp))
         SwitchRow(
             title = "Block screenshots",
@@ -466,6 +520,48 @@ fun SettingsSheet(
             fontSize = 11.sp,
             lineHeight = 15.sp
         )
+        Spacer(Modifier.height(10.dp))
+        // How old the last snapshot from this phone is, before the buttons that make a new
+        // one: a backup nobody refreshed is the one that costs a force-close.
+        val lastBackupAge = ChannelBackupReview.ageLabel(state.lastChannelBackupEpochSecs, nowEpochSecs)
+        val hasChannels = state.channels.isNotEmpty()
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(Pal.Surface)
+                .border(1.dp, Pal.Border, RoundedCornerShape(14.dp))
+                .padding(14.dp)
+        ) {
+            Text(
+                when {
+                    lastBackupAge != null ->
+                        "Last backup from this phone: $lastBackupAge" +
+                            if (state.lastChannelBackupChannels > 0) {
+                                " (${state.lastChannelBackupChannels} channels)"
+                            } else {
+                                ""
+                            }
+                    hasChannels -> "No backup has been saved from this phone"
+                    else -> "No channel backup saved from this phone yet"
+                },
+                color = if (lastBackupAge == null && hasChannels) Pal.Warning else Pal.TextPrimary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+            if (hasChannels) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "A backup only knows the channel states it saw. Every payment since then " +
+                        "makes the file older than the channel, and an old snapshot closes the " +
+                        "channels that moved when it is restored. Save a new one after your " +
+                        "channels change, and keep the newest.",
+                    color = Pal.TextTertiary,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
+                )
+            }
+        }
         Spacer(Modifier.height(10.dp))
         PrimaryButton(
             text = if (backupBusy) "Working" else "Save backup to Drive",
@@ -505,9 +601,8 @@ fun SettingsSheet(
         Spacer(Modifier.height(8.dp))
         Text(
             "Only these same 12 or 24 words open it - ZeroWallet cannot open it for you. Restore " +
-                "works after the phrase is on the phone: pick the file and the node replaces its " +
-                "channel data with it. A backup is a snapshot, so a channel that changed after it " +
-                "was saved may close when you restore.",
+                "works after the phrase is on the phone: pick the file, read what it holds, and " +
+                "confirm - the node then replaces its channel data with it.",
             color = Pal.TextTertiary,
             fontSize = 11.sp,
             lineHeight = 15.sp
@@ -530,43 +625,137 @@ fun SettingsSheet(
         )
     }
 
-    pendingRestore?.let { bytes ->
+    pendingRestore?.let { pending ->
+        val review = pending.review
+        val blocked = review != null && !review.canRestore
         AlertDialog(
             onDismissRequest = { pendingRestore = null },
             containerColor = Pal.SurfaceElevated,
             titleContentColor = Pal.TextPrimary,
             textContentColor = Pal.TextSecondary,
-            title = { Text("Restore channel backup?") },
-            text = {
+            title = {
                 Text(
-                    "The channel data on this phone is replaced with the backup and the node " +
-                        "restarts. This is how a replacement phone gets its open channels back.",
-                    fontSize = 13.sp,
-                    lineHeight = 18.sp
+                    when {
+                        blocked -> "This backup cannot be restored here"
+                        else -> "Restore channel backup?"
+                    }
                 )
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    pendingRestore = null
-                    // Replacing the channel data can cost the funds in a live channel, so it
-                    // asks for the same proof as a payment before it runs.
-                    authorization.guarded("Authenticate to restore a channel backup.") {
-                        scope.launch {
-                            backupBusy = true
-                            backupError = null
-                            backupNote = null
-                            BackupTransfer.reset()
-                            vm.importChannelBackup(bytes)
-                                .onSuccess { manifest: BackupManifest ->
-                                    backupNote = "Restored ${manifest.channelCount} channels from a " +
-                                        "${manifest.network} backup"
+            text = {
+                // The warnings are longer than one screen on a phone, and a confirmation that
+                // cannot be read to the end is not a warning.
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    when {
+                        pending.loading -> Text(
+                            "Opening the backup with your recovery phrase…",
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp
+                        )
+
+                        pending.error != null -> Text(
+                            pending.error,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp,
+                            color = Pal.Danger
+                        )
+
+                        review != null -> {
+                            LabelRow("Saved", backupDateLabel(review, nowEpochSecs))
+                            Spacer(Modifier.height(6.dp))
+                            LabelRow("Network", review.manifest.network)
+                            Spacer(Modifier.height(6.dp))
+                            LabelRow("Channels", review.manifest.channelCount.toString())
+                            Spacer(Modifier.height(6.dp))
+                            LabelRow(
+                                "Node",
+                                review.manifest.nodeId.takeIf { it.isNotBlank() }
+                                    ?.let { Fmt.shortId(it) } ?: "not named"
+                            )
+                            if (review.problems.isNotEmpty()) {
+                                Spacer(Modifier.height(12.dp))
+                                review.problems.forEach { problem ->
+                                    Text(
+                                        problem,
+                                        color = Pal.Danger,
+                                        fontSize = 12.sp,
+                                        lineHeight = 17.sp
+                                    )
+                                    Spacer(Modifier.height(4.dp))
                                 }
-                                .onFailure { backupError = it.message ?: "The backup could not be restored" }
-                            backupBusy = false
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            review.warnings.forEach { warning ->
+                                Text(
+                                    warning,
+                                    color = Pal.TextSecondary,
+                                    fontSize = 12.sp,
+                                    lineHeight = 17.sp
+                                )
+                                Spacer(Modifier.height(8.dp))
+                            }
+                            Text(
+                                "The channel data on this phone is replaced with the backup and " +
+                                    "the node restarts.",
+                                color = Pal.TextTertiary,
+                                fontSize = 11.sp,
+                                lineHeight = 15.sp
+                            )
+                            if (review.canRestore) {
+                                Spacer(Modifier.height(12.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Checkbox(
+                                        checked = pending.acknowledged,
+                                        onCheckedChange = { checked ->
+                                            pendingRestore = pending.copy(acknowledged = checked)
+                                        },
+                                        colors = CheckboxDefaults.colors(
+                                            checkedColor = Pal.Accent,
+                                            uncheckedColor = Pal.TextSecondary,
+                                            checkmarkColor = Pal.OnAccent
+                                        )
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        "I understand that restoring an older state can " +
+                                            "force-close channels that changed since.",
+                                        color = Pal.TextPrimary,
+                                        fontSize = 12.sp,
+                                        lineHeight = 16.sp
+                                    )
+                                }
+                            }
                         }
                     }
-                }) {
-                    Text("Restore", color = Pal.AccentBright)
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = review != null && review.canRestore && pending.acknowledged,
+                    onClick = {
+                        val bytes = pending.bytes
+                        pendingRestore = null
+                        // Replacing the channel data can cost the funds in a live channel, so
+                        // it asks for the same proof as a payment before it runs.
+                        authorization.guarded("Authenticate to restore a channel backup.") {
+                            scope.launch {
+                                backupBusy = true
+                                backupError = null
+                                backupNote = null
+                                BackupTransfer.reset()
+                                vm.importChannelBackup(bytes)
+                                    .onSuccess { manifest: BackupManifest ->
+                                        backupNote = "Restored ${manifest.channelCount} channels from a " +
+                                            "${manifest.network} backup"
+                                    }
+                                    .onFailure {
+                                        backupError = it.message ?: "The backup could not be restored"
+                                    }
+                                backupBusy = false
+                            }
+                        }
+                    }
+                ) {
+                    Text("Restore", color = if (review?.canRestore == true) Pal.AccentBright else Pal.TextTertiary)
                 }
             },
             dismissButton = {
@@ -611,6 +800,23 @@ fun SettingsSheet(
             }
         )
     }
+}
+
+/** A file picked for a restore, and what reading it said about itself. */
+private data class PendingRestore(
+    val bytes: ByteArray,
+    val review: BackupReview? = null,
+    val error: String? = null,
+    val loading: Boolean = false,
+    val acknowledged: Boolean = false
+)
+
+/** "Nov 20, 21:14 (2 days ago)": when the file was made, in the one line that fits a dialog. */
+private fun backupDateLabel(review: BackupReview, nowEpochSecs: Long): String {
+    val created = review.manifest.createdAtEpochSecs
+    if (created <= 0L) return "date not recorded"
+    val age = ChannelBackupReview.ageLabel(created, nowEpochSecs)
+    return Fmt.dateTime(created) + if (age != null) " ($age)" else ""
 }
 
 @Composable

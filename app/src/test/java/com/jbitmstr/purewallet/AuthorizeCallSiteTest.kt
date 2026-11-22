@@ -58,11 +58,14 @@ class AuthorizeCallSiteTest {
     fun everyPrivilegedActionIsGuarded() {
         val sources = sources()
         // The seven places the review named, plus the two phrase reveals on the home side.
+        // WalletApp's third guarded call is the seal prompt of 1.1.17: creating or restoring a
+        // wallet asks for the device lock when the Keystore's bound key needs it, and the
+        // work happens inside that answer rather than before it.
         val expected = mapOf(
             "ui/sheets/SettingsSheet.kt" to 3,
             "ui/sheets/ChannelsSheet.kt" to 2,
             "ui/sheets/SendSheet.kt" to 1,
-            "ui/WalletApp.kt" to 2
+            "ui/WalletApp.kt" to 3
         )
         for ((file, count) in expected) {
             val text = sources[file] ?: throw AssertionError("$file is gone")

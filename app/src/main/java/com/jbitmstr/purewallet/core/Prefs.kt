@@ -65,6 +65,30 @@ class Prefs internal constructor(
         set(value) = prefs.edit().putLong(KEY_CREATED_AT, value).apply()
 
     /**
+     * When this phone last wrote a channel backup, and how many channels it held.
+     *
+     * Only the date is kept - it names no channel, peer or amount. It is what lets Settings
+     * say "8 days ago" instead of hoping the user remembers, because the value of a channel
+     * snapshot drops with every block that moves a channel.
+     */
+    var lastChannelBackupEpochSecs: Long?
+        get() = prefs.getLong(KEY_CHANNEL_BACKUP_AT, 0L).takeIf { it > 0L }
+        set(value) {
+            prefs.edit().putLong(KEY_CHANNEL_BACKUP_AT, value ?: 0L).apply()
+        }
+
+    var lastChannelBackupChannels: Int
+        get() = prefs.getInt(KEY_CHANNEL_BACKUP_CHANNELS, 0)
+        set(value) = prefs.edit().putInt(KEY_CHANNEL_BACKUP_CHANNELS, value).apply()
+
+    fun recordChannelBackup(epochSecs: Long, channels: Int) {
+        prefs.edit()
+            .putLong(KEY_CHANNEL_BACKUP_AT, epochSecs)
+            .putInt(KEY_CHANNEL_BACKUP_CHANNELS, channels)
+            .apply()
+    }
+
+    /**
      * True when the user pressed "Stop node". Kept on disk because Android may kill the
      * process: without it, the next open would quietly start a node the user had stopped.
      */
@@ -257,6 +281,8 @@ class Prefs internal constructor(
         private const val KEY_LOCK_ON_OPEN = "lock_on_open"
         private const val KEY_SCREEN_PROTECTION = "screen_protection"
         private const val KEY_CREATED_AT = "wallet_created_at"
+        private const val KEY_CHANNEL_BACKUP_AT = "channel_backup_at"
+        private const val KEY_CHANNEL_BACKUP_CHANNELS = "channel_backup_channels"
         private const val KEY_NODE_STOPPED = "node_stopped_by_user"
         private const val KEY_ESPLORA = "esplora_url_"
         private const val KEY_ESPLORA_WORKING = "esplora_working_"

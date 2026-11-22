@@ -51,22 +51,45 @@ object Market {
     suspend fun fetchFeeRates(esploraBaseUrl: String): FeeRates? = withContext(Dispatchers.IO) {
         val base = esploraBaseUrl.trimEnd('/')
         httpGet("$base/fee-estimates")?.let { body -> FeeEstimates.fromEsplora(body) }
-            ?: recommendedFees(base)
+            ?: httpGet("$base/v1/fees/recommended")?.let { body -> parseRecommendedFees(body) }
     }
 
-    private fun recommendedFees(base: String): FeeRates? {
-        val body = httpGet("$base/v1/fees/recommended") ?: return null
-        return runCatching {
-            val json = JSONObject(body)
-            // Clamped like every other estimate: a stray 0 or an absurd number cannot decide
-            // what this wallet pays.
-            FeeRates(
-                fastestSatPerVb = FeeEstimates.clamp(json.optLong("fastestFee", 0L)),
-                halfHourSatPerVb = FeeEstimates.clamp(json.optLong("halfHourFee", 0L)),
-                hourSatPerVb = FeeEstimates.clamp(json.optLong("hourFee", 0L)),
-                minimumSatPerVb = FeeEstimates.clamp(json.optLong("minimumFee", FeeEstimates.MIN_SAT_PER_VB))
-            )
-        }.getOrNull()
+    /**
+     * Reads the mempool.space `/v1/fees/recommended` body.
+     *
+     * Every rate is required, and a reply that does not carry a usable number for one of
+     * them is null, not a guess. It used to be read with `optLong(key, 0)`, which turns a
+     * missing or non-numeric field into 0 and then, after the clamp, into a perfectly
+     * ordinary-looking 1 sat/vB: a broken endpoint produced a rate the send screen would
+     * have shown and paid with, and nothing anywhere said the estimate had failed. Nulled
+     * here, the screen has to say so and offer to read again (see [FeeGate]).
+     *
+     * Visible to tests: this is the parser, and it is checked against malformed replies as
+     * well as real ones.
+     */
+    internal fun parseRecommendedFees(body: String): FeeRates? {
+        val json = runCatching { JSONObject(body) }.getOrNull() ?: return null
+
+        fun rate(key: String): Long? {
+            if (!json.has(key)) return null
+            // optDouble coerces a quoted number ("1.5") and gives NaN for anything else.
+            val value = json.optDouble(key, Double.NaN)
+            if (!value.isFinite() || value <= 0.0) return null
+            // Clamped like every other estimate: a stray or absurd number cannot decide what
+            // this wallet pays.
+            return FeeEstimates.satPerVb(value)
+        }
+
+        val fastest = rate("fastestFee") ?: return null
+        val halfHour = rate("halfHourFee") ?: return null
+        val hour = rate("hourFee") ?: return null
+        val minimum = rate("minimumFee") ?: return null
+        return FeeRates(
+            fastestSatPerVb = fastest,
+            halfHourSatPerVb = halfHour,
+            hourSatPerVb = hour,
+            minimumSatPerVb = minimum
+        )
     }
 
     private fun coingecko(): FiatQuote? {

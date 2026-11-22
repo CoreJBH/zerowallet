@@ -32,6 +32,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jbitmstr.purewallet.WalletViewModel
+import com.jbitmstr.purewallet.core.Bip21
 import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.QrCode
 import com.jbitmstr.purewallet.core.SensitiveClipboard
@@ -161,6 +162,28 @@ fun ReceiveSheet(
                     fontSize = 12.sp,
                     lineHeight = 17.sp
                 )
+                Spacer(Modifier.height(14.dp))
+                // The amount belongs to the on-chain request too: without this field the
+                // BIP-21 `?amount=` it built could only ever be empty, because the only
+                // amount input lived in the Lightning tabs.
+                WalletTextField(
+                    value = amountText,
+                    onValueChange = { amountText = it.filter { ch -> ch.isDigit() }; error = null },
+                    placeholder = "Amount in sats (optional)",
+                    label = "Amount",
+                    keyboardType = KeyboardType.Number
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    if (amountText.isBlank()) {
+                        "With an amount, the QR asks for that exact sum; without one, the sender chooses."
+                    } else {
+                        "The QR carries ${amountText.ifBlank { "0" }} sats as a BIP-21 amount, so a wallet that scans it fills in the sum."
+                    },
+                    color = Pal.TextTertiary,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
+                )
                 Spacer(Modifier.height(18.dp))
             }
 
@@ -185,16 +208,16 @@ fun ReceiveSheet(
                             0 -> vm.createInvoice(amount, description).map { it.invoice }
                             1 -> vm.createOffer(amount, description)
                             else -> vm.newAddress().map { address ->
-                                if (amount != null) {
-                                    "bitcoin:$address?amount=${Fmt.btc(amount)}"
-                                } else {
-                                    address
-                                }
+                                // One builder for the URI, tested on its own: the address it
+                                // is given, and the amount only when there is a real one.
+                                Bip21.uri(address, amount)
                             }
                         }
                         busy = false
                         outcome.onSuccess { value ->
-                            result = if (tab == 2 && value.startsWith("bitcoin:")) value.substringAfter(':').substringBefore('?') else value
+                            // The code holds the whole request; the text under it is what a
+                            // person reads out or copies, which is the bare address.
+                            result = if (tab == 2) Bip21.addressOf(value) else value
                             qrContent = value
                         }.onFailure { error = it.message ?: "Could not create the request" }
                     }

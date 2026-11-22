@@ -3,6 +3,7 @@ package com.jbitmstr.purewallet
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import com.jbitmstr.purewallet.core.ChainNetwork
+import com.jbitmstr.purewallet.core.BackupReview
 import com.jbitmstr.purewallet.core.ChannelBackupExport
 import com.jbitmstr.purewallet.core.ChannelRow
 import com.jbitmstr.purewallet.core.BackupManifest
@@ -45,6 +46,10 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
     suspend fun importChannelBackup(bytes: ByteArray): Result<BackupManifest> =
         manager.importChannelBackup(bytes)
+
+    /** Reads a backup file's manifest without restoring it, for the confirmation. */
+    suspend fun inspectChannelBackup(bytes: ByteArray): Result<BackupReview> =
+        manager.inspectChannelBackup(bytes)
 
     fun refresh() = manager.refresh()
 

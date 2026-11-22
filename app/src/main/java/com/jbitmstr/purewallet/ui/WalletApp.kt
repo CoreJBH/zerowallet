@@ -35,6 +35,7 @@ import com.jbitmstr.purewallet.core.AppLockGate
 import com.jbitmstr.purewallet.core.Authorization
 import com.jbitmstr.purewallet.core.DeviceLockSettings
 import com.jbitmstr.purewallet.core.ScreenSecurity
+import com.jbitmstr.purewallet.core.SeedSealRequired
 import com.jbitmstr.purewallet.ui.screens.LockedScreen
 import com.jbitmstr.purewallet.ui.screens.ScannerScreen
 import com.jbitmstr.purewallet.ui.screens.SetupScreen
@@ -45,6 +46,8 @@ import com.jbitmstr.purewallet.ui.sheets.SendSheet
 import com.jbitmstr.purewallet.ui.sheets.SettingsSheet
 import com.jbitmstr.purewallet.ui.theme.Pal
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 
 private enum class ActiveSheet { NONE, SETTINGS, SEND, RECEIVE, CHANNELS }
 
@@ -230,6 +233,57 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
         }
     }
 
+    /** [Authorization.guarded] as a suspend call, for the one flow that needs its answer inline. */
+    suspend fun authenticateForSeal(): Boolean = suspendCancellableCoroutine { continuation ->
+        authorization.guarded(
+            reason = "Authenticate to let this phone's Keystore seal your recovery phrase.",
+            onDenied = { if (continuation.isActive) continuation.resume(false) },
+            action = { if (continuation.isActive) continuation.resume(true) }
+        )
+    }
+
+    /**
+     * Runs a wallet creation or restore, asking for the device lock once if the Keystore's
+     * key needs a fresh authentication before it will seal the phrase.
+     *
+     * The wallet key is generated inside the Keystore and bound to the screen lock, so the
+     * seal can land outside its validity window. Nothing is written in that case
+     * ([SeedSealRequired]), which is what makes a second attempt safe: the first one changed
+     * nothing on this phone. A prompt that the user dismisses writes nothing either, and the
+     * setup screen says so instead of leaving a half-made wallet behind.
+     */
+    suspend fun <T> withSealAuthentication(block: suspend () -> T): T = try {
+        block()
+    } catch (required: SeedSealRequired) {
+        if (!authenticateForSeal()) {
+            throw IllegalStateException(
+                "Authentication was not completed, so nothing was written. Try again when you can confirm it is you."
+            )
+        }
+        block()
+    }
+
+    /**
+     * The same for a call that reports its failure as a [Result] instead of throwing.
+     *
+     * A restore has to keep reporting ordinary failures (a phrase that does not check out, a
+     * node that will not start) as a Result, so its "authenticate first" arrives that way
+     * too. Only that one failure is turned into a prompt; everything else is handed back as
+     * it came.
+     */
+    suspend fun <T> withSealAuthenticationResult(block: suspend () -> Result<T>): Result<T> {
+        val first = block()
+        if (first.exceptionOrNull() !is SeedSealRequired) return first
+        if (!authenticateForSeal()) {
+            return Result.failure(
+                IllegalStateException(
+                    "Authentication was not completed, so nothing was changed on this phone."
+                )
+            )
+        }
+        return block()
+    }
+
     /**
      * Opens the wallet after the device-lock prompt. The Keystore key that seals the phrase
      * needs a recent authentication, and this is the one place that provides it.
@@ -317,12 +371,14 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                 unlockError = state.unlockError,
                 unlockMessage = state.error,
                 onCreate = { wordCount ->
-                    // Sealing the phrase generates a Keystore key pair off the main thread.
-                    val words = vm.createWallet(wordCount)
+                    // Sealing the phrase is a Keystore operation off the main thread; when the
+                    // key is bound to the lock it may ask for it first, and the same call is
+                    // then made again with nothing of the first attempt on this phone.
+                    val words = withSealAuthentication { vm.createWallet(wordCount) }
                     backupWords = words
                     backupVerify = true
                 },
-                onRestore = { phrase -> vm.restoreWallet(phrase) }
+                onRestore = { phrase -> withSealAuthenticationResult { vm.restoreWallet(phrase) } }
             )
         } else {
             HomeScreen(

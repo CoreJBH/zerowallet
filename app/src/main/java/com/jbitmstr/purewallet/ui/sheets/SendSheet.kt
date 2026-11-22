@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.Authorization
+import com.jbitmstr.purewallet.core.FeeGate
 import com.jbitmstr.purewallet.core.FeePriority
 import com.jbitmstr.purewallet.core.FeeWarning
 import com.jbitmstr.purewallet.core.OnchainFeeEstimate
@@ -72,7 +73,10 @@ fun SendSheet(
     var amountText by remember { mutableStateOf("") }
     var priority by remember { mutableStateOf(FeePriority.NORMAL) }
     var sendAll by remember { mutableStateOf(false) }
-    var feeRate by remember { mutableStateOf<Long?>(null) }
+    // The fee read as a state with an end, so a chain source that does not answer can be
+    // asked again instead of leaving Send disabled with nothing to press (see [FeeGate]).
+    var feeGate by remember { mutableStateOf(FeeGate()) }
+    val feeRate = feeGate.rateSatPerVb
     // A BIP-21 QR can offer both an on-chain address and a Lightning invoice. Lightning is
     // the cheaper route and the default; this lets the other one be chosen instead.
     var viaLightning by remember { mutableStateOf(true) }
@@ -126,14 +130,17 @@ fun SendSheet(
     val onchain = target?.input?.kind == PaymentInputKind.ONCHAIN && !lightningRoute
     val needsAmount = target?.amountEditable == true
 
-    LaunchedEffect(onchain, priority) {
-        if (onchain) {
-            // Cleared first, on purpose. The rate for the previous priority must not be the
-            // one a send is judged by, and while there is no rate the send button stays
-            // disabled: without it the high-fee check cannot be asked at all.
-            feeRate = null
-            feeRate = vm.estimateFeeRate(priority)
+    LaunchedEffect(onchain, priority, feeGate.attempts) {
+        if (!onchain) {
+            feeGate = FeeGate()
+            return@LaunchedEffect
         }
+        // Cleared first, on purpose. The rate for the previous priority must not be the one a
+        // send is judged by, and while there is no rate the send button stays disabled:
+        // without it the high-fee check cannot be asked at all. A read that comes back empty
+        // ends in Failed, which is where Retry appears.
+        feeGate = feeGate.reading()
+        feeGate = feeGate.resolved(vm.estimateFeeRate(priority))
     }
 
     /**
@@ -491,11 +498,21 @@ fun SendSheet(
                 val vBytes = OnchainFeeEstimate.vBytes(inputs = 1, outputs = outputs)
                 val estimate = feeRate?.let { OnchainFeeEstimate.feeSats(it, inputs = 1, outputs = outputs) }
                 Text(
-                    feeSummary(estimate, feeRate, vBytes),
-                    color = Pal.TextTertiary,
+                    feeSummary(estimate, feeRate, vBytes, failed = feeGate.showsRetry),
+                    color = if (feeGate.showsRetry) Pal.Danger else Pal.TextTertiary,
                     fontSize = 11.sp,
                     lineHeight = 15.sp
                 )
+                if (feeGate.showsRetry) {
+                    Spacer(Modifier.height(10.dp))
+                    // The one thing that was missing before: a way to ask again. Without it a
+                    // failed read left the sheet with a permanently grey Send button.
+                    GhostButton(
+                        text = "Retry fee estimate",
+                        onClick = { feeGate = feeGate.retry() },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
                 Spacer(Modifier.height(10.dp))
                 // Sweeping the balance replaces the amount the request asked for, so the
                 // switch exists only where the amount is the sender's to choose: a
@@ -519,7 +536,7 @@ fun SendSheet(
                 text = if (onchain) "Send on-chain" else "Send payment",
                 onClick = { execute() },
                 loading = busy,
-                enabled = !state.starting && !FeeWarning.isWaitingForRate(onchain, feeRate)
+                enabled = !state.starting && (!onchain || feeGate.canSend)
             )
             Spacer(Modifier.height(10.dp))
             GhostButton(
@@ -626,12 +643,22 @@ internal fun referenceLabel(sentOverLightning: Boolean, kind: PaymentInputKind?)
  * well: "₿1,234 sats" counted the unit twice. The rate and the estimated size stay in the
  * sentence because they answer a different question than the total does.
  */
-internal fun feeSummary(estimate: Long?, feeRate: Long?, vBytes: Long): String =
-    if (estimate != null) {
+internal fun feeSummary(
+    estimate: Long?,
+    feeRate: Long?,
+    vBytes: Long,
+    failed: Boolean = false
+): String = when {
+    estimate != null ->
         "Estimated fee: ${Fmt.sats(estimate)} " +
             "($feeRate sat/vB × ~$vBytes vB). The node sets the exact fee " +
             "from the transaction it signs."
-    } else {
+    // A read that ended without a rate says so, and says what to do about it, instead of
+    // pretending it is still on its way.
+    failed ->
+        "The fee rate could not be read from the chain source, so this send is on hold. " +
+            "Retry the estimate, or check the connection and the Esplora endpoint in Settings."
+    else ->
         "Reading the fee rate from the chain source. Sending stays disabled " +
             "until it arrives, because the high-fee check needs it."
-    }
+}

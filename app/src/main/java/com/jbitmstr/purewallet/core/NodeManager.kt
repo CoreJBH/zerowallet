@@ -132,7 +132,14 @@ data class WalletState(
     val lastSyncEpochSecs: Long? = null,
     val syncing: Boolean = false,
     val fiat: FiatQuote? = null,
-    val error: String? = null
+    val error: String? = null,
+    /**
+     * When this phone last wrote a channel backup, and how many channels it held. A snapshot
+     * is only as good as its age, so the settings sheet says how old this one is instead of
+     * leaving the user to remember whether they ever saved one.
+     */
+    val lastChannelBackupEpochSecs: Long? = null,
+    val lastChannelBackupChannels: Int = 0
 ) {
     val totalSats: Long get() = onchainTotalSats + lightningBalanceSats
 
@@ -210,6 +217,14 @@ class NodeManager(context: Context) {
     private var node: Node? = null
     private var eventJob: Job? = null
     private var fiatJob: Job? = null
+
+    /**
+     * Whether the wallet is on screen. The price loop only runs while it is, so a read that
+     * is started by something other than the first frame (a node that finished starting
+     * while the app was away) cannot bring the loop back in the background.
+     */
+    @Volatile
+    private var onScreen: Boolean = true
     private var bootstrapped = false
 
     /**
@@ -288,6 +303,10 @@ class NodeManager(context: Context) {
      * instead of leaving the numbers from before the screen changed.
      */
     fun onAppForeground() {
+        // The market loop stopped when the app left the screen; starting it again is what
+        // makes the balance card's fiat figure current rather than an hour old.
+        onScreen = true
+        startFiatLoop()
         val snapshot = _state.value
         when (lifecycle.foregroundAction(snapshot.seedPresent, snapshot.running, snapshot.starting)) {
             ForegroundAction.REFRESH -> scope.launch { refreshInternal(userInitiated = false) }
@@ -315,6 +334,12 @@ class NodeManager(context: Context) {
      */
     fun onAppBackground() {
         openedSeed = null
+        // Nothing about the price changes while the screen is away, and a request every 60
+        // seconds from a wallet that is not on screen costs battery and tells the price
+        // endpoints the user's address for no reason at all. The loop starts again with the
+        // first frame after the app comes back (onAppForeground).
+        onScreen = false
+        stopFiatLoop()
     }
 
     /**
@@ -481,7 +506,9 @@ class NodeManager(context: Context) {
                 seedPresent = seed != null,
                 backedUp = prefs.seedBackedUp,
                 setupRequired = seed == null,
-                seedProtection = protectionStatus()
+                seedProtection = protectionStatus(),
+                lastChannelBackupEpochSecs = prefs.lastChannelBackupEpochSecs,
+                lastChannelBackupChannels = prefs.lastChannelBackupChannels
             )
         }
         if (seed != null) {
@@ -513,9 +540,10 @@ class NodeManager(context: Context) {
         val (mnemonic, epoch) = nodeMutex.withLock {
             check(!secureStore.hasSeed()) { "A wallet already exists on this device" }
             val generated = Bip39.randomMnemonic(wordCount)
-            // Sealing the phrase means generating a Keystore key pair, which is slow enough to
-            // be felt on the main thread and must not run there.
-            secureStore.saveSeed(generated)
+            // Sealing the phrase means a Keystore operation, which is slow enough to be felt
+            // on the main thread and must not run there. It either stores the phrase or says
+            // the user has to authenticate first - never a plain text or weaker-key copy.
+            sealSeed(generated)
             openedSeed = generated
             val created = walletEpoch.incrementAndGet()
             prefs.seedBackedUp = false
@@ -557,11 +585,16 @@ class NodeManager(context: Context) {
                 throw IllegalArgumentException("That recovery phrase is not valid (word count or checksum)")
             }
             nodeMutex.withLock {
+                // Checked before anything on this phone is touched. The node store of the
+                // wallet being replaced is deleted a few lines down, and a seal that turned
+                // out to need an authentication afterwards would leave the user with neither
+                // the old wallet nor the new one.
+                checkSealPossible()
                 lifecycle.onUserStart()
                 prefs.nodeStoppedByUser = false
                 stopNodeLocked(keepState = false, nextStarting = true)
                 clearNodeData()
-                secureStore.saveSeed(normalized)
+                sealSeed(normalized)
                 openedSeed = normalized
                 // A different wallet: any start still waiting for the lock was asked for by
                 // the one this phrase replaces.
@@ -603,6 +636,37 @@ class NodeManager(context: Context) {
     fun confirmSeedBackedUp() {
         prefs.seedBackedUp = true
         _state.update { it.copy(backedUp = true) }
+    }
+
+    /**
+     * Seals the phrase in the Keystore, or fails in a way the caller can act on.
+     *
+     * [SecureStore.SeedSeal.NeedsAuthentication] becomes [SeedSealRequired], which the setup
+     * screen turns into a device-lock prompt and a second attempt. Nothing is stored on that
+     * path, and nothing is stored with a weaker key either: a wallet whose phrase cannot be
+     * sealed properly is not created at all.
+     */
+    private fun sealSeed(mnemonic: String) {
+        when (val seal = secureStore.saveSeed(mnemonic)) {
+            SecureStore.SeedSeal.Sealed -> Unit
+            SecureStore.SeedSeal.NeedsAuthentication -> throw SeedSealRequired()
+            is SecureStore.SeedSeal.Failed -> throw IllegalStateException(
+                seal.detail?.let { "The recovery phrase could not be sealed on this phone: $it" }
+                    ?: "The recovery phrase could not be sealed on this phone."
+            )
+        }
+    }
+
+    /** [sealSeed] without writing anything, for a flow that destroys data before it seals. */
+    private fun checkSealPossible() {
+        when (val check = secureStore.canSeal()) {
+            SecureStore.SeedSeal.Sealed -> Unit
+            SecureStore.SeedSeal.NeedsAuthentication -> throw SeedSealRequired()
+            is SecureStore.SeedSeal.Failed -> throw IllegalStateException(
+                check.detail?.let { "This phone cannot seal a recovery phrase: $it" }
+                    ?: "This phone cannot seal a recovery phrase."
+            )
+        }
     }
 
     // ------------------------------------------------------- channel backup
@@ -647,6 +711,15 @@ class NodeManager(context: Context) {
                         } finally {
                             archive.fill(0)
                         }
+                        // Remembered so Settings can say how old the last backup is: a
+                        // snapshot nobody refreshed is the one that costs a force-close.
+                        prefs.recordChannelBackup(manifest.createdAtEpochSecs, manifest.channelCount)
+                        _state.update {
+                            it.copy(
+                                lastChannelBackupEpochSecs = manifest.createdAtEpochSecs,
+                                lastChannelBackupChannels = manifest.channelCount
+                            )
+                        }
                         ChannelBackupExport(
                             bytes = sealed,
                             fileName = ChannelBackup.suggestedFileName(network.id, manifest.createdAtEpochSecs),
@@ -662,6 +735,36 @@ class NodeManager(context: Context) {
                     _state.update { it.copy(busy = null) }
                     if (wasRunning) startNodeLocked(mnemonic)
                 }
+            }
+        }
+    }
+
+    /**
+     * Opens a backup file far enough to say what is in it, without replacing anything.
+     *
+     * The restore confirmation needs this before the user commits: the date the file was
+     * made, the wallet it belongs to, and whether restoring it here is allowed at all. The
+     * decrypted archive is wiped as soon as its manifest has been read.
+     */
+    suspend fun inspectChannelBackup(bytes: ByteArray): Result<BackupReview> = withContext(Dispatchers.IO) {
+        runCatching {
+            val mnemonic = seedOrNull()
+                ?: throw IllegalStateException("Open the wallet first, then open the backup")
+            val archive = ChannelBackup.decrypt(mnemonic, bytes)
+            val payload = try {
+                ChannelBackup.readArchive(archive)
+            } finally {
+                archive.fill(0)
+            }
+            try {
+                ChannelBackupReview.review(
+                    manifest = payload.manifest,
+                    networkId = prefs.network.id,
+                    nodeId = _state.value.nodeId,
+                    nowEpochSecs = System.currentTimeMillis() / 1000L
+                )
+            } finally {
+                payload.files.forEach { it.bytes.fill(0) }
             }
         }
     }
@@ -700,10 +803,18 @@ class NodeManager(context: Context) {
                     _state.update { it.copy(busy = null) }
                 }
                 val network = ChainNetwork.fromId(payload.manifest.network)
-                if (network != prefs.network) {
-                    throw IllegalStateException(
-                        "This backup was saved on ${network.title}. Switch to ${network.title} in Settings first."
-                    )
+                // Decided here as well as on the screen: a backup of another chain or of
+                // another wallet is refused even if the sheet that opened it was wrong, and
+                // the sheet's own warning is what the user actually reads (BackupReview).
+                val review = ChannelBackupReview.review(
+                    manifest = payload.manifest,
+                    networkId = prefs.network.id,
+                    nodeId = _state.value.nodeId,
+                    nowEpochSecs = System.currentTimeMillis() / 1000L
+                )
+                if (!review.canRestore) {
+                    payload.files.forEach { it.bytes.fill(0) }
+                    throw IllegalStateException(review.problems.first())
                 }
 
                 stopNodeLocked(keepState = false)
@@ -755,6 +866,15 @@ class NodeManager(context: Context) {
                     )
                 }
                 previous.deleteRecursively()
+                // The store now holds the state the file carried, so the age Settings shows
+                // is the backup's, not the moment it was restored.
+                prefs.recordChannelBackup(payload.manifest.createdAtEpochSecs, payload.manifest.channelCount)
+                _state.update {
+                    it.copy(
+                        lastChannelBackupEpochSecs = payload.manifest.createdAtEpochSecs,
+                        lastChannelBackupChannels = payload.manifest.channelCount
+                    )
+                }
                 _messages.tryEmit("Channel backup restored")
                 payload.manifest
             }
@@ -1797,7 +1917,9 @@ class NodeManager(context: Context) {
         runCatching { ldkRoot().deleteRecursively() }
     }
 
+    /** Runs the price loop while the wallet is on screen; idempotent. */
     private fun startFiatLoop() {
+        if (!onScreen) return
         if (fiatJob?.isActive == true) return
         fiatJob = scope.launch {
             while (isActive) {
@@ -1805,9 +1927,15 @@ class NodeManager(context: Context) {
                 if (quote != null) {
                     _state.update { it.copy(fiat = quote) }
                 }
-                delay(60_000L)
+                delay(FIAT_POLL_MILLIS)
             }
         }
+    }
+
+    /** Stops it with the screen; the last quote stays on the card until a new one arrives. */
+    private fun stopFiatLoop() {
+        fiatJob?.cancel()
+        fiatJob = null
     }
 
     private fun toRow(payment: PaymentDetails): PaymentRow {
@@ -1903,6 +2031,9 @@ class NodeManager(context: Context) {
 
         /** How long a burst of node events is given to settle before one refresh runs. */
         private const val REFRESH_SETTLE_MILLIS = 1_500L
+
+        /** How often the price is read while the wallet is on screen (and only then). */
+        private const val FIAT_POLL_MILLIS = 60_000L
     }
 }
 

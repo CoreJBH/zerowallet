@@ -58,8 +58,8 @@ android {
         applicationId = "com.jbitmstr.purewallet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 18
-        versionName = "1.1.16"
+        versionCode = 19
+        versionName = "1.1.17"
 
         ndk {
             // Phones are ARM; keeping the APK to the two ARM ABIs halves its size.
@@ -83,14 +83,21 @@ android {
             isMinifyEnabled = false
         }
         release {
-            // The shipped APK is the debug build (no signing key lives in this repository),
-            // but a release build still has to work: ldk-node's JNI bridge, the UniFFI
-            // bindings and JNA are kept by proguard-rules.pro, and the rest is shrunk.
+            // The shipped APK is the debug build until the release keystore secrets exist
+            // (see the signing block above; the user is setting those up separately), but a
+            // release build still has to work and has to be shippable the moment they do:
+            // ldk-node's JNI bridge, the UniFFI bindings and JNA are kept by
+            // proguard-rules.pro, and the rest is shrunk.
             isMinifyEnabled = true
             isShrinkResources = true
             // A release build must not expose the debug runtime to a connected adb shell or a
-            // crash reporter that expects debuggable code.
+            // crash reporter that expects debuggable code. Both of these are stated rather
+            // than inherited, so a future change to the debug block cannot leak into release:
+            // - isDebuggable=false drops run-as, the debugger and the JDWP port;
+            // - isJniDebuggable=false does the same for the native side (ldk-node's .so),
+            //   which is where a wallet's channel state actually lives.
             isDebuggable = false
+            isJniDebuggable = false
             // Null when no release key is configured, which leaves the APK unsigned rather
             // than falling back to the debug key.
             signingConfig = signingConfigs.findByName("release")
