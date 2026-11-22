@@ -90,8 +90,8 @@ android {
         applicationId = "com.jbitmstr.purewallet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 21
-        versionName = "1.2.0"
+        versionCode = 22
+        versionName = "1.2.1"
 
         // Instrumented tests (Keystore, BiometricPrompt, FileProvider) run on a device with
         // `connectedDebugAndroidTest`; they are not part of CI, which has no device.

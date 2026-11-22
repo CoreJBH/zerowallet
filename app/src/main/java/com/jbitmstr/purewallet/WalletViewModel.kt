@@ -3,6 +3,7 @@ package com.jbitmstr.purewallet
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.SavedStateHandle
+import com.jbitmstr.purewallet.core.AppLock
 import com.jbitmstr.purewallet.core.AppLockGate
 import com.jbitmstr.purewallet.core.BackupManifest
 import com.jbitmstr.purewallet.core.BackupReview
@@ -74,6 +75,12 @@ class WalletViewModel(
 
     private val _lock = MutableStateFlow(
         LockUiState(
+            // Whether this phone can ask at all is read before the first frame, not left
+            // false until something reports it: the open-lock gate is decided on the very
+            // first composition, and a session that answered "no" for one frame would open a
+            // wallet in front of a phone that does have a screen lock. Every resume reads it
+            // again (onScreenResumed), which is what makes a removed lock close the gate.
+            lockAvailable = AppLock.isAvailable(application),
             // Only "the decision was already made" is restored. Whether the wallet was open
             // never is: a bundle restored into a new process must not hand someone an opened
             // wallet. With the flag set and `unlocked` false, the gate below asks exactly the

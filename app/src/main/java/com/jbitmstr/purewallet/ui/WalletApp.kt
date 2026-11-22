@@ -72,14 +72,15 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     // Until the wallet is loaded it is not known whether one exists, so the gate stays
     // armed; after that only a real wallet is worth locking. Onboarding is never gated.
     val lockArmed = if (state.bootstrapped) state.seedPresent else true
-    // Whether the phone can authenticate, read here and not from a stored value: the gate
-    // below is decided by this answer on the very first frame, and a remembered `true` from
-    // before the screen lock was removed would open a wallet nobody can prove is theirs.
-    val deviceLockAvailable = remember(activity) { appLock?.isAvailable() == true }
-    LaunchedEffect(deviceLockAvailable) { vm.onLockAvailability(deviceLockAvailable) }
     // Locking the app every time it opens is opt-in in Settings. Sending funds and showing
     // the recovery phrase authenticate on their own, whether or not that option is on.
-    val openLockEnabled = state.lockOnOpen && deviceLockAvailable && lockArmed
+    //
+    // Whether the phone can ask at all is read from the wallet session, not from a value
+    // remembered for this composition: the session re-reads it at every resume, so a screen
+    // lock removed while the app sat in the background takes the gate with it instead of
+    // leaving a lock screen no prompt can open. The first frame is covered by the value the
+    // session reads when it is created.
+    val openLockEnabled = state.lockOnOpen && lock.lockAvailable && lockArmed
     // A wallet whose key is bound to the device lock cannot be read at all until the user
     // authenticates, so the lock screen comes up before anything of the wallet is shown.
     val lockedBySeed = state.seedLocked
