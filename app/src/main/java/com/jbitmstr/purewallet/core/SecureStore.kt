@@ -148,7 +148,6 @@ class SecureStore(context: Context) {
         }
 
         prefs.edit()
-            .remove(KEY_KEYS_INVALIDATED)
             .putString(KEY_SEALED_WITH, SeedStorage.CURRENT)
             .apply()
         // The older keys are no longer needed: this build has re-sealed the phrase onto its
@@ -199,6 +198,7 @@ class SecureStore(context: Context) {
         val ciphertext = payload.copyOfRange(IV_BYTES, payload.size)
 
         var waited = false
+        var invalidated = false
         var lastFailure: String? = null
 
         // Every generation of the file, newest first. A ciphertext sealed by an older key
@@ -210,7 +210,6 @@ class SecureStore(context: Context) {
             } catch (e: KeyPermanentlyInvalidatedException) {
                 if (kind == SeedStorage.CURRENT) {
                     if (BuildConfig.DEBUG) Log.w(TAG, "The wallet key was invalidated by a screen-lock change", e)
-                    markKeysInvalidated()
                     return SeedRead.Invalidated
                 }
                 null
@@ -232,20 +231,30 @@ class SecureStore(context: Context) {
             } catch (e: KeyPermanentlyInvalidatedException) {
                 if (kind == SeedStorage.CURRENT) {
                     if (BuildConfig.DEBUG) Log.w(TAG, "The wallet key was invalidated by a screen-lock change", e)
-                    markKeysInvalidated()
                     return SeedRead.Invalidated
                 }
+                // An older generation's key died with the phone's previous lock. The payload
+                // may well be that key's, so this is not "no key here" - it is the one case
+                // where nothing on this device can open the phrase any more.
+                invalidated = true
             } catch (e: Exception) {
                 // Wrong key for this ciphertext (a GCM tag mismatch) or a damaged payload.
                 lastFailure = e.message
             }
         }
 
-        return if (waited) {
-            SeedRead.NeedsAuthentication
-        } else {
-            if (BuildConfig.DEBUG) Log.e(TAG, "No stored key opened the seed")
-            SeedRead.Failed(lastFailure ?: "The wallet key is missing")
+        return when {
+            waited -> SeedRead.NeedsAuthentication
+            invalidated -> {
+                // Said plainly, and pointed at the recovery phrase: a vague failure would send
+                // the user looking for a bug instead of for their words.
+                if (BuildConfig.DEBUG) Log.w(TAG, "An older wallet key was invalidated by a screen-lock change")
+                SeedRead.Invalidated
+            }
+            else -> {
+                if (BuildConfig.DEBUG) Log.e(TAG, "No stored key opened the seed")
+                SeedRead.Failed(lastFailure ?: "The wallet key is missing")
+            }
         }
     }
 
@@ -293,7 +302,6 @@ class SecureStore(context: Context) {
     fun clear() {
         prefs.edit()
             .remove(KEY_SEED)
-            .remove(KEY_KEYS_INVALIDATED)
             .remove(KEY_UNBOUND_REASON)
             .remove(KEY_SEALED_WITH)
             .apply()
@@ -385,10 +393,6 @@ class SecureStore(context: Context) {
     } catch (e: Exception) {
         if (BuildConfig.DEBUG) Log.w(TAG, "The Keystore entry $alias could not be read", e)
         null
-    }
-
-    private fun markKeysInvalidated() {
-        prefs.edit().putBoolean(KEY_KEYS_INVALIDATED, true).apply()
     }
 
     /**
@@ -510,7 +514,6 @@ class SecureStore(context: Context) {
         private const val TAG = "PureWalletSecureStore"
         private const val NAME = "purewallet_secrets"
         private const val KEY_SEED = "seed_ciphertext"
-        private const val KEY_KEYS_INVALIDATED = "seed_keys_invalidated"
 
         /** Why the wallet key is not bound to the screen lock, when it is not. */
         private const val KEY_UNBOUND_REASON = "seed_key_unbound_reason"

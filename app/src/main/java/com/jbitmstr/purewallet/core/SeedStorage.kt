@@ -84,10 +84,6 @@ internal object SeedStorage {
                 "PIN, pattern or password in Android settings; restoring the wallet afterwards " +
                 "seals it again, bound to the lock."
         }
-        REASON_AUTH_UNAVAILABLE ->
-            "The wallet key is held in the Android Keystore but could not be bound to this " +
-                "phone's screen lock. Sending, showing the phrase and wiping still ask for the " +
-                "lock first."
         else ->
             "The wallet key is held in the Android Keystore but is not bound to the screen " +
                 "lock. Sending, showing the phrase and wiping still ask for it first."
@@ -97,9 +93,6 @@ internal object SeedStorage {
 
     /** A Keystore that refused to create the bound key. */
     const val REASON_GENERATE_REFUSED = "generate_refused"
-
-    /** A device that is secure but could not authenticate (no biometric, credential locked out). */
-    const val REASON_AUTH_UNAVAILABLE = "auth_unavailable"
 
     /** What 1.1.11-1.1.16 stored when the imported bound key was refused. Still read. */
     const val LEGACY_REASON_IMPORT_REFUSED = "import_refused"
