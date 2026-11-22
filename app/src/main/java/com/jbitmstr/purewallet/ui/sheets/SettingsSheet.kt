@@ -368,10 +368,11 @@ fun SettingsSheet(
             if (lockAvailable) {
                 "Sending funds, funding a channel and showing the recovery phrase always ask " +
                     "for your fingerprint or screen lock before they go ahead. The recovery " +
-                    "phrase itself is sealed with a key in the Android Keystore that only " +
-                    "opens after you authenticate, so the screen is not the only thing in " +
-                    "the way: that is also why opening the wallet after Android closed the " +
-                    "app can ask for your screen lock even with lock-on-open off."
+                    "phrase itself is sealed with a key in the Android Keystore, and where this " +
+                    "phone allows it that key is bound to your screen lock, so the screen is not " +
+                    "the only thing in the way: the key status below says which of the two this " +
+                    "wallet has. That binding is also why opening the wallet after Android closed " +
+                    "the app can ask for your screen lock even with lock-on-open off."
             } else {
                 "This phone has no screen lock, so the wallet cannot confirm that it is you. " +
                     "Sending, showing the recovery phrase and wiping are blocked until you set " +

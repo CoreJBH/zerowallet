@@ -195,8 +195,8 @@ fun SetupScreen(
                     title = if (createWordCount == 24) "One tap, 24 words" else "One tap, 12 words",
                     body = "The phrase is generated from the phone's secure random generator " +
                         "(${if (createWordCount == 24) "256" else "128"} bits) and sealed with a key " +
-                        "in the Android Keystore that only opens after you authenticate. You " +
-                        "will see it once for backup."
+                        "in the Android Keystore, bound to your screen lock where this phone has " +
+                        "one. You will see it once for backup."
                 )
                 Spacer(Modifier.height(16.dp))
                 SegmentedOptions(
