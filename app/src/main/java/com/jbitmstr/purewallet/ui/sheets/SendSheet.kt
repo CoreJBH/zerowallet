@@ -77,6 +77,10 @@ fun SendSheet(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var reference by remember { mutableStateOf<String?>(null) }
+    // Whether the payment that produced [reference] went over Lightning: a Lightning send
+    // that returned without an error is in flight, not settled, and the banner says so until
+    // the node reports the payment settled.
+    var sentOverLightning by remember { mutableStateOf(false) }
     var highFee by remember { mutableStateOf<HighFee?>(null) }
 
     val scope = rememberCoroutineScope()
@@ -120,6 +124,13 @@ fun SendSheet(
         }
     }
 
+    /**
+     * True when this send would run on-chain: either the request is an address with no
+     * Lightning alternative, or the QR offered both and the on-chain route is picked.
+     */
+    fun isOnchainSend(current: ResolvedTarget): Boolean =
+        current.input.kind == PaymentInputKind.ONCHAIN && !lightningRoute
+
     fun review() {
         val parsed = PaymentInputParser.parse(text)
         if (parsed.kind == PaymentInputKind.PEER) {
@@ -153,17 +164,32 @@ fun SendSheet(
             scope.launch {
                 busy = true
                 error = null
-                val outcome = if (current.input.kind == PaymentInputKind.ONCHAIN && sendAll && !lightningRoute) {
+                // Send-all is only ever offered on an editable on-chain request (see
+                // [ResolvedTarget.allowsSendAll]); a fixed-amount QR is paid for exactly
+                // what it says even if the switch somehow ended up on.
+                val sendAllApplies = current.allowsSendAll && !lightningRoute
+                if (sendAllApplies && sendAll && isOnchainSend(current)) {
+                    val rate = feeRate
+                    if (rate == null) {
+                        error = "The fee estimate has not arrived yet. Wait a moment, then try again."
+                        busy = false
+                        return@launch
+                    }
+                    sentOverLightning = false
                     vm.sendOnchain(
                         address = current.input.address.orEmpty(),
                         amountSats = null,
                         sendAll = true,
-                        priority = priority
+                        feeRateSatPerVb = rate
                     )
                 } else {
-                    vm.pay(current, amount, priority, viaLightning)
-                }
-                outcome.onSuccess { reference = it }.onFailure {
+                    sentOverLightning =
+                        current.input.kind != PaymentInputKind.ONCHAIN || lightningRoute
+                    // The rate shown when the payment was confirmed is the rate it is signed
+                    // with: it is passed through rather than read again before signing, and
+                    // an on-chain send without one is refused instead of paying a fallback.
+                    vm.pay(current, amount, viaLightning, feeRate)
+                }.onSuccess { reference = it }.onFailure {
                     error = it.message ?: "The payment could not be sent"
                 }
                 busy = false
@@ -240,9 +266,17 @@ fun SendSheet(
         )
 
         if (reference != null) {
+            // A Lightning payment is "sending" until the node reports it settled; an
+            // on-chain one is sent once it is signed and broadcast.
+            val settled = state.payments.any { it.id == reference && it.succeeded }
             Banner(
-                title = "Payment sent",
-                body = "The node signed and broadcast this payment. It appears in your history as soon as the network confirms it.",
+                title = if (!sentOverLightning || settled) "Payment sent" else "Payment sending",
+                body = if (!sentOverLightning || settled) {
+                    "The node signed and broadcast this payment. It appears in your history as soon as the network confirms it."
+                } else {
+                    "The node accepted this payment and is routing it. The banner turns to " +
+                        "\"Payment sent\" when the network settles it - history marks it failed if routing cannot complete."
+                },
                 tone = Pal.Positive
             )
             Spacer(Modifier.height(16.dp))
@@ -446,11 +480,16 @@ fun SendSheet(
                     lineHeight = 15.sp
                 )
                 Spacer(Modifier.height(10.dp))
-                GhostButton(
-                    text = if (sendAll) "Send all (selected)" else "Send all on-chain balance",
-                    onClick = { sendAll = !sendAll; if (sendAll) amountText = "" },
-                    modifier = Modifier.fillMaxWidth()
-                )
+                // Sweeping the balance replaces the amount the request asked for, so the
+                // switch exists only where the amount is the sender's to choose: a
+                // fixed-amount invoice or BIP-21 QR never offers it.
+                if (current.allowsSendAll) {
+                    GhostButton(
+                        text = if (sendAll) "Send all (selected)" else "Send all on-chain balance",
+                        onClick = { sendAll = !sendAll; if (sendAll) amountText = "" },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
 
             if (error != null) {

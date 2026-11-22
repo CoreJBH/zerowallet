@@ -1,8 +1,11 @@
 package com.jbitmstr.purewallet
 
 import com.jbitmstr.purewallet.core.FeeEstimates
+import com.jbitmstr.purewallet.core.FeePriority
+import com.jbitmstr.purewallet.core.FeeRates
 import com.jbitmstr.purewallet.core.FeeWarning
 import com.jbitmstr.purewallet.core.OnchainFeeEstimate
+import com.jbitmstr.purewallet.core.estimatedSendRate
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -175,5 +178,25 @@ class FeeEstimatesTest {
         assertFalse(FeeWarning.isWaitingForRate(onchain = true, rateSatPerVb = 900L))
         // A Lightning payment is not judged by an on-chain rate.
         assertFalse(FeeWarning.isWaitingForRate(onchain = false, rateSatPerVb = null))
+    }
+
+    @Test
+    fun aFailedFeeEstimateIsANullRateNotAFallback() {
+        // The regression: a send screen that could not reach the chain source used to fall
+        // back to hardcoded 8/16 sat/vB and pay that silently. No estimate, no rate.
+        assertNull(estimatedSendRate(FeePriority.NORMAL, null))
+        assertNull(estimatedSendRate(FeePriority.FAST, null))
+    }
+
+    @Test
+    fun anArrivedFeeEstimateIsThePrioritysRate() {
+        val rates = FeeRates(
+            fastestSatPerVb = 21L,
+            halfHourSatPerVb = 12L,
+            hourSatPerVb = 6L,
+            minimumSatPerVb = 1L
+        )
+        assertEquals(12L, estimatedSendRate(FeePriority.NORMAL, rates))
+        assertEquals(21L, estimatedSendRate(FeePriority.FAST, rates))
     }
 }

@@ -1,8 +1,10 @@
 package com.jbitmstr.purewallet
 
 import com.jbitmstr.purewallet.core.Fmt
+import com.jbitmstr.purewallet.core.PaymentInput
 import com.jbitmstr.purewallet.core.PaymentInputKind
 import com.jbitmstr.purewallet.core.PaymentInputParser
+import com.jbitmstr.purewallet.core.ResolvedTarget
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -169,5 +171,49 @@ class PaymentInputTest {
     fun amountsStayWithinTheSupply() {
         // The parser is not the only gate; this pins the constant the node checks against.
         assertEquals(2_100_000_000_000_000L, Fmt.MAX_SATS)
+    }
+
+    @Test
+    fun sendAllAppliesOnlyToAnEditableOnchainRequest() {
+        // A fixed-amount QR is paid for exactly what it says: sweeping the balance would
+        // silently pay a different payment than the one on screen, so it is not offered.
+        val fixedQr = ResolvedTarget(
+            input = PaymentInput(
+                kind = PaymentInputKind.ONCHAIN,
+                raw = "bitcoin:$mainnetBech32?amount=0.001",
+                address = mainnetBech32,
+                amountSats = 100_000L
+            ),
+            description = "",
+            amountSats = 100_000L,
+            amountEditable = false
+        )
+        assertFalse(fixedQr.allowsSendAll)
+
+        val editableAddress = ResolvedTarget(
+            input = PaymentInput(
+                kind = PaymentInputKind.ONCHAIN,
+                raw = mainnetBech32,
+                address = mainnetBech32
+            ),
+            description = "",
+            amountSats = null,
+            amountEditable = true
+        )
+        assertTrue(editableAddress.allowsSendAll)
+
+        // Lightning is not swept: send-all is an on-chain balance action, whatever amount
+        // editability the invoice itself has.
+        val lightning = ResolvedTarget(
+            input = PaymentInput(
+                kind = PaymentInputKind.BOLT11,
+                raw = "lnbc",
+                bolt11 = "lnbc"
+            ),
+            description = "",
+            amountSats = null,
+            amountEditable = true
+        )
+        assertFalse(lightning.allowsSendAll)
     }
 }

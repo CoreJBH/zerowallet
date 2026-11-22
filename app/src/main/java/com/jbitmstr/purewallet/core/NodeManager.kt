@@ -44,6 +44,7 @@ import org.lightningdevkit.ldknode.PaymentStatus
 import org.lightningdevkit.ldknode.QrPaymentResult
 import com.jbitmstr.purewallet.BuildConfig
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /** One row of the history list. */
@@ -161,6 +162,17 @@ data class ResolvedTarget(
 ) {
     /** True when a BIP-21 QR offers both an on-chain address and a Lightning request. */
     val hasLightningAlternative: Boolean get() = lightning != null
+
+    /**
+     * Whether "send the whole on-chain balance" applies to this request.
+     *
+     * Sweeping the balance replaces whatever amount the request asked for, so it is only
+     * offered for a request whose amount is the sender's to choose. A fixed-amount invoice
+     * or BIP-21 QR - `amountEditable` false - must be paid for exactly what it says; letting
+     * send-all run on one would silently pay a different payment than the one on screen.
+     */
+    val allowsSendAll: Boolean
+        get() = input.kind == PaymentInputKind.ONCHAIN && amountEditable
 }
 
 enum class FeePriority(val label: String, val detail: String) {
@@ -212,6 +224,17 @@ class NodeManager(context: Context) {
     private var activeEsploraUrl: String? = null
 
     /**
+     * Lightning payments this process has sent and is still waiting to hear settled.
+     *
+     * A Lightning send that returned without an error is in flight, not settled: the node
+     * only knows it went out when the `PaymentSuccessful` event arrives, and `PaymentFailed`
+     * when it did not. The set makes that state explicit so a payment is never announced as
+     * sent before the network says so. Kept only for the life of the process; the history
+     * list is the durable record.
+     */
+    private val pendingLightning: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /**
      * What the Keystore says about the stored phrase's key, or null when it cannot be read.
      * Read from the key itself, so a wallet sealed by an older build, by the single-key
      * fallback or before this phone had a screen lock is reported as it actually is.
@@ -261,6 +284,19 @@ class NodeManager(context: Context) {
             }
             ForegroundAction.NONE -> Unit
         }
+    }
+
+    /**
+     * Called when the app leaves the screen (ON_STOP).
+     *
+     * The copy of the phrase this process opened goes away with it. Anything that needs the
+     * phrase again - showing it, a restart, a channel backup - reopens the stored ciphertext
+     * through [seedOrNull], and a key bound to the device lock asks for a fresh
+     * authentication there, so backgrounding the app is never a free pass to the words. The
+     * node keeps running: hiding the screen is not stopping the Lightning node.
+     */
+    fun onAppBackground() {
+        openedSeed = null
     }
 
     /**
@@ -928,10 +964,14 @@ class NodeManager(context: Context) {
             }
             is Event.PaymentClaimable -> scheduleRefresh()
             is Event.PaymentSuccessful -> {
+                // A Lightning payment is only now settled; the send screen called it
+                // "sending" until this event arrived.
+                pendingLightning.remove(event.paymentId)
                 _messages.tryEmit("Payment sent")
                 scheduleRefresh()
             }
             is Event.PaymentFailed -> {
+                pendingLightning.remove(event.paymentId)
                 _messages.tryEmit("Payment failed")
                 scheduleRefresh()
             }
@@ -1197,7 +1237,13 @@ class NodeManager(context: Context) {
                     peers = peers.map { PeerRow(it.nodeId, it.address, it.isConnected, it.isPersisted) },
                     bestHeight = status?.currentBestBlock?.height?.toInt()
                         ?.takeIf { height -> height > 0 } ?: previous.bestHeight,
-                    lastSyncEpochSecs = System.currentTimeMillis() / 1000L,
+                    lastSyncEpochSecs = if (syncError == null) {
+                        System.currentTimeMillis() / 1000L
+                    } else {
+                        // A sync that failed learned nothing new: the timestamp keeps saying
+                        // when the wallet was last actually synced instead of claiming now.
+                        previous.lastSyncEpochSecs
+                    },
                     running = true,
                     error = null
                 )
@@ -1432,8 +1478,8 @@ class NodeManager(context: Context) {
     suspend fun pay(
         target: ResolvedTarget,
         amountSats: Long?,
-        priority: FeePriority,
-        viaLightning: Boolean = true
+        viaLightning: Boolean = true,
+        feeRateSatPerVb: Long? = null
     ): Result<String> = runCatching {
         withNode { n ->
             val input = target.input
@@ -1450,8 +1496,8 @@ class NodeManager(context: Context) {
                     PaymentInputKind.UNKNOWN -> {
                         when (val result = n.unifiedQrPayment().send(input.raw, null)) {
                             is QrPaymentResult.Onchain -> result.txid
-                            is QrPaymentResult.Bolt11 -> result.paymentId
-                            is QrPaymentResult.Bolt12 -> result.paymentId
+                            is QrPaymentResult.Bolt11 -> markLightningPending(result.paymentId)
+                            is QrPaymentResult.Bolt12 -> markLightningPending(result.paymentId)
                         }
                     }
                     PaymentInputKind.ONCHAIN -> {
@@ -1459,7 +1505,11 @@ class NodeManager(context: Context) {
                             ?: throw IllegalArgumentException("No Bitcoin address found")
                         val sats = amountSats ?: target.amountSats
                             ?: throw IllegalArgumentException("Enter an amount")
-                        sendOnchainInternal(n, address, checkedSats(sats), priority)
+                        val rate = feeRateSatPerVb
+                            ?: throw IllegalStateException(
+                                "The fee rate has not been confirmed yet"
+                            )
+                        sendOnchainInternal(n, address, checkedSats(sats), rate)
                     }
                     PaymentInputKind.PEER -> throw IllegalArgumentException("Use Channels to connect to this peer")
                 }
@@ -1472,70 +1522,83 @@ class NodeManager(context: Context) {
         when (input.kind) {
             PaymentInputKind.BOLT11 -> {
                 val invoice = Bolt11Invoice.fromStr(input.bolt11 ?: input.raw)
-                if (invoice.amountMilliSatoshis() == null) {
+                val id = if (invoice.amountMilliSatoshis() == null) {
                     val sats = amountSats ?: throw IllegalArgumentException("Enter an amount")
                     n.bolt11Payment().sendUsingAmount(invoice, millisats(sats), null)
                 } else {
                     n.bolt11Payment().send(invoice, null)
                 }
+                markLightningPending(id)
             }
             PaymentInputKind.BOLT12_OFFER -> {
                 val offer = Offer.fromStr(input.bolt12Offer ?: input.raw)
-                if (offer.amount() == null) {
+                val id = if (offer.amount() == null) {
                     val sats = amountSats ?: throw IllegalArgumentException("Enter an amount")
                     n.bolt12Payment().sendUsingAmount(offer, millisats(sats), null, null, null)
                 } else {
                     n.bolt12Payment().send(offer, null, null, null)
                 }
+                markLightningPending(id)
             }
             PaymentInputKind.BOLT12_INVOICE -> when (val result = n.unifiedQrPayment().send(input.raw, null)) {
                 is QrPaymentResult.Onchain -> result.txid
-                is QrPaymentResult.Bolt11 -> result.paymentId
-                is QrPaymentResult.Bolt12 -> result.paymentId
+                is QrPaymentResult.Bolt11 -> markLightningPending(result.paymentId)
+                is QrPaymentResult.Bolt12 -> markLightningPending(result.paymentId)
             }
             else -> throw IllegalArgumentException("This is not a Lightning payment request")
         }
+
+    /**
+     * Records that a Lightning payment has left this node but has not settled, and says so.
+     *
+     * The send screen and the history list must not read "sent" before the node reports the
+     * payment settled ([Event.PaymentSuccessful]); between the two it is in flight, and
+     * [Event.PaymentFailed] can still take it back.
+     */
+    private fun markLightningPending(paymentId: String): String {
+        if (paymentId.isNotBlank()) {
+            pendingLightning.add(paymentId)
+            _messages.tryEmit("Payment sending")
+        }
+        return paymentId
+    }
 
     suspend fun sendOnchain(
         address: String,
         amountSats: Long?,
         sendAll: Boolean,
-        priority: FeePriority
+        feeRateSatPerVb: Long
     ): Result<String> = runCatching {
         withNode { n ->
             if (sendAll) {
-                val rates = Market.fetchFeeRates(currentEsploraUrl(prefs.network))
-                n.onchainPayment().sendAllToAddress(address, true, feeRateFor(priority, rates))
+                n.onchainPayment().sendAllToAddress(address, true, sendRate(feeRateSatPerVb))
             } else {
                 val sats = amountSats ?: throw IllegalArgumentException("Enter an amount")
-                sendOnchainInternal(n, address, checkedSats(sats), priority)
+                sendOnchainInternal(n, address, checkedSats(sats), feeRateSatPerVb)
             }
         }
     }
 
-    private suspend fun sendOnchainInternal(
+    private fun sendOnchainInternal(
         n: Node,
         address: String,
         amountSats: Long,
-        priority: FeePriority
-    ): String {
-        val rates = Market.fetchFeeRates(currentEsploraUrl(prefs.network))
-        return n.onchainPayment().sendToAddress(address, amountSats.toULong(), feeRateFor(priority, rates))
-    }
+        feeRateSatPerVb: Long
+    ): String = n.onchainPayment().sendToAddress(address, amountSats.toULong(), sendRate(feeRateSatPerVb))
 
     /**
-     * The fee rate a send uses, as the node takes it.
+     * The rate a send uses, as the node takes it.
      *
      * `fromSatPerVbUnchecked` trusts its input: 0 or an enormous number goes straight into
      * the transaction. Every rate therefore passes through [FeeEstimates.clamp] first, so a
      * broken estimate can cost at most [FeeEstimates.MAX_SAT_PER_VB] per vB.
      */
-    private fun feeRateFor(priority: FeePriority, rates: FeeRates?): FeeRate =
-        FeeRate.fromSatPerVbUnchecked(FeeEstimates.clamp(priority.satPerVb(rates)).toULong())
+    private fun sendRate(satPerVb: Long): FeeRate =
+        FeeRate.fromSatPerVbUnchecked(FeeEstimates.clamp(satPerVb).toULong())
 
-    suspend fun estimateFeeRate(priority: FeePriority): Long =
+    suspend fun estimateFeeRate(priority: FeePriority): Long? =
         withContext(Dispatchers.IO) {
-            priority.satPerVb(Market.fetchFeeRates(currentEsploraUrl(prefs.network)))
+            estimatedSendRate(priority, Market.fetchFeeRates(currentEsploraUrl(prefs.network)))
         }
 
     // ------------------------------------------------------------- channels
@@ -1754,6 +1817,17 @@ internal fun esploraChangeNeedsRestart(
     nodeRunning: Boolean,
     seedAvailable: Boolean
 ): Boolean = before != after && nodeRunning && seedAvailable
+
+/**
+ * The rate the send screen shows for [priority], or null when the chain source did not
+ * answer.
+ *
+ * A failed estimate returns null rather than a hardcoded rate: the send screen disables the
+ * send button while there is no rate, so a phone that is offline (or an endpoint that is
+ * down) holds the send instead of quietly paying a made-up fee.
+ */
+internal fun estimatedSendRate(priority: FeePriority, rates: FeeRates?): Long? =
+    rates?.let { priority.satPerVb(it) }
 
 /** A node that came up, and the chain source it came up on. */
 private class StartedNode(val node: Node, val esploraUrl: String)

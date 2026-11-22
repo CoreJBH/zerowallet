@@ -52,7 +52,10 @@ so a reinstall needs the previous build removed first.
   one. A different Esplora endpoint can be typed into Settings, and saving it restarts the
   node so the new source is in use right away instead of waiting for the next start.
 - **On-chain wallet.** Receive to a freshly derived address, send with Normal/Fast fee
-  priorities taken from the network fee estimator, or sweep the whole balance. The
+  priorities taken from the network fee estimator, or sweep the whole balance. The rate
+  shown when a payment is confirmed is the rate it is signed with - the send does not read
+  the estimator again before signing, and a send cannot start while the estimate has not
+  arrived. The
   confirmation screen shows the entire destination address in monospace, wrapped over as
   many lines as it needs, never an abbreviation. The address must carry the prefix of the
   chain the wallet is on (`bc1`/`1`/`3` on mainnet, `tb1`/`m`/`n`/`2` on the test chains),
@@ -60,7 +63,9 @@ so a reinstall needs the previous build removed first.
   are read as exact decimals: more than the 21 million BTC supply, a sub-satoshi remainder
   or a value that would overflow is refused instead of paid.
 - **Lightning.** Create BOLT11 invoices and BOLT12 offers, pay BOLT11 invoices, BOLT12
-  offers and BOLT12 invoices, and use unified BIP-21 / Lightning QR requests.
+  offers and BOLT12 invoices, and use unified BIP-21 / Lightning QR requests. A Lightning
+  send that left this node reads "sending" until the node reports it settled, and only then
+  "sent" - routing can still fail after the send screen is done with it.
 - **Direct P2P channels.** Connect to a peer with `pubkey@host:port`, open a channel from
   the on-chain balance, then close cooperatively or force close. No LSP, no just-in-time
   channel service, no channel-opening fee to a third party.
@@ -156,7 +161,18 @@ so a reinstall needs the previous build removed first.
 - **The recovery phrase never outlives the screen.** The phrase dialog is dropped on pause
   and on stop whether or not lock-on-open is on, and the Send and Receive sheets drop the
   request they hold when the app goes to the background - a pasted address, a scanned
-  invoice or a freshly made one - while a payment already running is left to finish.
+  invoice or a freshly made one - while a payment already running is left to finish. The
+  copy of the phrase the process had opened is dropped on stop as well: showing the words
+  again, restarting the node or packing a channel backup all read the stored ciphertext
+  through the Keystore again, so a key bound to the device lock asks for a fresh
+  authentication instead of answering from a backgrounded process's memory.
+- **What is stored on disk and why.** The BIP-39 mnemonic lives only as AES-256-GCM
+  ciphertext under a non-exportable Keystore key; nothing plaintext is written by the app.
+  The one exception is upstream: ldk-node keeps its own seed material (`keys_seed`) in the
+  app's `noBackupFilesDir`, an `ldk-node` requirement for holding Lightning channel state,
+  and it is protected by Android's app sandbox plus `allowBackup="false"` rather than by
+  this app's own lock. Lock-on-open stays off by default - an opt-in in Settings - because
+  sending, showing the phrase and wiping always authenticate on their own.
 - **No screenshots, no Recents thumbnail.** The window is `FLAG_SECURE`, so the wallet is
   blocked from screenshots and screen recording and blanked in the recent-apps list. The
   recovery phrase and the setup/restore screens force it on even if the setting is off.
@@ -300,7 +316,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.12`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.13`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build

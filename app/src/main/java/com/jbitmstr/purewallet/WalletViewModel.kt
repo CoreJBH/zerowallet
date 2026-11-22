@@ -27,6 +27,9 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     /** The wallet is back on screen: bring the node back if it was frozen or failed. */
     fun onAppForeground() = manager.onAppForeground()
 
+    /** The app left the screen: the phrase this process opened is dropped from memory. */
+    fun onAppBackground() = manager.onAppBackground()
+
     suspend fun createWallet(wordCount: Int = 12): String = manager.createWallet(wordCount)
 
     /** Called after the device-lock prompt succeeded: opens the wallet and starts its node. */
@@ -75,16 +78,16 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     suspend fun pay(
         target: ResolvedTarget,
         amountSats: Long?,
-        priority: FeePriority,
-        viaLightning: Boolean = true
-    ): Result<String> = manager.pay(target, amountSats, priority, viaLightning)
+        viaLightning: Boolean = true,
+        feeRateSatPerVb: Long? = null
+    ): Result<String> = manager.pay(target, amountSats, viaLightning, feeRateSatPerVb)
 
     suspend fun sendOnchain(
         address: String,
         amountSats: Long?,
         sendAll: Boolean,
-        priority: FeePriority
-    ): Result<String> = manager.sendOnchain(address, amountSats, sendAll, priority)
+        feeRateSatPerVb: Long
+    ): Result<String> = manager.sendOnchain(address, amountSats, sendAll, feeRateSatPerVb)
 
     suspend fun connectPeer(uri: String): Result<Unit> = manager.connectPeer(uri)
 
@@ -94,5 +97,5 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     suspend fun closeChannel(channel: ChannelRow, force: Boolean): Result<Unit> =
         manager.closeChannel(channel, force)
 
-    suspend fun estimateFeeRate(priority: FeePriority): Long = manager.estimateFeeRate(priority)
+    suspend fun estimateFeeRate(priority: FeePriority): Long? = manager.estimateFeeRate(priority)
 }

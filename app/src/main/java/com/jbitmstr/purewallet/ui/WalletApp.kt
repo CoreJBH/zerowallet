@@ -158,6 +158,10 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                 Lifecycle.Event.ON_STOP -> {
                     backupWords = null
                     backupVerify = false
+                    // The phrase this process had opened goes with the screen: the next read
+                    // (showing it, a restart, a backup) goes through the Keystore again, so
+                    // a key bound to the device lock asks for a fresh authentication.
+                    vm.onAppBackground()
                     // Pasted or scanned input is only needed at the moment its sheet opens, so
                     // it is dropped here: a sheet opened after the app was away never starts
                     // from something that was typed before it left the screen. The sheets that
