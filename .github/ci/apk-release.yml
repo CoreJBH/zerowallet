@@ -1,0 +1,130 @@
+name: Release APK
+
+# One workflow, one artifact: a signed release APK built from a commit, with every action
+# pinned to a commit SHA so a tag cannot be built by code that changed under it.
+#
+# It replaces the debug build this repository shipped up to 1.1.18. That workflow called
+# `assembleDebug` and published `purewallet.apk`, which is not installable over a release build
+# and is signed with a key nobody keeps. Nothing here produces or uploads a debug APK.
+#
+# Signing comes from four repository secrets, all required:
+#   ZEROWALLET_KEYSTORE_BASE64    the .jks, base64-encoded
+#   ZEROWALLET_KEYSTORE_PASSWORD
+#   ZEROWALLET_KEY_ALIAS
+#   ZEROWALLET_KEY_PASSWORD
+# Without all four the release step fails with their names. It does not fall back to a debug
+# key, and no artifact is published: an unsigned or debug-signed `assembleRelease` output is
+# exactly what this workflow exists to stop.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish a signed release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0bdd871935719febd78681f197cd39af5b6e16a6 # v4.2.2
+
+      - name: Check the signing secrets are all present
+        env:
+          KEYSTORE: ${{ secrets.ZEROWALLET_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ZEROWALLET_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ZEROWALLET_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ZEROWALLET_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${KEYSTORE}" ] || missing="${missing} ZEROWALLET_KEYSTORE_BASE64"
+          [ -n "${STORE_PASSWORD}" ] || missing="${missing} ZEROWALLET_KEYSTORE_PASSWORD"
+          [ -n "${KEY_ALIAS}" ] || missing="${missing} ZEROWALLET_KEY_ALIAS"
+          [ -n "${KEY_PASSWORD}" ] || missing="${missing} ZEROWALLET_KEY_PASSWORD"
+          if [ -n "${missing}" ]; then
+            echo "::error::Release signing is not configured. Missing:${missing}"
+            exit 1
+          fi
+
+      - name: Restore the release keystore
+        env:
+          KEYSTORE: ${{ secrets.ZEROWALLET_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${KEYSTORE}" | base64 -d > "${RUNNER_TEMP}/zerowallet-release.jks"
+          test -s "${RUNNER_TEMP}/zerowallet-release.jks"
+
+      - name: Run the unit tests
+        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Run lint
+        run: ./gradlew lintDebug --no-daemon --stacktrace
+
+      - name: Assemble the signed release
+        env:
+          ZEROWALLET_KEYSTORE: ${{ runner.temp }}/zerowallet-release.jks
+          ZEROWALLET_KEYSTORE_PASSWORD: ${{ secrets.ZEROWALLET_KEYSTORE_PASSWORD }}
+          ZEROWALLET_KEY_ALIAS: ${{ secrets.ZEROWALLET_KEY_ALIAS }}
+          ZEROWALLET_KEY_PASSWORD: ${{ secrets.ZEROWALLET_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          APK="app/build/outputs/apk/release/app-release.apk"
+          test -f "${APK}"
+          # An unsigned build is what assembleRelease produces when the key is missing. It is
+          # not an artifact: stop here rather than publish something that cannot install.
+          if ! apksigner verify --print-certs "${APK}"; then
+            echo "::error::The release APK is not signed."
+            exit 1
+          fi
+          cp "${APK}" zerowallet-release.apk
+          sha256sum zerowallet-release.apk | tee zerowallet-release.apk.sha256
+
+      - name: Upload the release APK
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: zerowallet-release-apk
+          path: |
+            zerowallet-release.apk
+            zerowallet-release.apk.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach it to the tag's release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          NOTES="Signed release build of ZeroWallet ${TAG} (versionCode from app/build.gradle.kts). Install it over an older release-signed build; a 1.1.x debug-signed install has to be removed first, so back up the recovery phrase before uninstalling."
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" zerowallet-release.apk zerowallet-release.apk.sha256 --clobber
+          else
+            gh release create "${TAG}" \
+              --title "ZeroWallet ${TAG}" \
+              --notes "${NOTES}" \
+              zerowallet-release.apk zerowallet-release.apk.sha256
+          fi

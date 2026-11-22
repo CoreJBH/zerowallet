@@ -32,9 +32,13 @@ The look is deep navy (Prussian blue): a `#060D24` canvas, `#0A1535` cards,
 `#0E1C47` raised surfaces, hairline `#1C2F66` borders, royal-blue `#3B82F6` actions with
 `#60A5FA` highlights, ice-white `#F1F5FF` type and green incoming amounts.
 
-**Download.** Grab the APK from [Releases](https://github.com/CoreJBH/zerowallet/releases/latest)
-and install it (allow "install unknown apps" for the app you open it with). Debug-signed,
-so a reinstall needs the previous build removed first.
+**Download.** Grab the release APK from
+[Releases](https://github.com/CoreJBH/zerowallet/releases/latest) and install it (allow
+"install unknown apps" for the app you open it with). Every artifact published from 1.2.0 on
+is built by the repository's CI from a signed `assembleRelease` build and its SHA-256 is listed
+on the release page. Release signing started with 1.2.0, so a phone still carrying a debug-signed
+build from 1.1.x has to remove that app first - write the recovery phrase down before it goes,
+because uninstalling deletes the only copy on the phone.
 
 ---
 
@@ -318,23 +322,37 @@ so a reinstall needs the previous build removed first.
 ## Architecture
 
 ```
-Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
-                                        │
-                                        ├── ldk-node 0.7.0 (Kotlin/UniFFI + Rust .so)
-                                        │     ├── BOLT11 / BOLT12 payments
-                                        │     ├── channel manager, peer connections
-                                        │     └── BDK on-chain wallet
-                                        │
-                                        ├── Esplora chain source (HTTPS)
-                                        ├── gossip: Lightning P2P (default) or RGS snapshot
-                                        ├── seed: AES-256-GCM, one Keystore-generated key (lock-bound)
-                                        ├── app lock: BiometricPrompt + device credential
-                                        └── sealed cache: balance snapshot and notes (Prefs)
+Compose UI  ──  WalletViewModel (lock state machine)  ──  NodeManager (front door)
+                                                              │
+                                                              ├── WalletCore   one Node, one lock, one state flow, one phrase read
+                                                              ├── WalletLayer  create / restore / reveal / unlock / wipe
+                                                              ├── NodeRuntime  start / stop / events / sync / settings
+                                                              ├── BackupLayer  sealed channel backup out and in (streaming)
+                                                              ├── PaymentLayer invoices, offers, sends, channels
+                                                              ├── MarketLayer  fiat price and fee rate
+                                                              │
+                                                              ├── ldk-node 0.7.0 (Kotlin/UniFFI + Rust .so)
+                                                              │     ├── BOLT11 / BOLT12 payments
+                                                              │     ├── channel manager, peer connections
+                                                              │     └── BDK on-chain wallet
+                                                              │
+                                                              ├── Esplora chain source (HTTPS)
+                                                              ├── gossip: Lightning P2P (default) or RGS snapshot
+                                                              ├── seed: AES-256-GCM, one Keystore-generated key (lock-bound)
+                                                              ├── app lock: BiometricPrompt + device credential
+                                                              └── sealed cache: balance snapshot and notes (Prefs)
 ```
 
-- `core/NodeManager.kt` owns the single `Node` instance, its event loop and every wallet
-  action. Balances, payments, channels and peers are read from the node, never invented.
-  A mutex serialises every start and stop.
+- `core/NodeManager.kt` is the front door on those five layers and holds no state of its own.
+  Before 1.2.0 the same class was 2,196 lines, where a payment path, a Keystore seal and the
+  node's start logic shared one scope and nothing said which fields a change was allowed to
+  touch. `core/WalletCore.kt` now owns the single `Node`, the mutex that serialises every start
+  and stop, the wallet epoch, the state flow the screens render, and the one phrase read; each
+  layer does one job over it. Balances, payments, channels and peers are still read from the
+  node, never invented.
+- The wallet's lock state (is it open, why not, did the prompt succeed, does this phone have a
+  screen lock) lives in `WalletViewModel`, so a rotation keeps the answer instead of asking
+  again, and a process death re-derives it - always closed - from the stored wallet.
 - `core/NodeLifecycle.kt` holds the start and stop rules as plain Kotlin - when a return to
   the foreground brings the node back, when it only resyncs, when "Stop node" keeps it down,
   and the order of listening attempts (port 9735, then none) - so they are unit tested
@@ -397,14 +415,21 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   restored data stays and the node is started again when the connection is back, rather than
   the restore being rolled back over a network problem. Only a backup that cannot be read or
   written, or that the node refuses to open, puts the previous data back.
+- **The node store is not encrypted at rest.** `files/ldk-node/<network>/` is what ldk-node
+  0.7.0 writes, and it has no encrypted-store option: the channel monitors sit in plain SQLite
+  files while the app runs. The app's private storage, `allowBackup="false"` and Android's
+  file-based encryption keep them from other apps and from a phone that is off or locked, but
+  a rooted or unlocked phone hands over the channel balance. [docs/at-rest.md](docs/at-rest.md)
+  lists the options that were considered (an idle stop, encrypting the directory, a separate
+  process) and what each actually buys, so the boundary is stated rather than implied.
 - Channel funds need an on-chain reserve (about 1% of channel size) plus funding fees, and
   closing a channel costs an on-chain transaction.
 - Testnet4 is not exposed by ldk-node 0.7.0, so Testnet3 is the test network offered.
-- The LDK native library ships as an unstripped Rust build: the debug APK is about 55 MB
+- The LDK native library ships as an unstripped Rust build: the release APK is about 40 MB
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.18`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.2.0`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -413,51 +438,74 @@ Requirements: JDK 17, the Android SDK (compileSdk 35), and a phone on Android 8.
 (API 26) or newer with an ARM CPU (`arm64-v8a` or `armeabi-v7a`).
 
 ```bash
-# Debug APK
-./gradlew assembleDebug
-# -> app/build/outputs/apk/debug/app-debug.apk
+# The artifact this repository ships: a signed release build
+export ZEROWALLET_KEYSTORE=/path/to/zerowallet-release.jks
+export ZEROWALLET_KEYSTORE_PASSWORD=...
+export ZEROWALLET_KEY_ALIAS=...
+export ZEROWALLET_KEY_PASSWORD=...
+./gradlew assembleRelease
+# -> app/build/outputs/apk/release/app-release.apk
 
-# Unit tests and lint
-./gradlew testDebugUnitTest
-./gradlew lintDebug
+# Everything the release is checked with
+./gradlew testDebugUnitTest lintDebug
+# On a phone or emulator, for the parts a JVM cannot have:
+./gradlew connectedDebugAndroidTest
 ```
 
-A release build is signed only with a real release key, passed as Gradle properties or
-environment variables: `ZEROWALLET_KEYSTORE`, `ZEROWALLET_KEYSTORE_PASSWORD`,
-`ZEROWALLET_KEY_ALIAS` and `ZEROWALLET_KEY_PASSWORD`. With none of them set,
-`./gradlew assembleRelease` produces an unsigned APK rather than silently signing with the
-debug key; with only some of them set, the build stops with a message saying what is missing,
-and a keystore path that does not exist fails the build instead of producing an artifact.
+There is no debug distribution path. `assembleDebug` still exists because a debug build is what
+a developer runs under a debugger, and nothing publishes it: the release page, the CI artifact
+and the README all carry the signed release APK. A release build is signed only with a real
+release key, passed as Gradle properties or environment variables: `ZEROWALLET_KEYSTORE`,
+`ZEROWALLET_KEYSTORE_PASSWORD`, `ZEROWALLET_KEY_ALIAS` and `ZEROWALLET_KEY_PASSWORD`. With none
+of them set, `./gradlew assembleRelease` produces an unsigned APK rather than silently signing
+with the debug key; with only some of them set, the build stops with a message saying what is
+missing, and a keystore path that does not exist fails the build instead of producing an
+artifact.
 
-The repository also ships `.github/workflows/apk.yml`, which builds the same APK on Ubuntu
-with JDK 17 and the Android SDK, runs the unit tests, and uploads the result as a build
-artifact on every push to `main` and on `v*` tags (the workflow keeps its original
-`purewallet.apk` artifact name).
+**CI.** `.github/workflows/apk.yml` runs on every push to `main` and on `v*` tags: it pins every
+action to a commit SHA, runs the unit tests, builds `assembleRelease` with the release key from
+repository secrets, refuses to publish an unsigned or debug-signed APK, and attaches the signed
+one (`zerowallet-release.apk` plus its SHA-256) to a tag's release. A build without the four
+signing secrets stops at the release step with the names of the variables it is missing - it
+does not fall back to a debug key. The same workflow is kept as a plain file at
+`.github/ci/apk-release.yml` so it can be reviewed like any other source.
 
 ## Verification
 
 | Check | Command | Result |
 | --- | --- | --- |
-| Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 369 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate and unreadable BIP-21 amounts, the authorization gate that runs a privileged action only on a reported success, an abandoned prompt answering its caller, the per-chain RGS URL, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate, the recommended-fee parser refusing a reply with a missing or non-numeric field instead of inventing 1 sat/vB, the send sheet's fee read as a state that ends in Retry, the BIP-21 amount URI of the on-chain receive tab, the three generations of stored seed file and what each says about its protection, the rule that the seed key is generated in the Keystore rather than imported, the restore confirmation's refusals and stale-backup warning, the refusal of a `req-` BIP-21 parameter and of a second `lightning=` key, exact millisatoshi agreement between the two halves of a QR, the folder names an interrupted channel-backup import leaves and which one comes back, the plain-record migration and its once-only marker, the displaced app-lock request being answered instead of dropped, the clipboard clear rule, and the restore review naming an older backup format |
-| Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
+| Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` (development only; nothing publishes it) |
+| Signed release build | `./gradlew assembleRelease` | `app-release.apk`, signed with the release key, minified and shrunk |
+| Unit tests | `./gradlew testDebugUnitTest` | 372 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate and unreadable BIP-21 amounts, the authorization gate that runs a privileged action only on a reported success, an abandoned prompt answering its caller, the per-chain RGS URL, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate, the recommended-fee parser refusing a reply with a missing or non-numeric field instead of inventing 1 sat/vB, the send sheet's fee read as a state that ends in Retry, the BIP-21 amount URI of the on-chain receive tab, the three generations of stored seed file and what each says about its protection, the rule that the seed key is generated in the Keystore rather than imported, the restore confirmation's refusals and stale-backup warning, the refusal of a `req-` BIP-21 parameter and of a second `lightning=` key, exact millisatoshi agreement between the two halves of a QR, the folder names an interrupted channel-backup import leaves and which one comes back, a plain record being refused rather than read (balance cache and payment notes alike), a streamed backup going out and back file for file including a 3 MiB store, a crafted archive whose entry escapes the restore directory, an entry that expands past the limit, a streamed file sealed with another phrase opening nothing, the displaced app-lock request being answered instead of dropped, the clipboard clear rule, and the restore review naming an older backup format |
+| Android lint | `./gradlew lintDebug` | 0 errors, 25 warnings |
+| Instrumented tests | `./gradlew connectedDebugAndroidTest` | Keystore seal/read/wipe on the real Android Keystore, BiometricManager answers against this phone's screen lock, FileProvider sharing `cache/backups` and nothing else |
 | Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
-| Package / label | `aapt2 dump badging app-debug.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |
+| Package / label | `aapt2 dump badging app-release.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |
 
 ## Repository layout
 
 ```
 app/src/main/java/com/jbitmstr/purewallet/
-  MainActivity.kt            single activity host, screenshot blocking
+  MainActivity.kt            single activity host, screenshot blocking, file-picker results
   PureWalletApp.kt           application graph
-  WalletViewModel.kt         UI bridge
-  core/                      node, node lifecycle rules, seed, app lock, channel backup, endpoint rules, log rotation, market data
+  WalletViewModel.kt         UI bridge and the wallet's lock state machine
+  core/WalletCore.kt         the one Node, the lock around it, the wallet epoch, the state flow
+  core/NodeManager.kt        front door on the layers below (no state of its own)
+  core/WalletLayer.kt        create, restore, reveal, unlock, wipe
+  core/NodeRuntime.kt        start, stop, events, sync, network and endpoint settings
+  core/BackupLayer.kt        sealed channel backup, streamed out and in
+  core/PaymentLayer.kt       invoices, offers, sends, channels
+  core/MarketLayer.kt        fiat price loop and fee rate
+  core/                      plus the plain-Kotlin rules (lifecycle, BIP-39, endpoint, fee, backup format) and the Keystore stores
   ui/                        home screen, lock screen, sheets, word-box setup and scanner
-app/src/test/                BIP-39, restore-word grid, channel backup and its restore review, fee parsing and the fee-read state, BIP-21 URIs, seed key storage, endpoint, node lifecycle, send draft, log rotation and lock lifecycle tests
+app/src/test/                the JVM suite: format, rules and source-shape checks
+app/src/androidTest/         Keystore, BiometricPrompt and FileProvider, on a device
 docs/icon.png                launcher icon artwork
 docs/preview.jpg             the screenshot above
-.github/workflows/apk.yml    CI build
+docs/at-rest.md              what is on disk in plain text, what protects it, and the limits
+.github/workflows/apk.yml    CI: SHA-pinned actions, signed release build
+.github/ci/apk-release.yml   the same workflow as a reviewable file
 verify-english.py            English-only guard
 ```
 
