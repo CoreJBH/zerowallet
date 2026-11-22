@@ -486,8 +486,9 @@ class NodeManager(context: Context) {
         openedSeed = mnemonic
         prefs.seedBackedUp = false
         prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
-        // A new wallet starts with nothing; an older snapshot must not show through.
-        prefs.clearCachedWallet(prefs.network)
+        // A new wallet starts with nothing; an older snapshot must not show through, on
+        // this chain or on any other one it was left under.
+        prefs.clearAllCachedWallets()
         _state.update {
             it.copy(
                 seedPresent = true,
@@ -528,8 +529,9 @@ class NodeManager(context: Context) {
                 openedSeed = normalized
                 prefs.seedBackedUp = true
                 prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
-                // The phrase may belong to another wallet than the one this snapshot was taken from.
-                prefs.clearCachedWallet(prefs.network)
+                // The phrase may belong to another wallet than the one this snapshot was taken from,
+                // and that is true of every chain's snapshot, not only the active one.
+                prefs.clearAllCachedWallets()
                 _state.update {
                     it.copy(
                         seedPresent = true,
@@ -1250,6 +1252,8 @@ class NodeManager(context: Context) {
             }
             if (balances != null) {
                 // Real numbers from a sync: they are what the next open shows while it waits.
+                // A snapshot the Keystore could not seal is not written at all (see
+                // Prefs.saveCachedWallet); the previous sealed one stays and keeps its date.
                 prefs.saveCachedWallet(network, WalletCache.snapshotOf(_state.value))
             }
         } finally {
@@ -1269,6 +1273,8 @@ class NodeManager(context: Context) {
                     n.bolt11Payment().receive(millisats(amountSats), desc, invoiceExpirySecs)
                 }
                 val hash = invoice.paymentHash()
+                // A note the Keystore could not seal is simply not saved (fail-closed); the
+                // invoice itself is what the user asked for and is returned regardless.
                 notes.put(hash, description)
                 InvoiceResult(invoice = invoice.toString(), paymentHash = hash)
             }

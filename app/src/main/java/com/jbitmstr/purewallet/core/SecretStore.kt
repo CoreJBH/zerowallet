@@ -4,6 +4,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
+import com.jbitmstr.purewallet.BuildConfig
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -25,6 +26,15 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * Values carry a [PREFIX] marker so a plain-text value written by an older build is still
  * readable and is replaced by a sealed one the next time it is saved.
+ *
+ * [seal] never falls back to the value it was given: a Keystore that refuses to seal returns
+ * null, and the caller writes nothing (see `Prefs.saveCachedWallet` and
+ * `PaymentNotes.put`). Writing the plain text instead would put exactly the amounts and
+ * merchant names this class exists to hide into the preferences file.
+ *
+ * Nothing here is logged in a release build: a failure names a Keystore alias and carries a
+ * stack trace from the crypto layer, which is a build-time debugging aid, not something a
+ * shipped wallet should leave in logcat for any process that can read it.
  */
 object SecretStore {
 
@@ -43,7 +53,9 @@ object SecretStore {
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val ciphertext = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
         PREFIX + Base64.encodeToString(cipher.iv + ciphertext, Base64.NO_WRAP)
-    }.onFailure { Log.w(TAG, "Unable to seal a stored value", it) }.getOrNull()
+    }.onFailure {
+        if (BuildConfig.DEBUG) Log.w(TAG, "Unable to seal a stored value", it)
+    }.getOrNull()
 
     /**
      * Opens a value written by [seal]. A value without the marker is returned as it is: it
@@ -63,14 +75,18 @@ object SecretStore {
                 GCMParameterSpec(TAG_BITS, payload.copyOfRange(0, IV_BYTES))
             )
             String(cipher.doFinal(payload.copyOfRange(IV_BYTES, payload.size)), Charsets.UTF_8)
-        }.onFailure { Log.w(TAG, "Unable to open a stored value", it) }.getOrNull()
+        }.onFailure {
+            if (BuildConfig.DEBUG) Log.w(TAG, "Unable to open a stored value", it)
+        }.getOrNull()
     }
 
     /** Deletes the data key, for a wipe: the ciphertext goes with the preferences. */
     fun deleteKey() {
         runCatching {
             keyStore().deleteEntry(KEY_ALIAS)
-        }.onFailure { Log.w(TAG, "Unable to delete the data key", it) }
+        }.onFailure {
+            if (BuildConfig.DEBUG) Log.w(TAG, "Unable to delete the data key", it)
+        }
     }
 
     private fun keyStore(): KeyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }

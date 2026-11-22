@@ -61,7 +61,9 @@ import com.jbitmstr.purewallet.ui.components.WalletSheet
 import com.jbitmstr.purewallet.ui.components.WalletTextField
 import com.jbitmstr.purewallet.ui.theme.Pal
 import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Settings: network, Esplora endpoint, gossip source, node identity, seed and wipe. */
 @Composable
@@ -681,16 +683,23 @@ private fun NetworkRow(network: ChainNetwork, selected: Boolean, onClick: () -> 
  * The cached copy is the sealed archive, and it is still a copy of the wallet's channel data
  * sitting on disk. Only the file just shared is kept: every share replaces the previous one,
  * and a wipe removes the directory (see NodeManager.wipeWallet).
+ *
+ * The write runs on [Dispatchers.IO]: the archive is as large as the node's channel state,
+ * and writing it (and deleting the previous copy) on the main thread is a stalled screen for
+ * as long as the storage takes. Only handing the finished URI to the chooser stays on the
+ * caller's thread, which is where the activity needs it.
  */
-private fun shareBackup(context: Context, export: ChannelBackupExport) {
-    val dir = File(context.cacheDir, "backups")
-    dir.mkdirs()
-    dir.listFiles()?.forEach { old ->
-        if (old.name != export.fileName) runCatching { old.delete() }
+private suspend fun shareBackup(context: Context, export: ChannelBackupExport) {
+    val uri = withContext(Dispatchers.IO) {
+        val dir = File(context.cacheDir, "backups")
+        dir.mkdirs()
+        dir.listFiles()?.forEach { old ->
+            if (old.name != export.fileName) runCatching { old.delete() }
+        }
+        val file = File(dir, export.fileName)
+        file.writeBytes(export.bytes)
+        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     }
-    val file = File(dir, export.fileName)
-    file.writeBytes(export.bytes)
-    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = ChannelBackup.MIME_TYPE
         putExtra(Intent.EXTRA_STREAM, uri)

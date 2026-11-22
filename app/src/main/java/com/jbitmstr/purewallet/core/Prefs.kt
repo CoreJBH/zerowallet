@@ -1,6 +1,9 @@
 package com.jbitmstr.purewallet.core
 
 import android.content.Context
+import android.content.SharedPreferences
+import android.util.Log
+import com.jbitmstr.purewallet.BuildConfig
 
 /**
  * Wallet settings and the last-synced snapshot.
@@ -10,10 +13,24 @@ import android.content.Context
  * who was paid are the wallet's business even on a device where another app can read this
  * file, and they carry a `v1:` marker once sealed. A value written before that (no marker)
  * is still read, and is replaced by a sealed one the next time the snapshot is saved.
+ *
+ * The sealing is fail-closed: when the Keystore cannot seal a value, [saveCachedWallet]
+ * writes nothing rather than the plain text. The previous snapshot stays as it was.
+ *
+ * The sealing functions are constructor arguments so the fail-closed path can be tested
+ * without Android: nothing else in this class needs them.
  */
-class Prefs(context: Context) {
+class Prefs internal constructor(
+    private val prefs: SharedPreferences,
+    private val seal: (String) -> String?,
+    private val unseal: (String) -> String?
+) {
 
-    private val prefs = context.applicationContext.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+    constructor(context: Context) : this(
+        context.applicationContext.getSharedPreferences(NAME, Context.MODE_PRIVATE),
+        SecretStore::seal,
+        SecretStore::open
+    )
 
     var network: ChainNetwork
         get() = ChainNetwork.fromId(prefs.getString(KEY_NETWORK, null))
@@ -134,33 +151,60 @@ class Prefs(context: Context) {
         )
     }
 
-    fun saveCachedWallet(network: ChainNetwork, cached: CachedWallet) {
-        prefs.edit()
-            .putLong(KEY_CACHE_SAVED + network.id, System.currentTimeMillis())
-            .putSealed(key(KEY_CACHE_ONCHAIN, network), cached.onchainSats.toString())
-            .putSealed(key(KEY_CACHE_SPENDABLE, network), cached.onchainSpendableSats.toString())
-            .putSealed(key(KEY_CACHE_LIGHTNING, network), cached.lightningSats.toString())
-            .putSealed(key(KEY_CACHE_HEIGHT, network), (cached.bestHeight ?: 0).toString())
-            .putSealed(key(KEY_CACHE_SYNC, network), (cached.lastSyncEpochSecs ?: 0L).toString())
-            .putSealed(
-                key(KEY_CACHE_PAYMENTS, network),
-                WalletCache.encodePayments(cached.payments)
-            )
-            .apply()
+    fun saveCachedWallet(network: ChainNetwork, cached: CachedWallet): Boolean {
+        val records = mapOf(
+            key(KEY_CACHE_ONCHAIN, network) to cached.onchainSats.toString(),
+            key(KEY_CACHE_SPENDABLE, network) to cached.onchainSpendableSats.toString(),
+            key(KEY_CACHE_LIGHTNING, network) to cached.lightningSats.toString(),
+            key(KEY_CACHE_HEIGHT, network) to (cached.bestHeight ?: 0).toString(),
+            key(KEY_CACHE_SYNC, network) to (cached.lastSyncEpochSecs ?: 0L).toString(),
+            key(KEY_CACHE_PAYMENTS, network) to WalletCache.encodePayments(cached.payments)
+        )
+        // Seal first, write second: a snapshot is written whole or not at all. One value
+        // left in plain text next to five sealed ones would be the balance it hides, and a
+        // half-written snapshot would show zeros for the parts that failed.
+        val sealed = records.mapValues { (_, value) -> seal(value) }
+        if (sealed.values.any { it == null }) {
+            if (BuildConfig.DEBUG) {
+                Log.w(TAG, "Snapshot for ${network.id} not saved: a value could not be sealed")
+            }
+            return false
+        }
+        val editor = prefs.edit()
+        sealed.forEach { (recordKey, value) -> editor.putString(recordKey, value) }
+        editor.putLong(KEY_CACHE_SAVED + network.id, System.currentTimeMillis()).apply()
+        return true
     }
 
     /** Forgets a chain's snapshot: a different wallet, or a wipe, must not inherit it. */
     fun clearCachedWallet(network: ChainNetwork) {
-        prefs.edit()
-            .remove(KEY_CACHE_SAVED + network.id)
-            .remove(KEY_CACHE_ONCHAIN + network.id)
-            .remove(KEY_CACHE_SPENDABLE + network.id)
-            .remove(KEY_CACHE_LIGHTNING + network.id)
-            .remove(KEY_CACHE_HEIGHT + network.id)
-            .remove(KEY_CACHE_SYNC + network.id)
-            .remove(KEY_CACHE_PAYMENTS + network.id)
-            .apply()
+        val editor = prefs.edit()
+        cacheKeys(network).forEach { editor.remove(it) }
+        editor.apply()
     }
+
+    /**
+     * Forgets every chain's snapshot.
+     *
+     * A new or restored phrase is a different wallet on every chain, not just the one being
+     * used right now: a snapshot left under another network would show its balance the first
+     * time the user switched to it.
+     */
+    fun clearAllCachedWallets() {
+        val editor = prefs.edit()
+        ChainNetwork.entries.forEach { network -> cacheKeys(network).forEach { editor.remove(it) } }
+        editor.apply()
+    }
+
+    private fun cacheKeys(network: ChainNetwork): List<String> = listOf(
+        KEY_CACHE_SAVED + network.id,
+        KEY_CACHE_ONCHAIN + network.id,
+        KEY_CACHE_SPENDABLE + network.id,
+        KEY_CACHE_LIGHTNING + network.id,
+        KEY_CACHE_HEIGHT + network.id,
+        KEY_CACHE_SYNC + network.id,
+        KEY_CACHE_PAYMENTS + network.id
+    )
 
     /**
      * One-time cleanup for the 1.1.4 default.
@@ -201,19 +245,11 @@ class Prefs(context: Context) {
             is Int -> raw.toString()
             else -> null
         } ?: return null
-        return SecretStore.open(stored)
-    }
-
-    private fun android.content.SharedPreferences.Editor.putSealed(
-        key: String,
-        value: String
-    ): android.content.SharedPreferences.Editor {
-        // A Keystore that refuses to seal must not lose the value outright: plain text is
-        // what this file held before, and the next save tries again.
-        return putString(key, SecretStore.seal(value) ?: value)
+        return unseal(stored)
     }
 
     companion object {
+        private const val TAG = "PureWalletPrefs"
         private const val NAME = "purewallet_settings"
         private const val KEY_NETWORK = "network"
         private const val KEY_BACKED_UP = "seed_backed_up"

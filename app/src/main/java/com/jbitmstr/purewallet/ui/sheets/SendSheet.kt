@@ -290,7 +290,7 @@ fun SendSheet(
             ) {
                 Column {
                     Text(
-                        if (target?.input?.kind == PaymentInputKind.ONCHAIN) "Transaction id" else "Payment id",
+                        referenceLabel(sentOverLightning, target?.input?.kind),
                         color = Pal.TextSecondary,
                         fontSize = 11.sp
                     )
@@ -467,14 +467,7 @@ fun SendSheet(
                 val vBytes = OnchainFeeEstimate.vBytes(inputs = 1, outputs = outputs)
                 val estimate = feeRate?.let { OnchainFeeEstimate.feeSats(it, inputs = 1, outputs = outputs) }
                 Text(
-                    if (estimate != null) {
-                        "Estimated fee: ${Fmt.sats(estimate)} sats " +
-                            "($feeRate sat/vB × ~$vBytes vB). The node sets the exact fee " +
-                            "from the transaction it signs."
-                    } else {
-                        "Reading the fee rate from the chain source. Sending stays disabled " +
-                            "until it arrives, because the high-fee check needs it."
-                    },
+                    feeSummary(estimate, feeRate, vBytes),
                     color = Pal.TextTertiary,
                     fontSize = 11.sp,
                     lineHeight = 15.sp
@@ -536,7 +529,7 @@ fun SendSheet(
                         append("The network estimate is ${pending.rateSatPerVb} sat/vB")
                         if (pending.feeSats != null) {
                             append(
-                                ", which is about ${Fmt.sats(pending.feeSats)} sats for " +
+                                ", which is about ${Fmt.sats(pending.feeSats)} for " +
                                     "this payment"
                             )
                             if (percent != null) append(" (${percent}% of the amount)")
@@ -585,3 +578,36 @@ private fun kindLabel(kind: PaymentInputKind): String = when (kind) {
     PaymentInputKind.PEER -> "Lightning peer"
     PaymentInputKind.UNKNOWN -> "Unknown"
 }
+
+/**
+ * What the identifier under a sent payment is.
+ *
+ * The payment of a BIP-21 QR can go either way, and the QR itself is an on-chain request even
+ * when it carries a `lightning=` invoice and the Lightning route is the one used. Deciding
+ * from the QR alone then labelled a Lightning payment hash "Transaction id", which is a
+ * different kind of identifier and cannot be looked up in a block explorer. Which route the
+ * payment actually took is the only thing that answers it.
+ */
+internal fun referenceLabel(sentOverLightning: Boolean, kind: PaymentInputKind?): String =
+    when {
+        sentOverLightning -> "Payment hash"
+        kind == PaymentInputKind.ONCHAIN -> "Transaction id"
+        else -> "Payment id"
+    }
+
+/**
+ * The fee line under the amount.
+ *
+ * [Fmt.sats] already writes the `₿` marker, so the number is never followed by "sats" as
+ * well: "₿1,234 sats" counted the unit twice. The rate and the estimated size stay in the
+ * sentence because they answer a different question than the total does.
+ */
+internal fun feeSummary(estimate: Long?, feeRate: Long?, vBytes: Long): String =
+    if (estimate != null) {
+        "Estimated fee: ${Fmt.sats(estimate)} " +
+            "($feeRate sat/vB × ~$vBytes vB). The node sets the exact fee " +
+            "from the transaction it signs."
+    } else {
+        "Reading the fee rate from the chain source. Sending stays disabled " +
+            "until it arrives, because the high-fee check needs it."
+    }

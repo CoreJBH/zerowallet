@@ -11,6 +11,7 @@ import android.security.keystore.KeyProtection
 import android.security.keystore.UserNotAuthenticatedException
 import android.util.Base64
 import android.util.Log
+import com.jbitmstr.purewallet.BuildConfig
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -43,6 +44,10 @@ import javax.crypto.spec.GCMParameterSpec
  * removed or reset (a normal PIN change keeps it usable). [readSeed] reports that as
  * [SeedRead.Invalidated] instead of a vague failure, so the app can say what happened and
  * send the user to the recovery phrase rather than silently losing the wallet.
+ *
+ * Nothing in this class is logged in a release build. The failures it warns about carry
+ * Keystore aliases and crypto stack traces, which is help while building and a description
+ * of the install for anyone reading logcat on a shipped phone.
  */
 class SecureStore(context: Context) {
 
@@ -126,10 +131,12 @@ class SecureStore(context: Context) {
             return try {
                 val mnemonic = decrypt(legacy, iv, ciphertext)
                 runCatching { saveSeed(mnemonic) }
-                    .onFailure { Log.w(TAG, "Seed opened with the old key but not re-sealed", it) }
+                    .onFailure {
+                        if (BuildConfig.DEBUG) Log.w(TAG, "Seed opened with the old key but not re-sealed", it)
+                    }
                 SeedRead.Ok(mnemonic)
             } catch (e: Exception) {
-                Log.e(TAG, "Unable to decrypt the stored seed with the old key", e)
+                if (BuildConfig.DEBUG) Log.e(TAG, "Unable to decrypt the stored seed with the old key", e)
                 SeedRead.Failed(e.message)
             }
         }
@@ -137,7 +144,7 @@ class SecureStore(context: Context) {
         val decryptKey = try {
             key(DEC_ALIAS) ?: key(ENC_ALIAS)
         } catch (e: KeyPermanentlyInvalidatedException) {
-            Log.w(TAG, "The wallet key was invalidated by a screen-lock change", e)
+            if (BuildConfig.DEBUG) Log.w(TAG, "The wallet key was invalidated by a screen-lock change", e)
             markKeysInvalidated()
             return SeedRead.Invalidated
         } ?: return SeedRead.Failed("The wallet key is missing")
@@ -148,11 +155,11 @@ class SecureStore(context: Context) {
             // Expected: the key is bound to the device lock and the window has passed.
             SeedRead.NeedsAuthentication
         } catch (e: KeyPermanentlyInvalidatedException) {
-            Log.w(TAG, "The wallet key was invalidated by a screen-lock change", e)
+            if (BuildConfig.DEBUG) Log.w(TAG, "The wallet key was invalidated by a screen-lock change", e)
             markKeysInvalidated()
             SeedRead.Invalidated
         } catch (e: Exception) {
-            Log.e(TAG, "Unable to decrypt the stored seed", e)
+            if (BuildConfig.DEBUG) Log.e(TAG, "Unable to decrypt the stored seed", e)
             SeedRead.Failed(e.message)
         }
     }
@@ -246,7 +253,7 @@ class SecureStore(context: Context) {
     } catch (e: KeyPermanentlyInvalidatedException) {
         throw e
     } catch (e: Exception) {
-        Log.w(TAG, "The Keystore entry $alias could not be read", e)
+        if (BuildConfig.DEBUG) Log.w(TAG, "The Keystore entry $alias could not be read", e)
         null
     }
 
@@ -303,7 +310,9 @@ class SecureStore(context: Context) {
         }
 
         if (imported.isFailure) {
-            Log.w(TAG, "This device refused the split keys; using one non-auth key", imported.exceptionOrNull())
+            if (BuildConfig.DEBUG) {
+                Log.w(TAG, "This device refused the split keys; using one non-auth key", imported.exceptionOrNull())
+            }
             // Not silent: the status the Settings sheet reads says this wallet's key is not
             // bound to the screen lock, and why.
             prefs.edit().putString(KEY_UNBOUND_REASON, REASON_IMPORT_REFUSED).apply()

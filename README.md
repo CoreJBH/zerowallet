@@ -186,7 +186,9 @@ so a reinstall needs the previous build removed first.
   non-exportable Keystore key (`v1:` prefixed in the preferences file). That key is not bound
   to the lock: those records are needed the instant the wallet opens and can be rebuilt by
   syncing, so a lost key costs a sync rather than funds. A value written by an older build is
-  still read and is re-sealed on the next save.
+  still read and is re-sealed on the next save. The sealing is fail-closed: a Keystore that
+  refuses to seal means the snapshot or the note is not written at all, rather than written
+  in plain text - the previous sealed snapshot stays, and the payment still goes through.
 - **A clipboard that does not show what it holds.** Copying an invoice, offer, address or
   node id marks the clip with `EXTRA_IS_SENSITIVE` on Android 13+, so the system does not
   draw it in the clipboard preview where anyone nearby can read it before it is pasted.
@@ -233,12 +235,15 @@ so a reinstall needs the previous build removed first.
   the keys behind for any old copy of the preferences file.
 - **Only the last shared backup stays in the cache.** The share sheet reads a file from the
   app's own cache through a `FileProvider` URI; a new share deletes the previous copy, so the
-  phone does not accumulate sealed copies of channel data.
+  phone does not accumulate sealed copies of channel data. The archive is written on
+  `Dispatchers.IO`, not on the thread drawing the Settings sheet.
 - **No plaintext node log in a release build.** `ldk-node`'s filesystem logger writes
   addresses, peers and channel ids to `logs/ldk-node.log`, so it is enabled only in a debug
   build; a release build starts the node without it and removes a log left by an older
-  install. Exception logging in the node manager is behind `BuildConfig.DEBUG` for the same
-  reason, and the release build is `isMinifyEnabled`, `isShrinkResources` and not debuggable.
+  install. Exception logging in the node manager, and every warning `SecureStore` and
+  `SecretStore` write about a Keystore alias or a failed seal or open, is behind
+  `BuildConfig.DEBUG` for the same reason: a shipped wallet leaves nothing about its keys in
+  logcat. The release build is `isMinifyEnabled`, `isShrinkResources` and not debuggable.
 - **Bounded logs.** In a debug build `logs/ldk-node.log` is capped at 2 MB and rotated with
   two archives while the node is stopped, so a long-running install cannot fill the phone
   with logs.
@@ -277,7 +282,8 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
 - `core/SecureStore.kt` encrypts the BIP-39 mnemonic with a non-exportable Keystore key pair
   (encrypt-only alias, decrypt-only alias bound to the device lock) and Android backup is
   disabled for the app, so the ciphertext never leaves the device. `core/SecretStore.kt`
-  seals the balance cache and the payment notes with a separate Keystore key.
+  seals the balance cache and the payment notes with a separate Keystore key; both stores are
+  fail-closed, so a value the Keystore cannot seal is never written in its place.
 - `core/AppLock.kt` wraps `BiometricPrompt` with the screen-lock fallback and exposes the
   availability check the UI uses to explain the setting on phones without a lock; without a
   lock the sensitive actions are refused rather than let through.
@@ -316,7 +322,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.13`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.14`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -351,7 +357,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 216 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate BIP-21 amount refusal, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate |
+| Unit tests | `./gradlew testDebugUnitTest` | 234 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate BIP-21 amount refusal, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate |
 | Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
 | Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
