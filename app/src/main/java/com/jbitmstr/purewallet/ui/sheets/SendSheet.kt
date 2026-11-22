@@ -12,7 +12,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -31,6 +33,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.FeePriority
+import com.jbitmstr.purewallet.core.FeeWarning
 import com.jbitmstr.purewallet.core.OnchainFeeEstimate
 import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.PaymentInputKind
@@ -73,6 +76,7 @@ fun SendSheet(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var reference by remember { mutableStateOf<String?>(null) }
+    var highFee by remember { mutableStateOf<HighFee?>(null) }
 
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
@@ -102,7 +106,8 @@ fun SendSheet(
             return
         }
         if (parsed.kind == PaymentInputKind.UNKNOWN) {
-            error = "That does not look like an invoice, offer or Bitcoin address."
+            error = parsed.rejection
+                ?: "That does not look like an invoice, offer or Bitcoin address."
             return
         }
         scope.launch {
@@ -122,13 +127,7 @@ fun SendSheet(
         }
     }
 
-    fun execute() {
-        val current = target ?: return
-        val amount = Fmt.parseSats(amountText)
-        if (current.amountEditable && amount == null && !sendAll) {
-            error = "Enter an amount in sats"
-            return
-        }
+    fun dispatch(current: ResolvedTarget, amount: Long?) {
         onAuthorize("Authenticate to send this payment.") {
             scope.launch {
                 busy = true
@@ -149,6 +148,60 @@ fun SendSheet(
                 busy = false
             }
         }
+    }
+
+    /**
+     * Sends, after stopping at the fee when the estimate is unusual.
+     *
+     * The fee rate is read from the chain endpoint, and nothing in the send screen would
+     * otherwise make an odd reply visible: a rate of 900 sat/vB looks exactly like a rate of
+     * 9. So an unusual rate, or a fee that is a large share of a small payment, gets its own
+     * confirmation with both numbers before the signature. Sending the whole balance has no
+     * amount to compare against, so only the rate rule can apply there.
+     */
+    fun sendPayment(current: ResolvedTarget, amount: Long?) {
+        if (onchain && !sendAll) {
+            val rate = feeRate
+            val outputs = 2
+            val estimate = rate?.let {
+                OnchainFeeEstimate.feeSats(it, inputs = 1, outputs = outputs)
+            }
+            if (rate != null && estimate != null &&
+                FeeWarning.isExcessive(rate, estimate, current.amountSats ?: amount)
+            ) {
+                highFee = HighFee(
+                    rateSatPerVb = rate,
+                    feeSats = estimate,
+                    amountSats = current.amountSats ?: amount,
+                    target = current,
+                    amount = amount
+                )
+                return
+            }
+        } else if (onchain) {
+            val rate = feeRate
+            if (rate != null && FeeWarning.isExcessive(rate, null, null)) {
+                highFee = HighFee(
+                    rateSatPerVb = rate,
+                    feeSats = null,
+                    amountSats = null,
+                    target = current,
+                    amount = amount
+                )
+                return
+            }
+        }
+        dispatch(current, amount)
+    }
+
+    fun execute() {
+        val current = target ?: return
+        val amount = Fmt.parseSats(amountText)
+        if (current.amountEditable && amount == null && !sendAll) {
+            error = "Enter an amount in sats"
+            return
+        }
+        sendPayment(current, amount)
     }
 
     WalletSheet(onDismiss = onClose) {
@@ -392,7 +445,65 @@ fun SendSheet(
             )
         }
     }
+
+    // The confirmation is drawn over the sheet, after it, so the send button below stays
+    // exactly where it was while the user reads the numbers.
+    highFee?.let { pending ->
+        AlertDialog(
+            onDismissRequest = { highFee = null },
+            containerColor = Pal.SurfaceElevated,
+            titleContentColor = Pal.TextPrimary,
+            textContentColor = Pal.TextSecondary,
+            title = { Text("That fee is unusually high") },
+            text = {
+                val percent = pending.feeSats?.let {
+                    FeeWarning.percentOfAmount(it, pending.amountSats)
+                }
+                Text(
+                    buildString {
+                        append("The network estimate is ${pending.rateSatPerVb} sat/vB")
+                        if (pending.feeSats != null) {
+                            append(
+                                ", which is about ${Fmt.sats(pending.feeSats)} sats for " +
+                                    "this payment"
+                            )
+                            if (percent != null) append(" (${percent}% of the amount)")
+                        }
+                        append(".\n\nA rate this far from the usual one comes from a fee " +
+                            "endpoint that is wrong or reading a spike, and the fee comes out " +
+                            "of your balance either way. Wait and try again, or send only if " +
+                            "you mean to pay this much.")
+                    },
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val confirmed = pending
+                    highFee = null
+                    dispatch(confirmed.target, confirmed.amount)
+                }) {
+                    Text("Send anyway", color = Pal.Danger)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { highFee = null }) {
+                    Text("Cancel", color = Pal.TextSecondary)
+                }
+            }
+        )
+    }
 }
+
+/** The numbers a high-fee confirmation was opened for, and what to send if confirmed. */
+private data class HighFee(
+    val rateSatPerVb: Long,
+    val feeSats: Long?,
+    val amountSats: Long?,
+    val target: ResolvedTarget,
+    val amount: Long?
+)
 
 private fun kindLabel(kind: PaymentInputKind): String = when (kind) {
     PaymentInputKind.BOLT11 -> "Lightning invoice (BOLT11)"

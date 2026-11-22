@@ -1,9 +1,12 @@
 package com.jbitmstr.purewallet
 
 import com.jbitmstr.purewallet.core.FeeEstimates
+import com.jbitmstr.purewallet.core.FeeWarning
 import com.jbitmstr.purewallet.core.OnchainFeeEstimate
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** Reading the standard Esplora `/fee-estimates` reply (Blockstream's default chain source). */
@@ -125,5 +128,42 @@ class FeeEstimatesTest {
             OnchainFeeEstimate.feeSats(1000L, inputs = 1, outputs = 2),
             OnchainFeeEstimate.feeSats(9_999_999L, inputs = 1, outputs = 2)
         )
+    }
+
+    // ------------------------------------------------------- high-fee warning
+
+    @Test
+    fun anOrdinaryFeeIsPaidWithoutADialog() {
+        // 16 sat/vB on 141 vB = 2,256 sats for 100,000 sats sent.
+        val fee = OnchainFeeEstimate.feeSats(16L, inputs = 1, outputs = 2)
+        assertFalse(FeeWarning.isExcessive(16L, fee, 100_000L))
+        assertEquals(2, FeeWarning.percentOfAmount(fee, 100_000L))
+    }
+
+    @Test
+    fun aRateOfAHundredOrMoreAlwaysWarns() {
+        assertTrue(FeeWarning.isExcessive(100L, 14_100L, 5_000_000L))
+        assertTrue(FeeWarning.isExcessive(900L, null, null))
+        assertFalse(FeeWarning.isExcessive(99L, 13_959L, 5_000_000L))
+    }
+
+    @Test
+    fun aFeeThatEatsThePaymentWarns() {
+        // 2,256 sats of fee on a 5,000 sat payment is 45%, with a rate that is not unusual.
+        assertTrue(FeeWarning.isExcessive(16L, 2_256L, 5_000L))
+    }
+
+    @Test
+    fun aPercentageOfATinyFeeIsNotWorthADialog() {
+        // 300 sats of fee on 1,000 sats is 30%, but the absolute fee is trivial.
+        assertFalse(FeeWarning.isExcessive(2L, 300L, 1_000L))
+    }
+
+    @Test
+    fun sendingEverythingOnlyHasTheRateRule() {
+        assertFalse(FeeWarning.isExcessive(16L, 2_256L, null))
+        assertTrue(FeeWarning.isExcessive(150L, 21_150L, null))
+        assertNull(FeeWarning.percentOfAmount(2_256L, null))
+        assertNull(FeeWarning.percentOfAmount(2_256L, 0L))
     }
 }

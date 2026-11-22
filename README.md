@@ -114,14 +114,30 @@ so a reinstall needs the previous build removed first.
 ## Security
 
 - **Authentication before money moves, and a gate that fails closed.** Sending a payment,
-  funding or closing a channel, restoring a channel backup and showing the recovery phrase
-  always ask for a biometric or the device screen lock first. One prompt accepts a strong
-  biometric or the screen lock on Android 11+; on older versions only a class-3 biometric is
-  accepted, with the screen lock as the fallback button, and a weak face unlock is never the
-  whole proof. When the phone has no screen lock, or the system reports it cannot
-  authenticate right now, the answer is "not authenticated": the wallet says what is
-  missing instead of opening. Whether a lock exists is re-read on every resume, so removing
-  it outside the app is noticed at once rather than after a restart.
+  funding or closing a channel, restoring a channel backup, showing the recovery phrase and
+  wiping the wallet always ask for a biometric or the device screen lock first. One prompt
+  accepts a strong biometric or the screen lock on Android 11+; on older versions only a
+  class-3 biometric is accepted, with the screen lock as the fallback button, and a weak face
+  unlock is never the whole proof. When the phone has no screen lock there is nothing to
+  prove it is you with, so those actions are refused: a dialog says so and opens the Android
+  security settings, and receiving keeps working. The same answer is given when the system
+  reports it cannot authenticate right now. Whether a lock exists is re-read on every
+  resume, so removing it outside the app is noticed at once rather than after a restart.
+- **The seed is bound to the phone's lock, in the Keystore itself.** On Android 11+ on a
+  phone with a screen lock, the key that decrypts the recovery phrase is created with
+  `setUserAuthenticationRequired(true)` and a 60-second validity window: the Keystore only
+  releases it shortly after the user authenticated, so a shell, a hooked callback or a
+  bypassed screen cannot read the phrase, and a process that has been sitting in the
+  background has to ask again. The same AES material is imported twice - an encrypt-only
+  alias with no such requirement (sealing a new or restored phrase asks nothing) and the
+  decrypt-only alias above - so nothing can read the phrase with the alias that writes it.
+  Opening the wallet after Android closed the app can therefore ask for the screen lock even
+  with lock-on-open off; the prompt is the same one. A wallet written by 1.1.10 or earlier is
+  moved onto this pair the first time it is opened.
+- **A screen-lock change is reported, not hidden.** Removing or resetting the phone's lock
+  invalidates that key by design, and the ciphertext cannot be opened by anything on the
+  device afterwards. The wallet says exactly that and sends the user to restore with the
+  recovery phrase instead of showing a generic error or a blank setup screen.
 - **Optional lock on open.** Off by default, a switch in Settings makes the app ask every
   time it opens and after coming back from the background. The prompt is lifecycle-driven:
   it restarts cleanly on resume, so the Unlock button cannot go dead after backgrounding.
@@ -133,19 +149,34 @@ so a reinstall needs the previous build removed first.
   AES-256-GCM ciphertext under a non-exportable Android Keystore key. Android backup is
   disabled for the app. The restore boxes are password fields with autocorrect off, so the
   phrase never reaches a keyboard's learned words or suggestion strip.
-- **HTTPS-only chain source.** A custom Esplora endpoint must be `https://`; plain `http://`
-  is accepted only for a node on the phone itself: `localhost`, `::1` or a literal address in
-  `127.0.0.0/8`, checked octet by octet (a public host that merely starts with `127.` is not
-  loopback). Credentials, query strings and fragments in the URL are rejected, and a stored
-  value that no longer passes is ignored in favour of the built-in default. The rule is
-  enforced twice: in `EsploraUrl` for the value the user types, and by
-  `res/xml/network_security_config.xml`, which keeps `usesCleartextTraffic="false"` for the
-  internet and permits cleartext only for `127.0.0.1` and `localhost`.
+- **Balance cache and payment notes are sealed too.** The last synced amounts, block height
+  and history, and the note kept for each invoice, are AES-256-GCM ciphertext under another
+  non-exportable Keystore key (`v1:` prefixed in the preferences file). That key is not bound
+  to the lock: those records are needed the instant the wallet opens and can be rebuilt by
+  syncing, so a lost key costs a sync rather than funds. A value written by an older build is
+  still read and is re-sealed on the next save.
+- **A clipboard that does not show what it holds.** Copying an invoice, offer, address or
+  node id marks the clip with `EXTRA_IS_SENSITIVE` on Android 13+, so the system does not
+  draw it in the clipboard preview where anyone nearby can read it before it is pasted.
+- **HTTPS-only chain source, with one address that cannot be spoofed.** A custom Esplora
+  endpoint must be `https://`; plain `http://` is accepted only for `127.0.0.1` and
+  `localhost`, the two names the platform's network security config permits cleartext for.
+  The lists are identical on purpose and a unit test compares them: a `domain` entry matches
+  a host name, not an address block, so accepting a wider range in the app would save an
+  endpoint whose every request the system then blocks. Credentials, query strings and
+  fragments in the URL are rejected, and a stored value that no longer passes is ignored in
+  favour of the built-in default.
 - **Fees that cannot be talked into overpaying.** Fee estimates are parsed as JSON (a string
   inside the reply cannot become a rate), skipped when they are not numbers, and clamped to
   1..1000 sat/vB before the node turns them into a `FeeRate`. The send confirmation shows
   both the rate and the estimated total (`rate × ~size` for one input and one change output),
-  so the number that leaves the balance is on screen next to the number it came from.
+  so the number that leaves the balance is on screen next to the number it came from. A rate
+  of 100 sat/vB or more, or a fee of more than 10% of a payment of 1,000 sats or more, stops
+  the send behind its own confirmation with both numbers; such a reply means the endpoint is
+  wrong or reading a spike, not that the user meant to pay it.
+- **Duplicate BIP-21 amounts are refused.** BIP-21 does not say which `amount` wins, so a QR
+  with two of them can be read as a different payment by another wallet. The send screen
+  refuses the request and says why instead of picking one of the numbers.
 - **BOLT12 stays on its chain.** A BOLT12 invoice names its chain by genesis hash and an offer
   by the chains it accepts; both are checked against the running network before the payment
   screen, along with the bech32 shape of the string (`lno1`/`lni1` with a valid data part), so
@@ -160,10 +191,14 @@ so a reinstall needs the previous build removed first.
   restart can never destroy a node a sync or payment is still using. A stop also waits for
   the event loop to leave its blocking native call before the node is destroyed.
 - **Wipe leaves nothing readable.** Wiping the wallet asks for the same proof as a payment
-  first, then deletes the seed, the Android Keystore key that sealed it, every chain's node
-  data, the payment notes, the settings, the node log (which names peers and channels) and
-  the cache copies of exported backups. Deleting the ciphertext alone would leave the key
-  behind for any old copy of the preferences file.
+  first, then deletes the seed, the Android Keystore keys that sealed it (both halves), every
+  chain's node data, the sealed payment notes, the settings (sealed balance cache included),
+  the node log (which names peers and channels) and the cache copies of exported backups,
+  including the backup directory under `cacheDir`. Deleting the ciphertext alone would leave
+  the keys behind for any old copy of the preferences file.
+- **Only the last shared backup stays in the cache.** The share sheet reads a file from the
+  app's own cache through a `FileProvider` URI; a new share deletes the previous copy, so the
+  phone does not accumulate sealed copies of channel data.
 - **No plaintext node log in a release build.** `ldk-node`'s filesystem logger writes
   addresses, peers and channel ids to `logs/ldk-node.log`, so it is enabled only in a debug
   build; a release build starts the node without it and removes a log left by an older
@@ -188,9 +223,9 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
                                         │
                                         ├── Esplora chain source (HTTPS)
                                         ├── gossip: Lightning P2P (default) or RGS snapshot
-                                        ├── seed: AES-256-GCM, key in Android Keystore
+                                        ├── seed: AES-256-GCM, split Keystore keys (read = device lock)
                                         ├── app lock: BiometricPrompt + device credential
-                                        └── last known balance cache (Prefs)
+                                        └── sealed cache: balance snapshot and notes (Prefs)
 ```
 
 - `core/NodeManager.kt` owns the single `Node` instance, its event loop and every wallet
@@ -204,17 +239,23 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   failure from a Lightning-port failure, with no Android APIs so it is unit tested.
 - `core/WalletCache.kt` encodes the last known balances and history and hydrates the wallet
   state with them while the node starts.
-- `core/SecureStore.kt` encrypts the BIP-39 mnemonic with a non-exportable Keystore key and
-  Android backup is disabled for the app, so the ciphertext never leaves the device.
+- `core/SecureStore.kt` encrypts the BIP-39 mnemonic with a non-exportable Keystore key pair
+  (encrypt-only alias, decrypt-only alias bound to the device lock) and Android backup is
+  disabled for the app, so the ciphertext never leaves the device. `core/SecretStore.kt`
+  seals the balance cache and the payment notes with a separate Keystore key.
 - `core/AppLock.kt` wraps `BiometricPrompt` with the screen-lock fallback and exposes the
-  availability check the UI uses to explain the setting on phones without a lock.
+  availability check the UI uses to explain the setting on phones without a lock; without a
+  lock the sensitive actions are refused rather than let through.
+- `core/SensitiveClipboard.kt` copies a request or address with `EXTRA_IS_SENSITIVE`, so the
+  system clipboard preview does not show it.
 - `core/ScreenSecurity.kt` applies `FLAG_SECURE` to the wallet window.
 - `core/EsploraUrl.kt` holds the endpoint rules; `core/Prefs.kt` refuses to store anything
   that fails them.
 - `core/FeeEstimates.kt` reads the standard Esplora `/fee-estimates` reply as JSON
   (confirmation target to sat/vB, clamped to 1..1000), so fee estimates work on any Esplora
   endpoint rather than only on mempool.space's numbered helper; `OnchainFeeEstimate` turns a
-  rate into the total shown on the confirmation screen.
+  rate into the total shown on the confirmation screen, and `FeeWarning` decides when that
+  total is unusual enough to stop the send behind its own confirmation.
 - `core/NodeLog.kt` rotates the LDK log file with a size cap.
 - `core/Bip39.kt` implements BIP-39 generation and validation in plain Kotlin, covered by
   unit tests against the official vectors.
@@ -236,7 +277,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.10`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.11`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -254,6 +295,13 @@ Requirements: JDK 17, the Android SDK (compileSdk 35), and a phone on Android 8.
 ./gradlew lintDebug
 ```
 
+A release build is signed only with a real release key, passed as Gradle properties or
+environment variables: `ZEROWALLET_KEYSTORE`, `ZEROWALLET_KEYSTORE_PASSWORD`,
+`ZEROWALLET_KEY_ALIAS` and `ZEROWALLET_KEY_PASSWORD`. With none of them set,
+`./gradlew assembleRelease` produces an unsigned APK rather than silently signing with the
+debug key; with only some of them set, the build stops with a message saying what is missing,
+and a keystore path that does not exist fails the build instead of producing an artifact.
+
 The repository also ships `.github/workflows/apk.yml`, which builds the same APK on Ubuntu
 with JDK 17 and the Android SDK, runs the unit tests, and uploads the result as a build
 artifact on every push to `main` and on `v*` tags (the workflow keeps its original
@@ -264,9 +312,9 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 200 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the strict 127.0.0.0/8 loopback check and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle |
+| Unit tests | `./gradlew testDebugUnitTest` | 208 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate BIP-21 amount refusal, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle |
 | Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
-| Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro` |
+| Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
 | Package / label | `aapt2 dump badging app-debug.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |
 
@@ -287,8 +335,9 @@ verify-english.py            English-only guard
 ```
 
 The Kotlin package and `applicationId` stay `com.jbitmstr.purewallet` so an install over an
-older build keeps the same app data and the same Android Keystore key that encrypts the
-seed.
+older build keeps the same app data. The seed's Keystore keys changed shape in 1.1.11 (a
+split encrypt/decrypt pair), so the stored seed of an older install is opened once with its
+old key and re-sealed under the new one on first launch instead of asking to restore.
 
 ## Contributors
 

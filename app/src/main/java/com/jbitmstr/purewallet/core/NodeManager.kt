@@ -100,6 +100,12 @@ data class WalletState(
     val backedUp: Boolean = false,
     val setupRequired: Boolean = true,
     val unlockError: Boolean = false,
+    /**
+     * A wallet is stored here, but its key is bound to the device lock and its short window
+     * has passed, so this process cannot open it yet. The wallet shows its lock screen until
+     * the user authenticates ([NodeManager.unlockSeed]).
+     */
+    val seedLocked: Boolean = false,
     val starting: Boolean = false,
     val running: Boolean = false,
     val busy: String? = null,
@@ -183,6 +189,18 @@ class NodeManager(context: Context) {
     private var fiatJob: Job? = null
     private var bootstrapped = false
 
+    /**
+     * The recovery phrase, once this process has opened it.
+     *
+     * The stored copy is sealed with a Keystore key that, on Android 11+ with a screen lock,
+     * only opens shortly after the user authenticated. Reading it again for every action
+     * would throw the prompt back at the user mid-payment, so it is kept here for the life of
+     * the process (and never written anywhere): the process is the same lifetime the node
+     * has, and it goes away with a wipe, a restore or the process being killed.
+     */
+    @Volatile
+    private var openedSeed: String? = null
+
     /** The chain source the running node was built with, when it is not the saved one. */
     private var activeEsploraUrl: String? = null
 
@@ -223,10 +241,104 @@ class NodeManager(context: Context) {
         when (lifecycle.foregroundAction(snapshot.seedPresent, snapshot.running, snapshot.starting)) {
             ForegroundAction.REFRESH -> scope.launch { refreshInternal(userInitiated = false) }
             ForegroundAction.START -> {
-                val seed = secureStore.loadSeed() ?: return
+                val seed = seedOrNull() ?: return
                 requestStart(seed)
             }
             ForegroundAction.NONE -> Unit
+        }
+    }
+
+    /**
+     * The seed for this process, opening the stored copy once if it is not open yet.
+     *
+     * Returns null when the wallet cannot be opened without the user: [readSeed] reports
+     * that through [SecureStore.SeedRead.NeedsAuthentication], and the state is set so the
+     * wallet shows its lock screen instead of pretending there is no wallet. Every caller
+     * already has a "no seed, do nothing" branch, so a locked wallet simply does nothing
+     * until [unlockSeed] brings it back.
+     */
+    private fun seedOrNull(): String? {
+        openedSeed?.let { return it }
+        return when (val read = secureStore.readSeed()) {
+            is SecureStore.SeedRead.Ok -> read.mnemonic.also { openedSeed = it }
+            SecureStore.SeedRead.NeedsAuthentication -> {
+                _state.update {
+                    it.copy(seedPresent = true, setupRequired = false, seedLocked = true, bootstrapped = true)
+                }
+                null
+            }
+            SecureStore.SeedRead.Invalidated -> {
+                reportInvalidatedKey()
+                null
+            }
+            else -> null
+        }
+    }
+
+    /**
+     * Called once the user proved it is them in front of [SecureStore]'s device-lock prompt.
+     *
+     * The read is tried again, and on success the wallet opens and its node starts: a wallet
+     * whose key is bound to the lock never shows balances or history before this point.
+     */
+    fun unlockSeed() {
+        scope.launch {
+            when (val read = secureStore.readSeed()) {
+                is SecureStore.SeedRead.Ok -> {
+                    openedSeed = read.mnemonic
+                    _state.update {
+                        it.copy(
+                            seedLocked = false,
+                            seedPresent = true,
+                            setupRequired = false,
+                            error = null
+                        )
+                    }
+                    requestStart(read.mnemonic)
+                }
+                SecureStore.SeedRead.NeedsAuthentication ->
+                    _messages.tryEmit("Authentication was not completed. Unlock again to open the wallet.")
+                SecureStore.SeedRead.Invalidated -> reportInvalidatedKey()
+                SecureStore.SeedRead.Absent -> {
+                    openedSeed = null
+                    _state.update {
+                        it.copy(seedLocked = false, seedPresent = false, setupRequired = true)
+                    }
+                }
+                is SecureStore.SeedRead.Failed -> reportBrokenWallet(
+                    read.detail?.let { "The wallet could not be opened: $it" }
+                        ?: "The wallet could not be opened on this device. Restore it with its recovery phrase."
+                )
+            }
+        }
+    }
+
+    /**
+     * The Keystore key died with the phone's previous screen lock, and the ciphertext cannot
+     * be opened by anything on this device any more. That is not a lost wallet: the phrase
+     * still restores it, so say exactly what happened and send the user to the restore flow
+     * rather than to a blank setup screen.
+     */
+    private fun reportInvalidatedKey() = reportBrokenWallet(
+        "This wallet's key was invalidated when the phone's screen lock was removed or " +
+            "reset. Restore the wallet with its recovery phrase."
+    )
+
+    /**
+     * The stored wallet cannot be opened on this device any more. Never overwrite it: the
+     * only safe way forward is restoring the recovery phrase, so the setup screen opens in
+     * its restore mode with the reason on it.
+     */
+    private fun reportBrokenWallet(message: String) {
+        openedSeed = null
+        _state.update {
+            it.copy(
+                seedLocked = false,
+                seedPresent = false,
+                setupRequired = true,
+                unlockError = true,
+                error = message
+            )
         }
     }
 
@@ -239,26 +351,53 @@ class NodeManager(context: Context) {
         val network = prefs.network
         // A node the user stopped stays stopped even after Android killed the process.
         lifecycle.restoreManualStop(prefs.nodeStoppedByUser)
-        val seed = secureStore.loadSeed()
-        if (seed == null && secureStore.hasSeed()) {
-            // A wallet exists but the Keystore key could not decrypt it. Never overwrite it:
-            // the only safe way forward is restoring the recovery phrase.
-            _state.update {
-                it.copy(
-                    network = network,
-                    esploraUrl = prefs.esploraUrl(network),
-                    lockOnOpen = prefs.lockOnOpen,
-                    screenProtection = prefs.screenProtection,
-                    bootstrapped = true,
-                    seedPresent = false,
-                    setupRequired = true,
-                    unlockError = true,
-                    error = "The stored recovery phrase could not be unlocked on this device."
-                )
+
+        val read = secureStore.readSeed()
+        val seed = (read as? SecureStore.SeedRead.Ok)?.mnemonic
+        if (seed == null && read !is SecureStore.SeedRead.Absent) {
+            when (read) {
+                SecureStore.SeedRead.NeedsAuthentication -> {
+                    // A wallet is here and it is this device's own: it is simply waiting for
+                    // the user. Nothing is started, and no balance or history is shown.
+                    _state.update {
+                        it.copy(
+                            network = network,
+                            esploraUrl = prefs.esploraUrl(network),
+                            rgsEnabled = prefs.rapidGossipSync,
+                            lockOnOpen = prefs.lockOnOpen,
+                            screenProtection = prefs.screenProtection,
+                            bootstrapped = true,
+                            seedPresent = true,
+                            setupRequired = false,
+                            seedLocked = true,
+                            backedUp = prefs.seedBackedUp
+                        )
+                    }
+                }
+                SecureStore.SeedRead.Invalidated -> reportInvalidatedKey()
+                else -> {
+                    // A wallet exists but the Keystore key could not decrypt it. Never
+                    // overwrite it: the only safe way forward is restoring the recovery
+                    // phrase.
+                    _state.update {
+                        it.copy(
+                            network = network,
+                            esploraUrl = prefs.esploraUrl(network),
+                            lockOnOpen = prefs.lockOnOpen,
+                            screenProtection = prefs.screenProtection,
+                            bootstrapped = true,
+                            seedPresent = false,
+                            setupRequired = true,
+                            unlockError = true,
+                            error = "The stored recovery phrase could not be unlocked on this device."
+                        )
+                    }
+                    startFiatLoop()
+                }
             }
-            startFiatLoop()
             return
         }
+        openedSeed = seed
         _state.update {
             it.copy(
                 network = network,
@@ -283,10 +422,13 @@ class NodeManager(context: Context) {
     }
 
     /** Creates a new wallet from SecureRandom entropy and returns the words. */
-    fun createWallet(wordCount: Int = 12): String {
+    suspend fun createWallet(wordCount: Int = 12): String = withContext(Dispatchers.IO) {
         check(!secureStore.hasSeed()) { "A wallet already exists on this device" }
         val mnemonic = Bip39.randomMnemonic(wordCount)
+        // Sealing the phrase means generating a Keystore key pair, which is slow enough to
+        // be felt on the main thread and must not run there.
         secureStore.saveSeed(mnemonic)
+        openedSeed = mnemonic
         prefs.seedBackedUp = false
         prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
         // A new wallet starts with nothing; an older snapshot must not show through.
@@ -295,7 +437,7 @@ class NodeManager(context: Context) {
             it.copy(seedPresent = true, backedUp = false, setupRequired = false)
         }
         startNode(mnemonic)
-        return mnemonic
+        mnemonic
     }
 
     /**
@@ -323,17 +465,36 @@ class NodeManager(context: Context) {
                 stopNodeLocked(keepState = false, nextStarting = true)
                 clearNodeData()
                 secureStore.saveSeed(normalized)
+                openedSeed = normalized
                 prefs.seedBackedUp = true
                 prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
                 // The phrase may belong to another wallet than the one this snapshot was taken from.
                 prefs.clearCachedWallet(prefs.network)
-                _state.update { it.copy(seedPresent = true, backedUp = true, setupRequired = false) }
+                _state.update {
+                    it.copy(
+                        seedPresent = true,
+                        backedUp = true,
+                        setupRequired = false,
+                        seedLocked = false,
+                        unlockError = false
+                    )
+                }
                 startNodeLocked(normalized)
             }
         }
     }
 
-    fun revealSeed(): String? = secureStore.loadSeed()
+    /**
+     * The recovery phrase, for the backup screen.
+     *
+     * It comes from the copy this process opened; a wallet that is still locked asks for the
+     * device lock instead of handing out an empty phrase.
+     */
+    fun revealSeed(): String? {
+        val seed = seedOrNull()
+        if (seed == null) _messages.tryEmit("Unlock the wallet to see its recovery phrase")
+        return seed
+    }
 
     fun confirmSeedBackedUp() {
         prefs.seedBackedUp = true
@@ -353,7 +514,7 @@ class NodeManager(context: Context) {
     suspend fun exportChannelBackup(): Result<ChannelBackupExport> = withContext(Dispatchers.IO) {
         runCatching {
             nodeMutex.withLock {
-                val mnemonic = secureStore.loadSeed()
+                val mnemonic = seedOrNull()
                     ?: throw IllegalStateException("This device has no recovery phrase to seal a backup with")
                 val network = prefs.network
                 val wasRunning = node != null
@@ -411,7 +572,7 @@ class NodeManager(context: Context) {
     suspend fun importChannelBackup(bytes: ByteArray): Result<BackupManifest> = withContext(Dispatchers.IO) {
         runCatching {
             nodeMutex.withLock {
-                val mnemonic = secureStore.loadSeed()
+                val mnemonic = seedOrNull()
                     ?: throw IllegalStateException("Restore your recovery phrase first, then import the backup")
                 _state.update { it.copy(busy = "Opening channel backup") }
                 val payload = try {
@@ -745,7 +906,7 @@ class NodeManager(context: Context) {
     }
 
     fun restartNode() {
-        val seed = secureStore.loadSeed() ?: return
+        val seed = seedOrNull() ?: return
         requestStart(seed)
     }
 
@@ -828,7 +989,9 @@ class NodeManager(context: Context) {
                 // the wallet's business, so a wipe takes them too.
                 runCatching { File(appContext.filesDir, "logs").deleteRecursively() }
                 runCatching { File(appContext.cacheDir, "backups").deleteRecursively() }
+                openedSeed = null
                 runCatching { secureStore.clear() }
+                runCatching { SecretStore.deleteKey() }
                 runCatching { notes.clear() }
                 runCatching { prefs.clear() }
                 _state.value = WalletState(
@@ -846,7 +1009,7 @@ class NodeManager(context: Context) {
 
     fun switchNetwork(network: ChainNetwork) {
         if (network == prefs.network) return
-        val seed = secureStore.loadSeed()
+        val seed = seedOrNull()
         scope.launch {
             nodeMutex.withLock {
                 stopNodeLocked(keepState = false)
@@ -889,7 +1052,7 @@ class NodeManager(context: Context) {
         result.onSuccess {
             val after = prefs.esploraUrl(network)
             _state.update { it.copy(esploraUrl = after) }
-            val seed = secureStore.loadSeed()
+            val seed = seedOrNull()
             val running = node != null && !_state.value.starting
             if (esploraChangeNeedsRestart(before, after, running, seed != null)) {
                 _messages.tryEmit("Esplora endpoint saved. Restarting the node to use it…")

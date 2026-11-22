@@ -34,6 +34,37 @@ class PaymentInputTest {
     }
 
     @Test
+    fun bip21WithTwoAmountsIsRefused() {
+        // BIP-21 does not say which duplicate wins, so two wallets can show different
+        // amounts for the same QR. This wallet refuses the request instead of picking one.
+        val parsed = PaymentInputParser.parse(
+            "bitcoin:$mainnetBech32?amount=0.001&amount=1.0"
+        )
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertNull(parsed.amountSats)
+        assertTrue(parsed.rejection.orEmpty().contains("more than one amount"))
+    }
+
+    @Test
+    fun bip21WithTheSameAmountTwiceIsAlsoRefused() {
+        val parsed = PaymentInputParser.parse(
+            "bitcoin:$mainnetBech32?amount=0.001&label=A&amount=0.001"
+        )
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertTrue(parsed.rejection != null)
+    }
+
+    @Test
+    fun aSingleAmountWithOtherParametersIsStillPaid() {
+        val parsed = PaymentInputParser.parse(
+            "bitcoin:$mainnetBech32?label=Coffee&amount=0.001&message=One"
+        )
+        assertEquals(PaymentInputKind.ONCHAIN, parsed.kind)
+        assertEquals(100_000L, parsed.amountSats)
+        assertNull(parsed.rejection)
+    }
+
+    @Test
     fun mainnetAddressesMatchOnlyMainnet() {
         assertTrue(PaymentInputParser.matchesNetwork(mainnetBech32, mainnet = true))
         assertTrue(PaymentInputParser.matchesNetwork(mainnetP2pkh, mainnet = true))

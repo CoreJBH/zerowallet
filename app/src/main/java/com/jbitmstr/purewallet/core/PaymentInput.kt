@@ -29,7 +29,13 @@ data class PaymentInput(
     val message: String? = null,
     val lightning: String? = null,
     val peerNodeId: String? = null,
-    val peerAddress: String? = null
+    val peerAddress: String? = null,
+    /**
+     * Why a request was refused outright, in words the send screen can show. Set only on a
+     * [PaymentInputKind.UNKNOWN] result whose shape was understood but must not be paid:
+     * a QR carrying two different `amount` parameters, for instance.
+     */
+    val rejection: String? = null
 )
 
 object PaymentInputParser {
@@ -240,6 +246,7 @@ object PaymentInputParser {
         var label: String? = null
         var message: String? = null
         var lightning: String? = null
+        var amountSeen = false
 
         if (query.isNotEmpty()) {
             for (pair in query.split('&')) {
@@ -247,7 +254,15 @@ object PaymentInputParser {
                 val key = pair.substringBefore('=').lowercase()
                 val value = decode(pair.substringAfter('=', ""))
                 when (key) {
-                    "amount" -> amountSats = Fmt.parseBtcToSats(value)
+                    "amount" -> {
+                        // Two amounts in one request are not a request this wallet will pay:
+                        // BIP-21 does not say which one wins, so other wallets can read a
+                        // different amount than this one, and the payer cannot tell which
+                        // number the receiver meant.
+                        if (amountSeen) return duplicateAmount(text)
+                        amountSeen = true
+                        amountSats = Fmt.parseBtcToSats(value)
+                    }
                     "label" -> label = value.ifBlank { null }
                     "message" -> message = value.ifBlank { null }
                     "lightning" -> lightning = value.ifBlank { null }
@@ -268,6 +283,13 @@ object PaymentInputParser {
         }
         return PaymentInput(PaymentInputKind.UNKNOWN, text)
     }
+
+    private fun duplicateAmount(text: String) = PaymentInput(
+        kind = PaymentInputKind.UNKNOWN,
+        raw = text,
+        rejection = "This payment request carries more than one amount. Wallets read that " +
+            "differently, so it is not paid here. Ask for a new QR or a Lightning invoice."
+    )
 
     private fun decode(value: String): String = try {
         URLDecoder.decode(value, "UTF-8")

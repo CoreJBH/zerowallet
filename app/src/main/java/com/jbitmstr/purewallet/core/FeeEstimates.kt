@@ -78,6 +78,47 @@ object FeeEstimates {
 }
 
 /**
+ * When an on-chain fee is high enough that the user should see it before signing.
+ *
+ * The fee rate comes from an Esplora endpoint. Its reply is clamped, but a clamped rate can
+ * still be a hundred times the going rate when the endpoint is wrong, hostile, or simply
+ * reading a mempool spike, and a small payment with a large fee takes a real bite out of the
+ * balance. Nothing here decides the fee; it decides when the send screen stops and asks.
+ */
+object FeeWarning {
+
+    /** A rate this high is unusual enough that the user should confirm it. */
+    const val HIGH_RATE_SAT_PER_VB = 100L
+
+    /** A fee above this share of the amount sent is not worth paying silently (10%). */
+    const val HIGH_FEE_PERMILLE = 100L
+
+    /**
+     * The percentage rule only applies from this fee upward. A fee of 300 sats on 1,000 sats
+     * is 30%, but 300 sats is not worth a dialog of its own.
+     */
+    const val MIN_FEE_SATS_FOR_PERCENT = 1_000L
+
+    /**
+     * True when [rateSatPerVb] is unusually high, or when the estimated [feeSats] is an
+     * excessive share of [amountSats]. With no amount (sending the whole balance) only the
+     * rate rule can apply.
+     */
+    fun isExcessive(rateSatPerVb: Long, feeSats: Long?, amountSats: Long?): Boolean {
+        if (rateSatPerVb >= HIGH_RATE_SAT_PER_VB) return true
+        if (feeSats == null || feeSats < MIN_FEE_SATS_FOR_PERCENT) return false
+        if (amountSats == null || amountSats <= 0L) return false
+        return feeSats * 1000L >= amountSats * HIGH_FEE_PERMILLE
+    }
+
+    /** The fee as a whole percentage of the amount, for the confirmation text. */
+    fun percentOfAmount(feeSats: Long, amountSats: Long?): Int? {
+        if (amountSats == null || amountSats <= 0L) return null
+        return ((feeSats * 100L + amountSats / 2L) / amountSats).toInt()
+    }
+}
+
+/**
  * What an on-chain send is likely to cost.
  *
  * The wallet cannot know the transaction before the node builds it (the number of inputs

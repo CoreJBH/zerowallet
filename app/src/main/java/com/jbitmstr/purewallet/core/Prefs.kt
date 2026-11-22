@@ -3,7 +3,13 @@ package com.jbitmstr.purewallet.core
 import android.content.Context
 
 /**
- * Non-secret wallet settings. The seed phrase never goes in here; it lives in [SecureStore].
+ * Wallet settings and the last-synced snapshot.
+ *
+ * The seed phrase never goes in here; it lives in [SecureStore]. The snapshot's amounts and
+ * history are sealed with [SecretStore] before they are written: a balance and the list of
+ * who was paid are the wallet's business even on a device where another app can read this
+ * file, and they carry a `v1:` marker once sealed. A value written before that (no marker)
+ * is still read, and is replaced by a sealed one the next time the snapshot is saved.
  */
 class Prefs(context: Context) {
 
@@ -118,27 +124,28 @@ class Prefs(context: Context) {
         val savedAt = prefs.getLong(KEY_CACHE_SAVED + network.id, 0L)
         if (savedAt <= 0L) return null
         return CachedWallet(
-            onchainSats = prefs.getLong(KEY_CACHE_ONCHAIN + network.id, 0L),
-            onchainSpendableSats = prefs.getLong(KEY_CACHE_SPENDABLE + network.id, 0L),
-            lightningSats = prefs.getLong(KEY_CACHE_LIGHTNING + network.id, 0L),
-            bestHeight = prefs.getInt(KEY_CACHE_HEIGHT + network.id, 0).takeIf { it > 0 },
-            lastSyncEpochSecs = prefs.getLong(KEY_CACHE_SYNC + network.id, 0L)
-                .takeIf { it > 0L },
-            payments = WalletCache.decodePayments(
-                prefs.getString(KEY_CACHE_PAYMENTS + network.id, null)
-            )
+            onchainSats = sealed(key(KEY_CACHE_ONCHAIN, network))?.toLongOrNull() ?: 0L,
+            onchainSpendableSats = sealed(key(KEY_CACHE_SPENDABLE, network))?.toLongOrNull() ?: 0L,
+            lightningSats = sealed(key(KEY_CACHE_LIGHTNING, network))?.toLongOrNull() ?: 0L,
+            bestHeight = sealed(key(KEY_CACHE_HEIGHT, network))?.toIntOrNull()?.takeIf { it > 0 },
+            lastSyncEpochSecs = sealed(key(KEY_CACHE_SYNC, network))?.toLongOrNull()
+                ?.takeIf { it > 0L },
+            payments = WalletCache.decodePayments(sealed(key(KEY_CACHE_PAYMENTS, network)))
         )
     }
 
     fun saveCachedWallet(network: ChainNetwork, cached: CachedWallet) {
         prefs.edit()
             .putLong(KEY_CACHE_SAVED + network.id, System.currentTimeMillis())
-            .putLong(KEY_CACHE_ONCHAIN + network.id, cached.onchainSats)
-            .putLong(KEY_CACHE_SPENDABLE + network.id, cached.onchainSpendableSats)
-            .putLong(KEY_CACHE_LIGHTNING + network.id, cached.lightningSats)
-            .putInt(KEY_CACHE_HEIGHT + network.id, cached.bestHeight ?: 0)
-            .putLong(KEY_CACHE_SYNC + network.id, cached.lastSyncEpochSecs ?: 0L)
-            .putString(KEY_CACHE_PAYMENTS + network.id, WalletCache.encodePayments(cached.payments))
+            .putSealed(key(KEY_CACHE_ONCHAIN, network), cached.onchainSats.toString())
+            .putSealed(key(KEY_CACHE_SPENDABLE, network), cached.onchainSpendableSats.toString())
+            .putSealed(key(KEY_CACHE_LIGHTNING, network), cached.lightningSats.toString())
+            .putSealed(key(KEY_CACHE_HEIGHT, network), (cached.bestHeight ?: 0).toString())
+            .putSealed(key(KEY_CACHE_SYNC, network), (cached.lastSyncEpochSecs ?: 0L).toString())
+            .putSealed(
+                key(KEY_CACHE_PAYMENTS, network),
+                WalletCache.encodePayments(cached.payments)
+            )
             .apply()
     }
 
@@ -177,6 +184,33 @@ class Prefs(context: Context) {
 
     fun clear() {
         prefs.edit().clear().apply()
+    }
+
+    // ------------------------------------------------------------ sealed cache values
+
+    private fun key(prefix: String, network: ChainNetwork) = prefix + network.id
+
+    /** A cached value, opened; null when there is none or it cannot be read. */
+    private fun sealed(key: String): String? {
+        // `all` is read rather than getString: a snapshot written by 1.1.10 or earlier holds
+        // Longs in these keys, and getString on a Long throws. Those plain numbers are taken
+        // as they are and are replaced by sealed strings on the next save.
+        val stored = when (val raw = runCatching { prefs.all[key] }.getOrNull()) {
+            is String -> raw
+            is Long -> raw.toString()
+            is Int -> raw.toString()
+            else -> null
+        } ?: return null
+        return SecretStore.open(stored)
+    }
+
+    private fun android.content.SharedPreferences.Editor.putSealed(
+        key: String,
+        value: String
+    ): android.content.SharedPreferences.Editor {
+        // A Keystore that refuses to seal must not lose the value outright: plain text is
+        // what this file held before, and the next save tries again.
+        return putString(key, SecretStore.seal(value) ?: value)
     }
 
     companion object {

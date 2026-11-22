@@ -1,8 +1,13 @@
 package com.jbitmstr.purewallet.core
 
+import android.app.KeyguardManager
 import android.content.Context
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
+import android.security.keystore.KeyProtection
+import android.security.keystore.UserNotAuthenticatedException
 import android.util.Base64
 import android.util.Log
 import java.security.KeyStore
@@ -12,81 +17,289 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 /**
- * Encrypts the seed phrase with an AES-256-GCM key that is generated inside the
- * Android Keystore and never leaves it. Only the ciphertext is written to disk.
+ * Encrypts the seed phrase with AES-256-GCM keys that are generated inside the Android
+ * Keystore and never leave it. Only the ciphertext is written to disk.
+ *
+ * Two aliases hold the same AES key material, each allowed only one direction:
+ *
+ * - [ENC_ALIAS] may encrypt and nothing else. It is not bound to the user, so the wallet can
+ *   be sealed with no prompt at all (creating a wallet, restoring one, upgrading an older
+ *   install). Holding this alias is useless for reading the wallet back.
+ * - [DEC_ALIAS] may decrypt and nothing else, and on Android 11 and later on a phone with a
+ *   screen lock it is created with `setUserAuthenticationRequired(true)`. Reading the seed
+ *   then needs the user to have authenticated on the device (screen unlock, or the prompt
+ *   the wallet shows): knowing the app's code, or getting a shell into it, is not enough to
+ *   open the phrase. The Keystore enforces that itself, so no screen can be bypassed.
+ *
+ * The binding uses a short validity window instead of a per-operation one, on purpose: a
+ * per-operation key needs a `CryptoObject` prompt around every single use, and the node has
+ * to read the seed on its own when the app comes back to the screen. With a window, the
+ * seed opens right after the user unlocks the phone and asks for the prompt only when that
+ * window has passed.
+ *
+ * Lock changes: the Keystore invalidates an auth-bound key when the secure lock screen is
+ * removed or reset (a normal PIN change keeps it usable). [readSeed] reports that as
+ * [SeedRead.Invalidated] instead of a vague failure, so the app can say what happened and
+ * send the user to the recovery phrase rather than silently losing the wallet.
  */
 class SecureStore(context: Context) {
 
-    private val prefs = context.applicationContext
-        .getSharedPreferences(NAME, Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
+    /** What reading the stored seed produced. */
+    sealed class SeedRead {
+        /** The phrase, decrypted. */
+        data class Ok(val mnemonic: String) : SeedRead()
+
+        /**
+         * The key is bound to the device lock and the user has not authenticated recently
+         * enough. Authenticate, then call [readSeed] again.
+         */
+        object NeedsAuthentication : SeedRead()
+
+        /** The Keystore key was invalidated by a screen-lock change; only a restore can help. */
+        object Invalidated : SeedRead()
+
+        /** No wallet is stored on this device. */
+        object Absent : SeedRead()
+
+        /** The ciphertext is there but could not be opened for another reason. */
+        data class Failed(val detail: String?) : SeedRead()
+    }
+
+    /** Seals [mnemonic] with a fresh IV. Never asks the user anything. */
     fun saveSeed(mnemonic: String) {
+        ensureKeyPair()
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey())
+        cipher.init(Cipher.ENCRYPT_MODE, encryptKey())
         val ciphertext = cipher.doFinal(mnemonic.toByteArray(Charsets.UTF_8))
         val payload = cipher.iv + ciphertext
         prefs.edit()
             .putString(KEY_SEED, Base64.encodeToString(payload, Base64.NO_WRAP))
             .apply()
+        // The upgrade path is done: the old single key can no longer open anything, and
+        // keeping it would leave a copy of the key material able to read old backups.
+        runCatching { keyStore().deleteEntry(LEGACY_ALIAS) }
     }
 
-    fun loadSeed(): String? {
-        val encoded = prefs.getString(KEY_SEED, null) ?: return null
+    /**
+     * Decrypts the seed for this process.
+     *
+     * @return [SeedRead.Ok] with the phrase, [SeedRead.NeedsAuthentication] when the user has
+     * to prove it is them first, [SeedRead.Invalidated] when the key died with the old screen
+     * lock, or [SeedRead.Absent]/[SeedRead.Failed].
+     */
+    fun readSeed(): SeedRead {
+        val payload = readPayload() ?: return SeedRead.Absent
+        val iv = payload.copyOfRange(0, IV_BYTES)
+        val ciphertext = payload.copyOfRange(IV_BYTES, payload.size)
+
+        // An install from before the split keys: read it with the old key and move it onto
+        // the new pair right away, so the next read is the protected one.
+        val legacy = try {
+            key(LEGACY_ALIAS)
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            null
+        }
+        if (legacy != null) {
+            return try {
+                val mnemonic = decrypt(legacy, iv, ciphertext)
+                runCatching { saveSeed(mnemonic) }
+                    .onFailure { Log.w(TAG, "Seed opened with the old key but not re-sealed", it) }
+                SeedRead.Ok(mnemonic)
+            } catch (e: Exception) {
+                Log.e(TAG, "Unable to decrypt the stored seed with the old key", e)
+                SeedRead.Failed(e.message)
+            }
+        }
+
+        val decryptKey = try {
+            key(DEC_ALIAS) ?: key(ENC_ALIAS)
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            Log.w(TAG, "The wallet key was invalidated by a screen-lock change", e)
+            markKeysInvalidated()
+            return SeedRead.Invalidated
+        } ?: return SeedRead.Failed("The wallet key is missing")
+
         return try {
-            val payload = Base64.decode(encoded, Base64.NO_WRAP)
-            if (payload.size <= IV_BYTES) return null
-            val iv = payload.copyOfRange(0, IV_BYTES)
-            val ciphertext = payload.copyOfRange(IV_BYTES, payload.size)
-            val cipher = Cipher.getInstance(TRANSFORMATION)
-            cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(TAG_BITS, iv))
-            String(cipher.doFinal(ciphertext), Charsets.UTF_8)
+            SeedRead.Ok(decrypt(decryptKey, iv, ciphertext))
+        } catch (e: UserNotAuthenticatedException) {
+            // Expected: the key is bound to the device lock and the window has passed.
+            SeedRead.NeedsAuthentication
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            Log.w(TAG, "The wallet key was invalidated by a screen-lock change", e)
+            markKeysInvalidated()
+            SeedRead.Invalidated
         } catch (e: Exception) {
             Log.e(TAG, "Unable to decrypt the stored seed", e)
-            null
+            SeedRead.Failed(e.message)
         }
     }
 
     fun hasSeed(): Boolean = prefs.contains(KEY_SEED)
 
     /**
-     * Forgets the seed and the key that sealed it.
+     * Forgets the seed and the keys that sealed it.
      *
-     * Removing the ciphertext alone would leave the AES key in the Android Keystore, where
-     * it outlives a wipe and could decrypt any copy of the ciphertext kept elsewhere (an
-     * old backup of the preferences, for instance). The key is deleted with the seed.
+     * Removing the ciphertext alone would leave the AES keys in the Android Keystore, where
+     * they outlive a wipe and could decrypt any copy of the ciphertext kept elsewhere (an
+     * old backup of the preferences, for instance). The keys are deleted with the seed.
      */
     fun clear() {
-        prefs.edit().remove(KEY_SEED).apply()
-        runCatching {
-            KeyStore.getInstance(KEYSTORE).apply { load(null) }.deleteEntry(KEY_ALIAS)
+        prefs.edit().remove(KEY_SEED).remove(KEY_KEYS_INVALIDATED).apply()
+        val keyStore = runCatching { keyStore() }.getOrNull() ?: return
+        listOf(LEGACY_ALIAS, ENC_ALIAS, DEC_ALIAS).forEach { alias ->
+            runCatching { keyStore.deleteEntry(alias) }
         }
     }
 
-    private fun secretKey(): SecretKey {
-        val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
-        (keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }
+    // ------------------------------------------------------------------- internals
 
-        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE)
-        val spec = KeyGenParameterSpec.Builder(
-            KEY_ALIAS,
-            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+    private fun readPayload(): ByteArray? {
+        val encoded = prefs.getString(KEY_SEED, null) ?: return null
+        val payload = runCatching { Base64.decode(encoded, Base64.NO_WRAP) }.getOrNull() ?: return null
+        return if (payload.size <= IV_BYTES) null else payload
+    }
+
+    private fun decrypt(key: SecretKey, iv: ByteArray, ciphertext: ByteArray): String {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, iv))
+        return String(cipher.doFinal(ciphertext), Charsets.UTF_8)
+    }
+
+    private fun keyStore(): KeyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
+
+    /**
+     * The Keystore entry for [alias], or null when there is none this build can read.
+     *
+     * An invalidated key is rethrown rather than folded into null: the difference between
+     * "there is no key" and "the phone's lock changed" is the difference between a broken
+     * install and a wallet that needs its recovery phrase.
+     */
+    private fun key(alias: String): SecretKey? = try {
+        (keyStore().getEntry(alias, null) as? KeyStore.SecretKeyEntry)?.secretKey
+    } catch (e: KeyPermanentlyInvalidatedException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(TAG, "The Keystore entry $alias could not be read", e)
+        null
+    }
+
+    private fun markKeysInvalidated() {
+        prefs.edit().putBoolean(KEY_KEYS_INVALIDATED, true).apply()
+    }
+
+    /**
+     * Makes sure the split keys exist.
+     *
+     * A pair that the Keystore invalidated (its decrypt half) cannot be repaired: the
+     * material cannot be read back out, so a fresh pair is generated and the caller's new
+     * ciphertext is sealed with it. That only happens on the restore path, where the
+     * phrase is known again.
+     *
+     * If the device refuses the imported pair at all, a single non-auth key is generated
+     * instead. That is the protection level the wallet had before 1.1.11, and it keeps a
+     * wallet working on a device whose Keystore cannot do better; the screen-based checks
+     * still apply, and the failure is logged rather than hidden.
+     */
+    private fun ensureKeyPair() {
+        val keyStore = keyStore()
+        val invalidated = prefs.getBoolean(KEY_KEYS_INVALIDATED, false)
+        if (!invalidated && keyStore.containsAlias(DEC_ALIAS)) return
+
+        listOf(LEGACY_ALIAS, ENC_ALIAS, DEC_ALIAS).forEach { alias ->
+            runCatching { keyStore.deleteEntry(alias) }
+        }
+
+        val imported = runCatching {
+            // The material is generated in software once so it can be imported under both
+            // aliases with different protections; from then on it lives only in the Keystore.
+            val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES)
+            generator.init(KEY_BITS)
+            val material = generator.generateKey()
+
+            keyStore.setEntry(
+                ENC_ALIAS,
+                KeyStore.SecretKeyEntry(material),
+                KeyProtection.Builder(KeyProperties.PURPOSE_ENCRYPT)
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .build()
+            )
+
+            val decryptProtection = KeyProtection.Builder(KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            bindToDeviceLock(decryptProtection)
+            keyStore.setEntry(DEC_ALIAS, KeyStore.SecretKeyEntry(material), decryptProtection.build())
+        }
+
+        if (imported.isFailure) {
+            Log.w(TAG, "This device refused the split keys; using one non-auth key", imported.exceptionOrNull())
+            runCatching { keyStore.deleteEntry(ENC_ALIAS) }
+            val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE)
+            val spec = KeyGenParameterSpec.Builder(
+                DEC_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(KEY_BITS)
+                .build()
+            generator.init(spec)
+            generator.generateKey()
+        }
+
+        prefs.edit().remove(KEY_KEYS_INVALIDATED).apply()
+    }
+
+    /** The key that seals a new phrase: the encrypt-only half, or the single fallback key. */
+    private fun encryptKey(): SecretKey =
+        key(ENC_ALIAS) ?: key(DEC_ALIAS) ?: throw IllegalStateException("no key to seal the seed with")
+
+    /**
+     * Puts the device-lock requirement on the decrypt key. The version check lives here, not
+     * in a helper, so it is obvious at the call site that the API 30 call is guarded.
+     */
+    private fun bindToDeviceLock(builder: KeyProtection.Builder) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        if (!isDeviceSecure()) return
+        builder.setUserAuthenticationRequired(true)
+        builder.setUserAuthenticationParameters(
+            AUTH_WINDOW_SECONDS,
+            KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG
         )
-            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-            .setKeySize(256)
-            .build()
-        generator.init(spec)
-        return generator.generateKey()
+    }
+
+    private fun isDeviceSecure(): Boolean {
+        val keyguard = appContext.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        return keyguard?.isDeviceSecure == true
     }
 
     companion object {
         private const val TAG = "PureWalletSecureStore"
         private const val NAME = "purewallet_secrets"
         private const val KEY_SEED = "seed_ciphertext"
+        private const val KEY_KEYS_INVALIDATED = "seed_keys_invalidated"
         private const val KEYSTORE = "AndroidKeyStore"
-        private const val KEY_ALIAS = "purewallet_seed_key"
+
+        /** The single key of builds up to 1.1.10; read once during an upgrade. */
+        private const val LEGACY_ALIAS = "purewallet_seed_key"
+
+        private const val ENC_ALIAS = "purewallet_seed_key_enc"
+        private const val DEC_ALIAS = "purewallet_seed_key_dec"
+
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val IV_BYTES = 12
         private const val TAG_BITS = 128
+        private const val KEY_BITS = 256
+
+        /**
+         * How long the decrypt key stays usable after the user proves it is them. Short
+         * enough that an app process picked up later cannot read the seed on its own, long
+         * enough that opening the wallet right after unlocking the phone asks nothing.
+         */
+        private const val AUTH_WINDOW_SECONDS = 60
     }
 }

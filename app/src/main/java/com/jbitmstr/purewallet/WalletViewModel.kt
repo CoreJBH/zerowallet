@@ -27,7 +27,10 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     /** The wallet is back on screen: bring the node back if it was frozen or failed. */
     fun onAppForeground() = manager.onAppForeground()
 
-    fun createWallet(wordCount: Int = 12): String = manager.createWallet(wordCount)
+    suspend fun createWallet(wordCount: Int = 12): String = manager.createWallet(wordCount)
+
+    /** Called after the device-lock prompt succeeded: opens the wallet and starts its node. */
+    fun unlockSeed() = manager.unlockSeed()
 
     suspend fun restoreWallet(mnemonic: String): Result<Unit> = manager.restoreWallet(mnemonic)
 

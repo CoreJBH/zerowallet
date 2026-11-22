@@ -3,10 +3,15 @@
     Cleartext stays off for the internet, and is allowed only for a node on this phone.
 
     The wallet talks https to every Esplora and price endpoint. The one plain-http case is a
-    personal Esplora instance or a local proxy bound to loopback (127.0.0.0/8, localhost),
-    where the traffic never leaves the device. `usesCleartextTraffic="false"` stays set on
-    the application; these domain rules are the only exception it makes, and they cover no
-    name that resolves off the device.
+    personal Esplora instance or a local proxy bound to loopback, where the traffic never
+    leaves the device. `usesCleartextTraffic="false"` stays set on the application; these
+    domain rules are the only exception it makes, and they cover no name that resolves off
+    the device.
+
+    This list is the pair EsploraUrl.CLEARTEXT_HOSTS accepts, and the two must stay equal.
+    A `domain` entry matches a host name, not an address block: 127.0.0.0/8 cannot be
+    written here, so a URL such as http://127.0.0.2:3002 is refused by the app instead of
+    being saved and then failing every request.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />

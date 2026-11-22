@@ -36,18 +36,46 @@ class EsploraUrlTest {
     }
 
     @Test
-    fun plainHttpIsAllowedForLoopbackHosts() {
+    fun plainHttpIsAllowedForTheTwoLoopbackHostsOnly() {
         assertTrue(EsploraUrl.isValid("http://127.0.0.1:3002"))
         assertTrue(EsploraUrl.isValid("http://localhost:5000/api"))
-        assertTrue(EsploraUrl.isValid("http://[::1]:3002"))
+        // The platform's network security config cannot express an address block, so the app
+        // refuses these instead of saving an endpoint whose every request would be blocked.
+        assertFalse(EsploraUrl.isValid("http://127.0.0.2:3002"))
+        assertFalse(EsploraUrl.isValid("http://127.5.6.7:3002"))
+        assertFalse(EsploraUrl.isValid("http://127.255.255.255/api"))
+        assertFalse(EsploraUrl.isValid("http://[::1]:3002"))
+        // https is still fine anywhere, loopback included.
+        assertTrue(EsploraUrl.isValid("https://127.0.0.1:3002"))
+        assertTrue(EsploraUrl.isValid("https://localhost/api"))
     }
 
     @Test
-    fun theWholeIpv4LoopbackRangeIsAllowed() {
-        assertTrue(EsploraUrl.isValid("http://127.0.0.1:3002"))
-        assertTrue(EsploraUrl.isValid("http://127.5.6.7:3002"))
-        assertTrue(EsploraUrl.isValid("http://127.255.255.255/api"))
-        assertTrue(EsploraUrl.isValid("http://127.0.0.2"))
+    fun theCleartextAllowlistIsTheOneTheNetworkSecurityConfigPermits() {
+        // A URL accepted here but not in the config saves fine and then fails every request;
+        // a config entry with no matching rule is dead weight. The two lists are compared
+        // rather than trusted to stay equal.
+        assertEquals(
+            cleartextHostsInNetworkSecurityConfig(),
+            EsploraUrl.CLEARTEXT_HOSTS
+        )
+    }
+
+    private fun cleartextHostsInNetworkSecurityConfig(): Set<String> {
+        val candidates = listOf(
+            java.io.File("src/main/res/xml/network_security_config.xml"),
+            java.io.File("app/src/main/res/xml/network_security_config.xml")
+        )
+        val file = candidates.firstOrNull { it.isFile }
+            ?: error("network_security_config.xml not found from ${java.io.File(".").absolutePath}")
+        val text = file.readText()
+        // Only the <domain-config> that permits cleartext takes domains.
+        val cleartextBlock = text.substringAfter("<domain-config cleartextTrafficPermitted=\"true\">")
+            .substringBefore("</domain-config>")
+        return Regex("<domain[^>]*>([^<]+)</domain>")
+            .findAll(cleartextBlock)
+            .map { it.groupValues[1].trim() }
+            .toSet()
     }
 
     @Test

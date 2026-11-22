@@ -7,26 +7,24 @@ import java.net.URI
  *
  * Everything the node reads about the chain (balances, history, fee estimates) comes from
  * this URL, so a custom endpoint is only accepted when it is an `https://` address. The
- * single exception is a host on the phone itself (`127.0.0.1`, `::1`, `localhost`), where
- * a personal Esplora instance or a local proxy usually speaks plain `http://` and the
- * traffic never leaves the device.
+ * single exception is a node on the phone itself, where a personal Esplora instance or a
+ * local proxy usually speaks plain `http://` and the traffic never leaves the device.
+ *
+ * That exception is exactly [CLEARTEXT_HOSTS], and it is the same list the platform's
+ * `res/xml/network_security_config.xml` permits cleartext for. The two have to agree: a URL
+ * this object accepts but the network security config refuses is a setting that saves and
+ * then fails every request, and a broader rule here (the whole 127.0.0.0/8 range, say) can
+ * never work in the config, whose `domain` entries match names, not address blocks.
  *
  * Deliberately free of Android APIs so the rules can be covered by plain JVM unit tests.
  */
 object EsploraUrl {
 
-    private val LOOPBACK_HOSTS = setOf("127.0.0.1", "::1", "[::1]", "localhost")
-
     /**
-     * Any address in 127.0.0.0/8, and nothing else.
-     *
-     * A prefix test such as `startsWith("127.")` also matches a host like
-     * `127.example.com`, which is an ordinary internet name: plain http to it would leave the
-     * phone. Each octet is checked as a number here, so only a genuine IPv4 loopback literal
-     * gets through.
+     * The only hosts plain `http://` is allowed for, and the only domains the network
+     * security config lets through in cleartext.
      */
-    private const val OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
-    private val IPV4_LOOPBACK = Regex("^127\\.$OCTET\\.$OCTET\\.$OCTET$")
+    val CLEARTEXT_HOSTS = setOf("127.0.0.1", "localhost")
 
     /**
      * Returns the normalized URL, or a [Result.failure] carrying a message that can be
@@ -59,8 +57,8 @@ object EsploraUrl {
             return failure("Remove the query string or fragment from the endpoint URL.")
         }
 
-        val loopback = host in LOOPBACK_HOSTS || IPV4_LOOPBACK.matches(host)
-        val allowed = scheme == "https" || (scheme == "http" && loopback)
+        // Exactly the two names the network security config allows: no CIDR, no lookalikes.
+        val allowed = scheme == "https" || (scheme == "http" && host in CLEARTEXT_HOSTS)
         if (!allowed) {
             return failure(
                 "Use an https:// endpoint. Plain http:// is only allowed for a node on this " +

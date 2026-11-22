@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.sp
 import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.QrCode
+import com.jbitmstr.purewallet.core.SensitiveClipboard
 import com.jbitmstr.purewallet.core.WalletState
 import com.jbitmstr.purewallet.ui.components.Banner
 import com.jbitmstr.purewallet.ui.components.GhostButton
@@ -42,9 +43,7 @@ import com.jbitmstr.purewallet.ui.components.SheetHeader
 import com.jbitmstr.purewallet.ui.components.WalletSheet
 import com.jbitmstr.purewallet.ui.components.WalletTextField
 import com.jbitmstr.purewallet.ui.theme.Pal
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import android.widget.Toast
 import kotlinx.coroutines.launch
 
 /**
@@ -67,7 +66,6 @@ fun ReceiveSheet(
     var error by remember { mutableStateOf<String?>(null) }
 
     val scope = rememberCoroutineScope()
-    val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
 
     fun reset() {
@@ -77,8 +75,10 @@ fun ReceiveSheet(
     }
 
     fun copy(value: String) {
-        clipboard.setText(androidx.compose.ui.text.AnnotatedString(value))
-        Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+        // A payment request is meant to be handed to another app, but until it is pasted it
+        // sits in the clipboard: mark it sensitive so Android does not draw it in the
+        // clipboard preview where anyone standing there can read it.
+        SensitiveClipboard.copy(context, value, "Copied", label = "ZeroWallet payment request")
     }
 
     WalletSheet(onDismiss = onClose) {

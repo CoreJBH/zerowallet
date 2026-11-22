@@ -2,7 +2,6 @@ package com.jbitmstr.purewallet.ui.sheets
 
 import android.content.Context
 import android.content.Intent
-import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -34,9 +33,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -49,7 +46,9 @@ import com.jbitmstr.purewallet.core.BackupTransfer
 import com.jbitmstr.purewallet.core.ChannelBackup
 import com.jbitmstr.purewallet.core.ChannelBackupExport
 import com.jbitmstr.purewallet.core.ChainNetwork
+import com.jbitmstr.purewallet.core.DeviceLockSettings
 import com.jbitmstr.purewallet.core.Fmt
+import com.jbitmstr.purewallet.core.SensitiveClipboard
 import com.jbitmstr.purewallet.core.WalletState
 import com.jbitmstr.purewallet.ui.components.Banner
 import com.jbitmstr.purewallet.ui.components.GhostButton
@@ -80,7 +79,6 @@ fun SettingsSheet(
     var backupNote by remember { mutableStateOf<String?>(null) }
     var backupError by remember { mutableStateOf<String?>(null) }
     var pendingRestore by remember { mutableStateOf<ByteArray?>(null) }
-    val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val transfer by BackupTransfer.state.collectAsStateWithLifecycle()
@@ -203,8 +201,7 @@ fun SettingsSheet(
                 GhostButton(
                     text = "Copy id",
                     onClick = {
-                        clipboard.setText(AnnotatedString(state.nodeId))
-                        Toast.makeText(context, "Node id copied", Toast.LENGTH_SHORT).show()
+                        SensitiveClipboard.copy(context, state.nodeId, "Node id copied")
                     },
                     modifier = Modifier.weight(1f),
                     enabled = state.nodeId.isNotEmpty()
@@ -369,15 +366,28 @@ fun SettingsSheet(
         Text(
             if (lockAvailable) {
                 "Sending funds, funding a channel and showing the recovery phrase always ask " +
-                    "for your fingerprint or screen lock before they go ahead."
+                    "for your fingerprint or screen lock before they go ahead. The recovery " +
+                    "phrase itself is sealed with a key in the Android Keystore that only " +
+                    "opens after you authenticate, so the screen is not the only thing in " +
+                    "the way: that is also why opening the wallet after Android closed the " +
+                    "app can ask for your screen lock even with lock-on-open off."
             } else {
-                "Without a screen lock on this phone the wallet cannot ask for authentication, " +
-                    "so those confirmations are skipped."
+                "This phone has no screen lock, so the wallet cannot confirm that it is you. " +
+                    "Sending, showing the recovery phrase and wiping are blocked until you set " +
+                    "one in Android settings. Receiving still works."
             },
             color = Pal.TextTertiary,
             fontSize = 11.sp,
             lineHeight = 15.sp
         )
+        if (!lockAvailable) {
+            Spacer(Modifier.height(10.dp))
+            GhostButton(
+                text = "Open Android security settings",
+                onClick = { DeviceLockSettings.open(context) },
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
         Spacer(Modifier.height(10.dp))
         SwitchRow(
             title = "Block screenshots",
@@ -629,10 +639,18 @@ private fun NetworkRow(network: ChainNetwork, selected: Boolean, onClick: () -> 
  * Hands the sealed backup to the Android share sheet, where Google Drive, Gmail and any other
  * app can take it. The bytes go to the app's own cache and leave it through a FileProvider
  * URI, so no storage permission is needed and nothing is world-readable.
+ *
+ * The cached copy is the sealed archive, and it is still a copy of the wallet's channel data
+ * sitting on disk. Only the file just shared is kept: every share replaces the previous one,
+ * and a wipe removes the directory (see NodeManager.wipeWallet).
  */
 private fun shareBackup(context: Context, export: ChannelBackupExport) {
-    val file = File(File(context.cacheDir, "backups"), export.fileName)
-    file.parentFile?.mkdirs()
+    val dir = File(context.cacheDir, "backups")
+    dir.mkdirs()
+    dir.listFiles()?.forEach { old ->
+        if (old.name != export.fileName) runCatching { old.delete() }
+    }
+    val file = File(dir, export.fileName)
     file.writeBytes(export.bytes)
     val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     val intent = Intent(Intent.ACTION_SEND).apply {
@@ -643,3 +661,4 @@ private fun shareBackup(context: Context, export: ChannelBackupExport) {
     }
     context.startActivity(Intent.createChooser(intent, "Share channel backup"))
 }
+

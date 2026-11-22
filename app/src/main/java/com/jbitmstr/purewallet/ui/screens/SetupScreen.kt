@@ -81,7 +81,9 @@ import kotlinx.coroutines.launch
 @Composable
 fun SetupScreen(
     unlockError: Boolean = false,
-    onCreate: (Int) -> Unit,
+    /** Why the stored wallet could not be opened, when [unlockError] is set. */
+    unlockMessage: String? = null,
+    onCreate: suspend (Int) -> Unit,
     onRestore: suspend (String) -> Result<Unit>
 ) {
     var mode by remember { mutableStateOf(if (unlockError) 1 else 0) }
@@ -93,6 +95,7 @@ fun SetupScreen(
     var jumpTick by remember { mutableStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
     var restoring by remember { mutableStateOf(false) }
+    var creating by remember { mutableStateOf(false) }
 
     val scope = rememberCoroutineScope()
 
@@ -161,7 +164,9 @@ fun SetupScreen(
                 Spacer(Modifier.height(24.dp))
                 Banner(
                     title = "Wallet locked",
-                    body = "This phone still holds a wallet, but its key could not unlock it. Restore the wallet with your recovery phrase instead of creating a new one."
+                    body = unlockMessage
+                        ?: "This phone still holds a wallet, but its key could not unlock it. " +
+                        "Restore the wallet with your recovery phrase instead of creating a new one."
                 )
             }
 
@@ -189,8 +194,9 @@ fun SetupScreen(
                 Banner(
                     title = if (createWordCount == 24) "One tap, 24 words" else "One tap, 12 words",
                     body = "The phrase is generated from the phone's secure random generator " +
-                        "(${if (createWordCount == 24) "256" else "128"} bits) and encrypted with a key in the " +
-                        "Android Keystore. You will see it once for backup."
+                        "(${if (createWordCount == 24) "256" else "128"} bits) and sealed with a key " +
+                        "in the Android Keystore that only opens after you authenticate. You " +
+                        "will see it once for backup."
                 )
                 Spacer(Modifier.height(16.dp))
                 SegmentedOptions(
@@ -199,7 +205,23 @@ fun SetupScreen(
                     onSelect = { createWordCount = if (it == 1) 24 else 12 }
                 )
                 Spacer(Modifier.height(20.dp))
-                PrimaryButton(text = "Create wallet", onClick = { onCreate(createWordCount) })
+                PrimaryButton(
+                    text = if (creating) "Creating" else "Create wallet",
+                    onClick = {
+                        scope.launch {
+                            // Generating the phrase and sealing it with a Keystore key takes
+                            // long enough to be felt, so the button waits instead of the
+                            // screen freezing.
+                            creating = true
+                            error = null
+                            runCatching { onCreate(createWordCount) }
+                                .onFailure { error = it.message ?: "Could not create the wallet" }
+                            creating = false
+                        }
+                    },
+                    enabled = !creating,
+                    loading = creating
+                )
             } else {
                 Text(
                     "Recovery phrase",

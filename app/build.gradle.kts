@@ -4,6 +4,52 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+/**
+ * Release signing, fail-closed.
+ *
+ * A release build is signed only with a real release key, supplied through Gradle
+ * properties or the environment:
+ *
+ *   ZEROWALLET_KEYSTORE          path to the .jks/.keystore
+ *   ZEROWALLET_KEYSTORE_PASSWORD store password
+ *   ZEROWALLET_KEY_ALIAS         key alias
+ *   ZEROWALLET_KEY_PASSWORD      key password
+ *
+ * With none of them set, `assembleRelease` produces an unsigned APK: it cannot be installed
+ * over an existing app, so nobody mistakes it for a shippable artifact. It is deliberately
+ * never signed with the debug key, which would make a build look installable while the
+ * update fails on every phone that already has the app (or, worse, gets accepted from a
+ * laptop instead of the release process). With only some of them set, the build stops here
+ * instead of quietly producing something that only looks right: a half-configured release
+ * key is a mistake to fix, not a state to build in.
+ */
+val releaseKeystorePath: String? =
+    (findProperty("ZEROWALLET_KEYSTORE") as String?)?.takeIf { it.isNotBlank() }
+        ?: System.getenv("ZEROWALLET_KEYSTORE")?.takeIf { it.isNotBlank() }
+val releaseKeystorePassword: String? =
+    (findProperty("ZEROWALLET_KEYSTORE_PASSWORD") as String?)?.takeIf { it.isNotBlank() }
+        ?: System.getenv("ZEROWALLET_KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() }
+val releaseKeyAlias: String? =
+    (findProperty("ZEROWALLET_KEY_ALIAS") as String?)?.takeIf { it.isNotBlank() }
+        ?: System.getenv("ZEROWALLET_KEY_ALIAS")?.takeIf { it.isNotBlank() }
+val releaseKeyPassword: String? =
+    (findProperty("ZEROWALLET_KEY_PASSWORD") as String?)?.takeIf { it.isNotBlank() }
+        ?: System.getenv("ZEROWALLET_KEY_PASSWORD")?.takeIf { it.isNotBlank() }
+
+val releaseSigningValues =
+    listOf(releaseKeystorePath, releaseKeystorePassword, releaseKeyAlias, releaseKeyPassword)
+val releaseSigningConfigured = releaseSigningValues.all { it != null }
+if (!releaseSigningConfigured && releaseSigningValues.any { it != null }) {
+    throw GradleException(
+        "Release signing is half configured. Set all of ZEROWALLET_KEYSTORE, " +
+            "ZEROWALLET_KEYSTORE_PASSWORD, ZEROWALLET_KEY_ALIAS and ZEROWALLET_KEY_PASSWORD " +
+            "(Gradle property or environment variable), or none of them for an unsigned build."
+    )
+}
+if (releaseSigningConfigured && !file(releaseKeystorePath!!).exists()) {
+    throw GradleException("ZEROWALLET_KEYSTORE points at ${releaseKeystorePath}, which does not exist.")
+}
+
 android {
     namespace = "com.jbitmstr.purewallet"
     compileSdk = 35
@@ -12,12 +58,23 @@ android {
         applicationId = "com.jbitmstr.purewallet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "1.1.10"
+        versionCode = 13
+        versionName = "1.1.11"
 
         ndk {
             // Phones are ARM; keeping the APK to the two ARM ABIs halves its size.
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+    }
+
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
         }
     }
 
@@ -34,6 +91,9 @@ android {
             // A release build must not expose the debug runtime to a connected adb shell or a
             // crash reporter that expects debuggable code.
             isDebuggable = false
+            // Null when no release key is configured, which leaves the APK unsigned rather
+            // than falling back to the debug key.
+            signingConfig = signingConfigs.findByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
