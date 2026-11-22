@@ -1,6 +1,7 @@
 package com.jbitmstr.purewallet
 
 import com.jbitmstr.purewallet.core.BackupManifest
+import com.jbitmstr.purewallet.core.ChannelBackup
 import com.jbitmstr.purewallet.core.ChannelBackupReview
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -42,8 +43,15 @@ class ChannelBackupReviewTest {
         manifest: BackupManifest = manifest(),
         networkId: String = "mainnet",
         currentNodeId: String = nodeId,
-        nowEpochSecs: Long = now
-    ) = ChannelBackupReview.review(manifest, networkId, currentNodeId, nowEpochSecs)
+        nowEpochSecs: Long = now,
+        formatVersion: Int? = ChannelBackup.FORMAT_VERSION
+    ) = ChannelBackupReview.review(
+        manifest,
+        networkId,
+        currentNodeId,
+        nowEpochSecs,
+        formatVersion
+    )
 
     @Test
     fun aBackupFromThisWalletOnThisChainMayBeRestored() {

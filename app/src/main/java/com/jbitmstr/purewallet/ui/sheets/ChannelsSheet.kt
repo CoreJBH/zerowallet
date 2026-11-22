@@ -35,6 +35,7 @@ import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.Authorization
 import com.jbitmstr.purewallet.core.ChannelRow
 import com.jbitmstr.purewallet.core.Fmt
+import com.jbitmstr.purewallet.core.PaymentInputParser
 import com.jbitmstr.purewallet.core.WalletState
 import com.jbitmstr.purewallet.ui.components.GhostButton
 import com.jbitmstr.purewallet.ui.components.Banner
@@ -69,6 +70,15 @@ fun ChannelsSheet(
     val scope = rememberCoroutineScope()
 
     fun openChannel() {
+        // Read and checked before the prompt, not after it. A peer URI the node cannot parse
+        // must not cost the user a fingerprint or a PIN first: the answer would be "that is
+        // not a peer" either way, and asking for the lock to arrive at it trains the user to
+        // authenticate for requests that were never going to be sent.
+        val peer = PaymentInputParser.parsePeer(peerUri)
+        if (peer == null) {
+            error = "Enter a peer as pubkey@host:port"
+            return
+        }
         val amount = Fmt.parseSats(amountText)
         if (amount == null) {
             error = "Enter a channel size in sats"
@@ -78,7 +88,7 @@ fun ChannelsSheet(
             scope.launch {
                 busy = true
                 error = null
-                vm.openChannel(peerUri.trim(), amount, 0L).onFailure {
+                vm.openChannel(peer.raw, amount, 0L).onFailure {
                     error = it.message ?: "Could not open the channel"
                 }
                 busy = false

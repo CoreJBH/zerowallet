@@ -124,6 +124,35 @@ class PaymentInputTest {
     }
 
     @Test
+    fun aRequiredParameterThisWalletDoesNotKnowIsRefused() {
+        // BIP-21's `req-` prefix says the payer has to understand the parameter. Ignoring it
+        // and paying the address would be paying a request that was not read: a future
+        // extension could change where the funds go.
+        val parsed = PaymentInputParser.parse(
+            "bitcoin:$mainnetBech32?amount=0.001&req-futurething=1"
+        )
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertNull(parsed.amountSats)
+        assertTrue(parsed.rejection.orEmpty().contains("req-futurething"))
+    }
+
+    @Test
+    fun aRequiredParameterIsRefusedEvenWithoutAnAmount() {
+        val parsed = PaymentInputParser.parse("bitcoin:$mainnetBech32?req-split=2")
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertTrue(parsed.rejection.orEmpty().contains("does not support"))
+    }
+
+    @Test
+    fun aParameterThatOnlyLooksLikeARequirementIsStillIgnored() {
+        // Only `req-` is reserved. `request=` is an ordinary parameter nobody defined, and it
+        // has always been ignored rather than treated as a condition.
+        val parsed = PaymentInputParser.parse("bitcoin:$mainnetBech32?amount=0.001&request=1")
+        assertEquals(PaymentInputKind.ONCHAIN, parsed.kind)
+        assertEquals(100_000L, parsed.amountSats)
+    }
+
+    @Test
     fun aSingleAmountWithOtherParametersIsStillPaid() {
         val parsed = PaymentInputParser.parse(
             "bitcoin:$mainnetBech32?label=Coffee&amount=0.001&message=One"
@@ -224,6 +253,28 @@ class PaymentInputTest {
         val fromOffer = PaymentInputParser.parseLightningValue(offer)
         assertEquals(PaymentInputKind.BOLT12_OFFER, fromOffer?.kind)
         assertEquals(offer, fromOffer?.bolt12Offer)
+    }
+
+    @Test
+    fun twoLightningParametersAreRefused() {
+        // Two invoices in one QR is the same ambiguity as two amounts: another wallet can
+        // settle the other one, and the payer would never know which was paid.
+        val other = "lnbc10u1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4js"
+        val parsed = PaymentInputParser.parse(
+            "bitcoin:$mainnetBech32?amount=0.001&lightning=$bolt11&lightning=$other"
+        )
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertNull(parsed.lightning)
+        assertTrue(parsed.rejection.orEmpty().contains("more than one Lightning request"))
+    }
+
+    @Test
+    fun theSameLightningParameterTwiceIsAlsoRefused() {
+        val parsed = PaymentInputParser.parse(
+            "bitcoin:$mainnetBech32?lightning=$bolt11&lightning=$bolt11"
+        )
+        assertEquals(PaymentInputKind.UNKNOWN, parsed.kind)
+        assertTrue(parsed.rejection != null)
     }
 
     @Test

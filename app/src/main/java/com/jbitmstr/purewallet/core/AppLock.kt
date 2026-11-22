@@ -37,7 +37,9 @@ import androidx.lifecycle.LifecycleEventObserver
  *
  * Prompt state is lifecycle-driven, never a one-way flag. Every request replaces any
  * earlier attempt, and a request made while the activity is not resumed waits for the
- * next resume, so backgrounding the app can never leave Unlock unresponsive.
+ * next resume, so backgrounding the app can never leave Unlock unresponsive. A request that
+ * arrives in front of one already waiting is answered false rather than dropped: only one
+ * prompt can be shown, and the screen that asked first is still busy waiting for its answer.
  *
  * Every request is answered exactly once. A prompt that the system dismisses without a
  * result, one this class supersedes, and one thrown away with the screen all report false
@@ -51,7 +53,15 @@ class AppLock(private val activity: FragmentActivity) {
     private val executor = ContextCompat.getMainExecutor(activity)
     private var prompt: BiometricPrompt? = null
     private var attempt = 0
-    private var pending: Pending? = null
+
+    /**
+     * A request that arrived while the screen was away, waiting for the next resume.
+     *
+     * Only one can wait, and a second one must not drop the first on the floor: the caller of
+     * a held request is still waiting for an answer while its button stays busy, and it would
+     * never get one. [HeldRequest] answers the displaced request with a no.
+     */
+    private val held = HeldRequest<Pending>()
 
     /** The caller of the prompt that is (or is about to be) on screen, until it is answered. */
     private val awaiting = PendingAuth()
@@ -70,8 +80,7 @@ class AppLock(private val activity: FragmentActivity) {
                 if (flow.onHostStopped()) supersede()
             }
             Lifecycle.Event.ON_RESUME -> {
-                val queued = pending
-                pending = null
+                val queued = held.take()
                 if (queued != null) start(queued.title, queued.subtitle, queued.onResult)
             }
             else -> Unit
@@ -118,7 +127,11 @@ class AppLock(private val activity: FragmentActivity) {
         }
 
         if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-            pending = Pending(title, subtitle, onResult)
+            // Queued for the next resume. A request that was already queued is answered first:
+            // only one prompt can be shown, and its caller is waiting with its screen busy.
+            held.replace(Pending(title, subtitle, onResult)) { displaced ->
+                displaced.onResult(false)
+            }
             return
         }
         start(title, subtitle, onResult)
@@ -133,9 +146,8 @@ class AppLock(private val activity: FragmentActivity) {
      */
     fun dispose() {
         activity.lifecycle.removeObserver(observer)
-        val held = pending
-        pending = null
-        held?.onResult?.invoke(false)
+        // A request held for the next resume is not going to get one.
+        held.clear { queued -> queued.onResult(false) }
         supersede()
     }
 
@@ -185,7 +197,7 @@ class AppLock(private val activity: FragmentActivity) {
         val callback = object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                 if (token != attempt) return
-                pending = null
+                held.clear { queued -> queued.onResult(false) }
                 flow.finish()
                 prompt = null
                 awaiting.settle()
@@ -199,7 +211,7 @@ class AppLock(private val activity: FragmentActivity) {
                     show(DEVICE_CREDENTIAL, title, subtitle, null, token, onResult)
                     return
                 }
-                pending = null
+                held.clear { queued -> queued.onResult(false) }
                 flow.finish()
                 prompt = null
                 awaiting.settle()
@@ -224,7 +236,7 @@ class AppLock(private val activity: FragmentActivity) {
             active.authenticate(info.build())
         } catch (t: Throwable) {
             if (token == attempt) {
-                pending = null
+                held.clear { queued -> queued.onResult(false) }
                 flow.finish()
                 prompt = null
                 awaiting.settle()

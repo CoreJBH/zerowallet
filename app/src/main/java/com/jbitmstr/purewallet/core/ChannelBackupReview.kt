@@ -48,12 +48,15 @@ object ChannelBackupReview {
      * @param networkId the chain the wallet is on now.
      * @param nodeId this wallet's node id, or blank when the node has not run here yet.
      * @param nowEpochSecs the current time, so the age is testable.
+     * @param formatVersion the file's own format ([ChannelBackup.formatOf]), or null when the
+     *   caller did not read it; an older one is called out with what to do about it.
      */
     fun review(
         manifest: BackupManifest,
         networkId: String,
         nodeId: String,
-        nowEpochSecs: Long
+        nowEpochSecs: Long,
+        formatVersion: Int? = null
     ): BackupReview {
         val problems = ArrayList<String>()
         val warnings = ArrayList<String>()
@@ -91,6 +94,14 @@ object ChannelBackupReview {
                 "than the latest one every time a payment moves. Restoring an older state makes " +
                 "the phone force-close channels that changed since: the funds come back after a " +
                 "timelock, minus the closing fee, and an old enough state can cost a penalty."
+        }
+
+        val olderFormat = formatVersion?.takeIf { it < ChannelBackup.FORMAT_VERSION }
+        if (olderFormat != null) {
+            warnings += "This backup was written in an older format (v$olderFormat), so the key " +
+                "that opens it comes from a weaker derivation than this wallet uses now. It " +
+                "restores the same way, but save a new channel backup right after the restore " +
+                "so the file you keep is the current format."
         }
 
         if (manifest.channelCount <= 0) {

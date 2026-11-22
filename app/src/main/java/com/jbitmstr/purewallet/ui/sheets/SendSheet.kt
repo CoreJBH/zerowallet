@@ -178,7 +178,12 @@ fun SendSheet(
         }
     }
 
-    fun dispatch(current: ResolvedTarget, amount: Long?) {
+    fun dispatch(current: ResolvedTarget, amount: Long?, confirmedRate: Long? = feeRate) {
+        // The rate the payment was reviewed at, not the one the gate happens to hold now: a
+        // re-read (another priority, a retry, a slow estimate landing) replaces `feeRate`
+        // while the confirmation is open, and signing with that would send at a rate the user
+        // never saw on the dialog they pressed.
+        val rateToSign = confirmedRate
         // The sheet is busy from here on: the prompt is part of sending, and a second tap
         // while it is up must not start a second one.
         busy = true
@@ -200,7 +205,7 @@ fun SendSheet(
                 // what it says even if the switch somehow ended up on.
                 val sendAllApplies = current.allowsSendAll && !lightningRoute
                 if (sendAllApplies && sendAll && isOnchainSend(current)) {
-                    val rate = feeRate
+                    val rate = rateToSign
                     if (rate == null) {
                         error = "The fee estimate has not arrived yet. Wait a moment, then try again."
                         busy = false
@@ -219,7 +224,7 @@ fun SendSheet(
                     // The rate shown when the payment was confirmed is the rate it is signed
                     // with: it is passed through rather than read again before signing, and
                     // an on-chain send without one is refused instead of paying a fallback.
-                    vm.pay(current, amount, viaLightning, feeRate)
+                    vm.pay(current, amount, viaLightning, rateToSign)
                 }.onSuccess { reference = it }.onFailure {
                     error = it.message ?: "The payment could not be sent"
                 }
@@ -588,7 +593,9 @@ fun SendSheet(
                 TextButton(onClick = {
                     val confirmed = pending
                     highFee = null
-                    dispatch(confirmed.target, confirmed.amount)
+                    // The confirmation carries the rate it was drawn for; anything newer on
+                    // the screen belongs to a later estimate that the user has not seen.
+                    dispatch(confirmed.target, confirmed.amount, confirmed.rateSatPerVb)
                 }) {
                     Text("Send anyway", color = Pal.Danger)
                 }

@@ -39,17 +39,23 @@ import javax.crypto.spec.GCMParameterSpec
  * is ever written with a weaker key to get around that, and the caller learns the difference
  * between "authenticate and retry" and "this phone cannot seal at all".
  *
- * The one fallback that remains is for a phone that *cannot* bind: no screen lock, or a
- * Keystore that refuses the bound key. There the key is still generated inside the Keystore
- * and never leaves it, but it opens without the device lock. That is reported as
- * [SeedProtection.UNBOUND] with the reason, shown on the home screen and in Settings - it is
- * a state the user is told about, not one to be assumed away.
+ * The one fallback that remains is for a phone that *cannot* bind: no screen lock at all.
+ * There the key is still generated inside the Keystore and never leaves it, but it opens
+ * without the device lock. That is reported as [SeedProtection.UNBOUND] with the reason,
+ * shown on the home screen and in Settings - it is a state the user is told about, not one to
+ * be assumed away. A phone that *has* a lock but whose Keystore refuses the bound key is
+ * different: nothing is generated, and the caller is told the phrase was not stored
+ * ([KeyBindingRefused]) rather than being handed an unbound key as if it were the real
+ * thing.
  *
  * Lock changes: the Keystore invalidates a bound key when the secure lock screen is removed
  * or reset (a normal PIN change keeps it usable, and enrolling a new fingerprint does not
  * invalidate it - see [KEY_ALIAS]'s spec). [readSeed] reports that as
  * [SeedRead.Invalidated] instead of a vague failure, so the app can say what happened and
- * send the user to the recovery phrase rather than silently losing the wallet.
+ * send the user to the recovery phrase rather than silently losing the wallet. A seal, and
+ * [canSeal], replace such a key instead: they run when a phrase is in hand (a create or a
+ * restore), the dead key can no longer open anything, and a check that only ever asked for
+ * the device lock would block a restore on this phone forever.
  *
  * Nothing in this class is logged in a release build. The failures it warns about carry
  * Keystore aliases and crypto stack traces, which is help while building and a description
@@ -122,7 +128,11 @@ class SecureStore(context: Context) {
      * authenticate first.
      */
     fun saveSeed(mnemonic: String): SeedSeal {
-        val key = keyForSeal() ?: return SeedSeal.Failed(KEY_FAILURE)
+        val key = try {
+            keyForSeal() ?: return SeedSeal.Failed(KEY_FAILURE)
+        } catch (refused: KeyBindingRefused) {
+            return SeedSeal.Failed(refused.message)
+        }
 
         when (val first = attemptSeal(key, mnemonic)) {
             SealAttempt.Sealed -> Unit
@@ -131,12 +141,10 @@ class SecureStore(context: Context) {
             SealAttempt.Invalidated -> {
                 // The key died with the phone's previous lock. The phrase is in hand here, so
                 // a fresh key can be made for it - which is what a restore does anyway.
-                if (BuildConfig.DEBUG) Log.w(TAG, "The wallet key was invalidated; making a new one")
                 val replaced = try {
-                    regenerate()
-                } catch (t: Exception) {
-                    if (BuildConfig.DEBUG) Log.e(TAG, "Could not replace the invalidated key", t)
-                    null
+                    replaceInvalidatedKey()
+                } catch (refused: KeyBindingRefused) {
+                    return SeedSeal.Failed(refused.message)
                 } ?: return SeedSeal.Failed(KEY_FAILURE)
                 when (val second = attemptSeal(replaced, mnemonic)) {
                     SealAttempt.Sealed -> Unit
@@ -166,22 +174,33 @@ class SecureStore(context: Context) {
      * place, and only then destroys anything.
      */
     fun canSeal(): SeedSeal {
-        val key = keyForSeal() ?: return SeedSeal.Failed(KEY_FAILURE)
-        return try {
-            val cipher = Cipher.getInstance(TRANSFORMATION)
-            cipher.init(Cipher.ENCRYPT_MODE, key)
-            // Encrypted and thrown away: the point is whether the Keystore will use the key,
-            // not what comes out.
-            cipher.doFinal(PROBE.toByteArray(Charsets.UTF_8))
-            SeedSeal.Sealed
-        } catch (e: UserNotAuthenticatedException) {
-            SeedSeal.NeedsAuthentication
-        } catch (e: KeyPermanentlyInvalidatedException) {
-            // Replacing the key is part of the next save, which is what this check is about.
-            SeedSeal.NeedsAuthentication
-        } catch (e: Exception) {
-            if (BuildConfig.DEBUG) Log.e(TAG, "The seal check failed", e)
-            SeedSeal.Failed(e.message)
+        val key = try {
+            keyForSeal() ?: return SeedSeal.Failed(KEY_FAILURE)
+        } catch (refused: KeyBindingRefused) {
+            return SeedSeal.Failed(refused.message)
+        }
+        return when (val first = probe(key)) {
+            SealProbe.Ready -> SeedSeal.Sealed
+            SealProbe.NeedsAuthentication -> SeedSeal.NeedsAuthentication
+            is SealProbe.Failed -> SeedSeal.Failed(first.detail)
+            SealProbe.Invalidated -> {
+                // A key that died with the phone's previous lock can never open anything
+                // again, so replacing it costs nothing that is still readable - and without
+                // the replacement a restore would be blocked on this phone for good, since
+                // the check would keep answering "authenticate" to a prompt that cannot
+                // bring a permanently invalid key back.
+                val replaced = try {
+                    replaceInvalidatedKey()
+                } catch (refused: KeyBindingRefused) {
+                    return SeedSeal.Failed(refused.message)
+                } ?: return SeedSeal.Failed(KEY_FAILURE)
+                when (val second = probe(replaced)) {
+                    SealProbe.Ready -> SeedSeal.Sealed
+                    SealProbe.NeedsAuthentication -> SeedSeal.NeedsAuthentication
+                    is SealProbe.Failed -> SeedSeal.Failed(second.detail)
+                    SealProbe.Invalidated -> SeedSeal.Failed(KEY_FAILURE)
+                }
+            }
         }
     }
 
@@ -318,6 +337,29 @@ class SecureStore(context: Context) {
         data class Failed(val detail: String?) : SealAttempt()
     }
 
+    /** One attempt to use [key] and throw the result away. */
+    private sealed class SealProbe {
+        object Ready : SealProbe()
+        object NeedsAuthentication : SealProbe()
+        object Invalidated : SealProbe()
+        data class Failed(val detail: String?) : SealProbe()
+    }
+
+    /** Encrypts and discards: the question is whether the Keystore will use [key] at all. */
+    private fun probe(key: SecretKey): SealProbe = try {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.ENCRYPT_MODE, key)
+        cipher.doFinal(PROBE.toByteArray(Charsets.UTF_8))
+        SealProbe.Ready
+    } catch (e: UserNotAuthenticatedException) {
+        SealProbe.NeedsAuthentication
+    } catch (e: KeyPermanentlyInvalidatedException) {
+        SealProbe.Invalidated
+    } catch (e: Exception) {
+        if (BuildConfig.DEBUG) Log.e(TAG, "The seal check failed", e)
+        SealProbe.Failed(e.message)
+    }
+
     private fun attemptSeal(key: SecretKey, mnemonic: String): SealAttempt = try {
         sealWith(key, mnemonic)
         SealAttempt.Sealed
@@ -330,12 +372,39 @@ class SecureStore(context: Context) {
         SealAttempt.Failed(e.message)
     }
 
-    /** The current key, created if this phone has none yet; null when the Keystore refuses. */
+    /**
+     * The current key, created if this phone has none yet; null when the Keystore refuses.
+     *
+     * A key that died with the phone's previous screen lock is replaced here rather than
+     * reported, because every caller of this is holding (or checking) a phrase to seal: the
+     * old key cannot open anything any more, and a new one is what lets the wallet exist on
+     * this phone at all.
+     */
     private fun keyForSeal(): SecretKey? = try {
         currentKey(create = true)
+    } catch (e: KeyPermanentlyInvalidatedException) {
+        replaceInvalidatedKey()
+    } catch (refused: KeyBindingRefused) {
+        // Carried out to the caller, which says why in words instead of "no key".
+        throw refused
     } catch (e: Exception) {
         if (BuildConfig.DEBUG) Log.e(TAG, "No key to seal the phrase with", e)
         null
+    }
+
+    /** Throws away a key the phone's old lock killed and makes a new one; null on failure. */
+    private fun replaceInvalidatedKey(): SecretKey? {
+        if (BuildConfig.DEBUG) {
+            Log.w(TAG, "The wallet key died with the phone's previous lock; making a new one")
+        }
+        return try {
+            regenerate()
+        } catch (refused: KeyBindingRefused) {
+            throw refused
+        } catch (t: Exception) {
+            if (BuildConfig.DEBUG) Log.e(TAG, "Could not replace the invalidated key", t)
+            null
+        }
     }
 
     private fun readPayload(): ByteArray? {
@@ -433,10 +502,15 @@ class SecureStore(context: Context) {
      * as it is made: it is never a `ByteArray` this process can hold, unlike the imported key
      * pair this build replaces.
      *
-     * The key is bound to the device lock where the phone has one. If the phone has no screen
-     * lock there is nothing to bind to; if the Keystore refuses the bound key, an unbound key
-     * is generated instead so the wallet still works. Both cases are recorded and reported as
-     * [SeedProtection.UNBOUND] with the reason, which is what the home screen and Settings show.
+     * The key is bound to the device lock where the phone has one. A phone with no screen lock
+     * has nothing to bind to, so its key is generated unbound and reported as
+     * [SeedProtection.UNBOUND] with the reason - a state the user is told about.
+     *
+     * A Keystore that *refuses* the bound key on a phone that does have a lock is different:
+     * sealing with an unbound key there would be a silent downgrade of exactly the protection
+     * this class exists to provide, under a lock the user believes is required. That is
+     * fail-closed - nothing is generated, [KeyBindingRefused] is thrown, and the caller says
+     * the phrase was not stored rather than storing it more weakly.
      */
     private fun generate(): SecretKey {
         val store = keyStore()
@@ -448,17 +522,16 @@ class SecureStore(context: Context) {
             return generateKey(authBound = false)
         }
 
-        val bound = runCatching { generateKey(authBound = true) }
-        bound.exceptionOrNull()?.let { failure ->
+        return try {
+            generateKey(authBound = true)
+        } catch (t: Exception) {
             if (BuildConfig.DEBUG) {
-                Log.w(TAG, "This Keystore refused a key bound to the screen lock", failure)
+                Log.e(TAG, "This Keystore refused a key bound to the screen lock", t)
             }
-            // Not silent: the status the Settings sheet and the home banner read says this
-            // wallet's key is not bound to the lock, and why.
-            prefs.edit().putString(KEY_UNBOUND_REASON, SeedStorage.REASON_GENERATE_REFUSED).apply()
+            // No key is left behind, and nothing weaker is made in its place.
             runCatching { store.deleteEntry(KEY_ALIAS) }
+            throw KeyBindingRefused(t)
         }
-        return bound.getOrElse { generateKey(authBound = false) }
     }
 
     private fun generateKey(authBound: Boolean): SecretKey {
@@ -544,6 +617,12 @@ class SecureStore(context: Context) {
         /** Said whenever the Keystore will not give this app a key at all. */
         private const val KEY_FAILURE = "This phone's Keystore would not create the wallet key"
 
+        /** Said when it will create one, but not one the phone's screen lock protects. */
+        internal const val KEY_BINDING_REFUSED =
+            "This phone's Keystore refused to create a wallet key tied to the screen lock, so " +
+                "nothing was stored. A wallet key that opened without your lock would be a " +
+                "weaker copy of what this app promises, so it is not used as a stand-in."
+
         /**
          * How long the key stays usable after the user proves it is them. Short enough that
          * an app process picked up later cannot read the seed on its own, long enough that
@@ -564,4 +643,16 @@ class SecureStore(context: Context) {
  */
 class SeedSealRequired : Exception(
     "Authenticate to let this phone's Keystore seal the recovery phrase"
+)
+
+/**
+ * The Keystore will make a key, but not one the phone's screen lock protects.
+ *
+ * Thrown instead of generating an unbound key for a phone that has a lock: sealing there would
+ * quietly deliver less protection than the app says it does. The message is written for the
+ * user, because it is what the setup screen shows when nothing could be stored.
+ */
+class KeyBindingRefused(cause: Throwable?) : Exception(
+    SecureStore.KEY_BINDING_REFUSED,
+    cause
 )

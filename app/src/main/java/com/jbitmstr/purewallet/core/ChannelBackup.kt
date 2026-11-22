@@ -211,6 +211,18 @@ object ChannelBackup {
     }
 
     /**
+     * The format a backup file was written in, or null when it is not one this build opens.
+     *
+     * The restore confirmation uses it to say when a file came from an older format: the key
+     * that protects it was derived more cheaply than this build derives one, so the file is
+     * worth replacing with a fresh backup once it has been restored.
+     */
+    fun formatOf(bytes: ByteArray): Int? {
+        if (!looksLikeBackup(bytes)) return null
+        return bytes[4].toInt() and 0xFF
+    }
+
+    /**
      * AES-256 key for a phrase.
      *
      * Format 3 (current): PBKDF2-HMAC-SHA256 over the normalized words, with the file's own

@@ -25,7 +25,11 @@ import javax.crypto.spec.GCMParameterSpec
  * yet".
  *
  * Values carry a [PREFIX] marker so a plain-text value written by an older build is still
- * readable and is replaced by a sealed one the next time it is saved.
+ * readable until the one-time migration has run, and is replaced by a sealed one the next
+ * time it is saved. Once that migration is complete the caller says so ([open]'s
+ * `allowPlainText`), and a value without the marker is refused instead of handed back: a
+ * plain-text record can only be one this build did not write, and returning it would fill the
+ * screen with whatever a tampered or corrupted preference file happens to hold.
  *
  * [seal] never falls back to the value it was given: a Keystore that refuses to seal returns
  * null, and the caller writes nothing (see `Prefs.saveCachedWallet` and
@@ -58,11 +62,23 @@ object SecretStore {
     }.getOrNull()
 
     /**
-     * Opens a value written by [seal]. A value without the marker is returned as it is: it
-     * was written before this build and is replaced on the next save.
+     * Opens a value written by [seal].
+     *
+     * A value without the marker was written before this build sealed its records. It is
+     * returned while [allowPlainText] is true - the one upgrade in which those values are
+     * still the user's own history - and refused once the caller's one-time migration has
+     * finished, because from then on nothing this app writes lacks the marker.
      */
-    fun open(stored: String): String? {
-        if (!stored.startsWith(PREFIX)) return stored
+    fun open(stored: String, allowPlainText: Boolean = false): String? {
+        if (!isSealed(stored)) {
+            if (!allowPlainText) {
+                if (BuildConfig.DEBUG) {
+                    Log.w(TAG, "A stored value has no seal marker and was refused")
+                }
+                return null
+            }
+            return stored
+        }
         val payload = runCatching {
             Base64.decode(stored.substring(PREFIX.length), Base64.NO_WRAP)
         }.getOrNull() ?: return null
@@ -79,6 +95,9 @@ object SecretStore {
             if (BuildConfig.DEBUG) Log.w(TAG, "Unable to open a stored value", it)
         }.getOrNull()
     }
+
+    /** True when [value] was written by [seal] rather than by a build before it. */
+    fun isSealed(value: String): Boolean = value.startsWith(PREFIX)
 
     /** Deletes the data key, for a wipe: the ciphertext goes with the preferences. */
     fun deleteKey() {

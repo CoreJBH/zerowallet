@@ -165,6 +165,16 @@ data class ResolvedTarget(
     val amountSats: Long?,
     val amountEditable: Boolean,
     /**
+     * The amount the request names in millisatoshis, when it names one.
+     *
+     * Lightning invoices are allowed to price in thousandths of a satoshi, and 1000.9 sats
+     * truncated to 1000 is a different payment: comparing the truncated figure with a BIP-21
+     * `amount=` could call two halves of one QR "the same" when they are not, and the send
+     * screen would show a total the invoice does not ask for. The exact value is kept for
+     * every check; [amountSats] stays the figure the screen displays.
+     */
+    val amountMsats: Long? = null,
+    /**
      * The Lightning request carried by the same BIP-21 QR as [input], when this wallet can
      * pay it over Lightning. Paying it this way keeps the on-chain address as the fallback
      * the sender offered; the caller decides which route to take.
@@ -443,7 +453,16 @@ class NodeManager(context: Context) {
             bootstrapped = true
         }
         prefs.migrateLegacyEsploraDefault()
+        // Records an older build wrote in plain text are re-sealed once, here, while nothing
+        // is reading them; after that a plain value is refused rather than shown.
+        runCatching { prefs.migratePlainTextValues() }
+        runCatching { notes.migratePlainTextNotes() }
         val network = prefs.network
+        // A store left one rename away by an interrupted channel-backup import is put back
+        // before anything reads the chain's directory. The start path does the same under the
+        // node lock; doing it here as well means the state the screen shows first already
+        // matches the wallet it will open.
+        recoverNodeDirs(network)
         // A node the user stopped stays stopped even after Android killed the process.
         lifecycle.restoreManualStop(prefs.nodeStoppedByUser)
 
@@ -547,6 +566,7 @@ class NodeManager(context: Context) {
             openedSeed = generated
             val created = walletEpoch.incrementAndGet()
             prefs.seedBackedUp = false
+            prefs.forgetNodeIdentity()
             prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
             // A new wallet starts with nothing; an older snapshot must not show through, on
             // this chain or on any other one it was left under.
@@ -600,6 +620,7 @@ class NodeManager(context: Context) {
                 // the one this phrase replaces.
                 walletEpoch.incrementAndGet()
                 prefs.seedBackedUp = true
+                prefs.forgetNodeIdentity()
                 prefs.walletCreatedAtEpochSecs = System.currentTimeMillis() / 1000L
                 // The phrase may belong to another wallet than the one this snapshot was taken from,
                 // and that is true of every chain's snapshot, not only the active one.
@@ -686,6 +707,9 @@ class NodeManager(context: Context) {
                     ?: throw IllegalStateException("This device has no recovery phrase to seal a backup with")
                 val network = prefs.network
                 val wasRunning = node != null
+                // Read before the node is stopped: the manifest has to name the wallet and its
+                // channels even when this session never had the node up.
+                val (manifestNodeId, manifestChannels) = backupIdentity(network)
                 _state.update { it.copy(busy = "Packing channel backup") }
                 try {
                     stopNodeLocked(keepState = true)
@@ -696,8 +720,8 @@ class NodeManager(context: Context) {
                     val manifest = BackupManifest(
                         network = network.id,
                         createdAtEpochSecs = System.currentTimeMillis() / 1000L,
-                        nodeId = _state.value.nodeId,
-                        channelCount = _state.value.channels.size,
+                        nodeId = manifestNodeId,
+                        channelCount = manifestChannels,
                         appVersion = BuildConfig.VERSION_NAME,
                         wordCount = Bip39.wordCount(mnemonic)
                     )
@@ -760,8 +784,11 @@ class NodeManager(context: Context) {
                 ChannelBackupReview.review(
                     manifest = payload.manifest,
                     networkId = prefs.network.id,
-                    nodeId = _state.value.nodeId,
-                    nowEpochSecs = System.currentTimeMillis() / 1000L
+                    // The live id, or the one this device last ran with: a backup opened while
+                    // the node is stopped still has a wallet to be compared against.
+                    nodeId = _state.value.nodeId.ifBlank { prefs.lastNodeId(prefs.network) },
+                    nowEpochSecs = System.currentTimeMillis() / 1000L,
+                    formatVersion = ChannelBackup.formatOf(bytes)
                 )
             } finally {
                 payload.files.forEach { it.bytes.fill(0) }
@@ -809,8 +836,9 @@ class NodeManager(context: Context) {
                 val review = ChannelBackupReview.review(
                     manifest = payload.manifest,
                     networkId = prefs.network.id,
-                    nodeId = _state.value.nodeId,
-                    nowEpochSecs = System.currentTimeMillis() / 1000L
+                    nodeId = _state.value.nodeId.ifBlank { prefs.lastNodeId(prefs.network) },
+                    nowEpochSecs = System.currentTimeMillis() / 1000L,
+                    formatVersion = ChannelBackup.formatOf(bytes)
                 )
                 if (!review.canRestore) {
                     payload.files.forEach { it.bytes.fill(0) }
@@ -820,8 +848,10 @@ class NodeManager(context: Context) {
                 stopNodeLocked(keepState = false)
                 val dir = networkDir(network)
                 val stamp = System.currentTimeMillis()
-                val incoming = File(appContext.filesDir, "ldk-node/incoming-$stamp").apply { mkdirs() }
-                val previous = File(appContext.filesDir, "ldk-node/previous-$stamp")
+                // The chain is in the name, so a start on any chain can tell which store the
+                // folders belong to (see [NodeDirs]).
+                val incoming = File(ldkRoot(), NodeDirs.incoming(network.id, stamp)).apply { mkdirs() }
+                val previous = File(ldkRoot(), NodeDirs.previous(network.id, stamp))
                 try {
                     try {
                         ChannelBackup.writeFiles(incoming, payload.files)
@@ -903,6 +933,11 @@ class NodeManager(context: Context) {
 
             val network = prefs.network
             val savedEsplora = prefs.esploraUrl(network)
+            // Before anything is built: a store left one rename away by an interrupted import
+            // is put back, and the fragments of an import that never reached the swap are
+            // cleared. Creating an empty directory here would hide the real store from the
+            // node, which would then start as a wallet with no channels.
+            recoverNodeDirs(network)
             val dir = networkDir(network).apply { mkdirs() }
             val logFile = NodeLog.file(appContext).apply { parentFile?.mkdirs() }
             // Keep the on-device log bounded. The node is stopped here, so the file is
@@ -922,6 +957,12 @@ class NodeManager(context: Context) {
 
             val status = runCatching { built.status() }.getOrNull()
             val listening = runCatching { built.listeningAddresses() }.getOrNull()
+            // Kept for a channel backup exported while this node is stopped (see [backupIdentity]).
+            prefs.recordNodeIdentity(
+                network,
+                runCatching { built.nodeId() }.getOrDefault(""),
+                -1
+            )
             _state.update {
                 it.copy(
                     network = network,
@@ -1348,26 +1389,45 @@ class NodeManager(context: Context) {
     fun setEsploraUrl(url: String?): Result<Unit> {
         val network = prefs.network
         val before = prefs.esploraUrl(network)
+        // Which wallet this change belongs to. The restart is queued behind the node lock, and
+        // a phrase that is replaced while it waits (a restore, a wipe) must not be started
+        // again from here: the new wallet has its own start.
+        val requestedAt = walletEpoch.get()
         val result = prefs.setEsploraUrl(network, url)
         result.onSuccess {
             val after = prefs.esploraUrl(network)
             _state.update { it.copy(esploraUrl = after) }
-            val seed = seedOrNull()
-            val running = node != null && !_state.value.starting
-            if (esploraChangeNeedsRestart(before, after, running, seed != null)) {
-                _messages.tryEmit("Esplora endpoint saved. Restarting the node to use it…")
-                scope.launch {
-                    nodeMutex.withLock {
-                        startNodeLocked(seed!!)
-                    }
-                    if (_state.value.running) {
-                        _messages.tryEmit("Esplora endpoint saved and in use")
+            // This used to read the Keystore on the caller's thread - the settings sheet's,
+            // which is the main one - to decide about a restart, and then take the node lock
+            // to do it. Both belong on the IO dispatcher, under the same lock, so a stop, a
+            // wipe or a restore cannot pull the node out from under the restart.
+            scope.launch {
+                val message = nodeMutex.withLock {
+                    val seed = seedOrNull()
+                    val replacing = requestedAt != walletEpoch.get()
+                    val running = node != null && !_state.value.starting
+                    when {
+                        replacing -> {
+                            // The wallet was replaced while this waited. Its store and its
+                            // phrase are the new wallet's, which is started elsewhere.
+                            "Esplora endpoint saved. It is used the next time the node starts."
+                        }
+                        esploraChangeNeedsRestart(before, after, running, seed != null) -> {
+                            _messages.tryEmit("Esplora endpoint saved. Restarting the node to use it…")
+                            startNodeLocked(seed!!)
+                            if (_state.value.running) {
+                                "Esplora endpoint saved and in use"
+                            } else {
+                                "Esplora endpoint saved. The node could not restart on it yet; " +
+                                    "it is used when the node starts."
+                            }
+                        }
+                        before != after ->
+                            "Esplora endpoint saved. It is used the next time the node starts."
+                        else -> "Esplora endpoint saved."
                     }
                 }
-            } else if (before != after) {
-                _messages.tryEmit("Esplora endpoint saved. It is used the next time the node starts.")
-            } else {
-                _messages.tryEmit("Esplora endpoint saved.")
+                _messages.tryEmit(message)
             }
         }.onFailure { failure ->
             _messages.tryEmit(failure.message ?: "That endpoint could not be saved.")
@@ -1461,6 +1521,11 @@ class NodeManager(context: Context) {
                     running = true,
                     error = null
                 )
+            }
+            if (_state.value.nodeId != prefs.lastNodeId(network) ||
+                _state.value.channels.size != prefs.lastKnownChannelCount(network)
+            ) {
+                prefs.recordNodeIdentity(network, _state.value.nodeId, _state.value.channels.size)
             }
             if (balances != null) {
                 // Real numbers from a sync: they are what the next open shows while it waits.
@@ -1556,12 +1621,13 @@ class NodeManager(context: Context) {
                     is Bolt11InvoiceDescription.Direct -> d.description
                     is Bolt11InvoiceDescription.Hash -> ""
                 }
-                val amountSats = invoice.amountMilliSatoshis()?.toLong()?.let { it / 1000L }
+                val amountMsats = invoice.amountMilliSatoshis()?.toLong()
                 ResolvedTarget(
                     input = input.copy(bolt11 = raw),
                     description = description,
-                    amountSats = amountSats,
-                    amountEditable = amountSats == null
+                    amountSats = amountMsats?.let { it / 1000L },
+                    amountEditable = amountMsats == null,
+                    amountMsats = amountMsats
                 )
             }
             PaymentInputKind.BOLT12_OFFER -> {
@@ -1580,8 +1646,8 @@ class NodeManager(context: Context) {
                 if (offer.isExpired()) {
                     throw IllegalArgumentException("This offer has expired")
                 }
-                val fixed = when (val amount = offer.amount()) {
-                    is OfferAmount.Bitcoin -> amount.amountMsats.toLong() / 1000L
+                val fixedMsats = when (val amount = offer.amount()) {
+                    is OfferAmount.Bitcoin -> amount.amountMsats.toLong()
                     is OfferAmount.Currency -> throw IllegalArgumentException(
                         "This offer is priced in ${amount.iso4217Code} and cannot be paid from here"
                     )
@@ -1590,8 +1656,9 @@ class NodeManager(context: Context) {
                 ResolvedTarget(
                     input = input.copy(bolt12Offer = raw),
                     description = offer.offerDescription() ?: "",
-                    amountSats = fixed,
-                    amountEditable = fixed == null
+                    amountSats = fixedMsats?.let { it / 1000L },
+                    amountEditable = fixedMsats == null,
+                    amountMsats = fixedMsats
                 )
             }
             PaymentInputKind.BOLT12_INVOICE -> {
@@ -1611,11 +1678,13 @@ class NodeManager(context: Context) {
                 if (invoice.isExpired()) {
                     throw IllegalArgumentException("This invoice has expired")
                 }
+                val invoiceMsats = invoice.amountMsats().toLong()
                 ResolvedTarget(
                     input = input.copy(bolt12Invoice = raw),
                     description = invoice.invoiceDescription() ?: "",
-                    amountSats = invoice.amountMsats().toLong() / 1000L,
-                    amountEditable = false
+                    amountSats = invoiceMsats / 1000L,
+                    amountEditable = false,
+                    amountMsats = invoiceMsats
                 )
             }
             else -> throw IllegalArgumentException("Unrecognized payment request")
@@ -1648,10 +1717,11 @@ class NodeManager(context: Context) {
             ?.let { PaymentInputParser.parseLightningValue(it) }
             ?.let { parsed -> runCatching { resolveLightning(n, parsed) }.getOrNull() }
         // Two halves that disagree on the amount are not the same payment: the on-chain
-        // amount is the one the sender wrote on the QR, so that route is used instead.
+        // amount is the one the sender wrote on the QR, so that route is used instead. The
+        // invoice's own millisatoshis are compared, not the sats the screen rounds them to.
         val agreed = when {
             lightning == null -> null
-            onchainSats != null && lightning.amountSats != null && lightning.amountSats != onchainSats -> null
+            !lightningAgreesWithOnchain(onchainSats, lightning.amountMsats) -> null
             else -> lightning
         }
         val routable = agreed != null && hasLightningOutbound(agreed.amountSats ?: onchainSats)
@@ -1909,6 +1979,51 @@ class NodeManager(context: Context) {
     private fun networkDir(network: ChainNetwork): File =
         File(appContext.filesDir, "ldk-node/${network.id}")
 
+    /**
+     * Puts a store back when a channel-backup import was interrupted, and clears what an
+     * import that never reached the swap left behind.
+     *
+     * The import's own rollback covers a failure it lives through; a process killed between
+     * the two renames does not. In that state this chain's directory is missing while its
+     * whole store sits in `previous-<chain>-<stamp>`, and starting the node would quietly
+     * make an empty one instead - a wallet that looks wiped with its funds still on disk. The
+     * newest displaced store is renamed back, and every `incoming-` fragment (a backup that
+     * was being written when the process died) is deleted: it was never the wallet.
+     */
+    private fun recoverNodeDirs(network: ChainNetwork) {
+        val root = ldkRoot()
+        val dir = networkDir(network)
+        val folders = root.list()?.filter { File(root, it).isDirectory }.orEmpty()
+        if (!dir.exists()) {
+            val previous = NodeDirs.newestPrevious(folders, network.id)?.let { File(root, it) }
+            if (previous != null && previous.renameTo(dir)) {
+                if (BuildConfig.DEBUG) {
+                    Log.w(TAG, "Put ${previous.name} back as ${dir.name} after an interrupted import")
+                }
+            }
+        }
+        folders.filter { NodeDirs.isIncoming(it, network.id) }.forEach { name ->
+            runCatching { File(root, name).deleteRecursively() }
+        }
+    }
+
+    /**
+     * The wallet identity a channel backup manifest should carry.
+     *
+     * A backup can be exported while the node is stopped - the store is on disk and is still
+     * the thing worth saving - and the live state then has no node id at all. The last identity
+     * this device recorded stands in for it, so the file names the wallet it came from instead
+     * of leaving the one field that stops it being restored elsewhere empty.
+     */
+    private fun backupIdentity(network: ChainNetwork): Pair<String, Int> {
+        val live = _state.value
+        return if (live.nodeId.isNotBlank()) {
+            live.nodeId to live.channels.size
+        } else {
+            prefs.lastNodeId(network) to prefs.lastKnownChannelCount(network)
+        }
+    }
+
     /** Everything ldk-node writes under `files/`: every chain's store and import leftovers. */
     private fun ldkRoot(): File = File(appContext.filesDir, "ldk-node")
 
@@ -2059,6 +2174,20 @@ internal fun esploraChangeNeedsRestart(
  */
 internal fun estimatedSendRate(priority: FeePriority, rates: FeeRates?): Long? =
     rates?.let { priority.satPerVb(it) }
+
+/**
+ * Whether a BIP-21 on-chain amount and the invoice beside it name the same payment.
+ *
+ * The comparison is in millisatoshis because that is the precision an invoice has: a
+ * 1,000.9-sat invoice is not a 1,000-sat `amount=`, and paying the on-chain half while the
+ * Lightning half was meant would send a different sum than the QR asked for. A side that
+ * names no amount agrees with anything, as there is nothing to disagree about.
+ */
+internal fun lightningAgreesWithOnchain(onchainSats: Long?, lightningMsats: Long?): Boolean =
+    when {
+        onchainSats == null || lightningMsats == null -> true
+        else -> onchainSats * 1000L == lightningMsats
+    }
 
 /** A node that came up, and the chain source it came up on. */
 private class StartedNode(val node: Node, val esploraUrl: String)

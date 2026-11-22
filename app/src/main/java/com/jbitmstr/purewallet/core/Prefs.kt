@@ -11,8 +11,10 @@ import com.jbitmstr.purewallet.BuildConfig
  * The seed phrase never goes in here; it lives in [SecureStore]. The snapshot's amounts and
  * history are sealed with [SecretStore] before they are written: a balance and the list of
  * who was paid are the wallet's business even on a device where another app can read this
- * file, and they carry a `v1:` marker once sealed. A value written before that (no marker)
- * is still read, and is replaced by a sealed one the next time the snapshot is saved.
+ * file, and they carry a `v1:` marker once sealed. A value written before that (no marker) is
+ * still read until [migratePlainTextValues] has re-sealed it, and is replaced by a sealed one
+ * the next time the snapshot is saved. After that one-time migration a plain value is refused
+ * rather than displayed.
  *
  * The sealing is fail-closed: when the Keystore cannot seal a value, [saveCachedWallet]
  * writes nothing rather than the plain text. The previous snapshot stays as it was.
@@ -23,7 +25,7 @@ import com.jbitmstr.purewallet.BuildConfig
 class Prefs internal constructor(
     private val prefs: SharedPreferences,
     private val seal: (String) -> String?,
-    private val unseal: (String) -> String?
+    private val unseal: (String, Boolean) -> String?
 ) {
 
     constructor(context: Context) : this(
@@ -86,6 +88,40 @@ class Prefs internal constructor(
             .putLong(KEY_CHANNEL_BACKUP_AT, epochSecs)
             .putInt(KEY_CHANNEL_BACKUP_CHANNELS, channels)
             .apply()
+    }
+
+    /**
+     * The node id this wallet last ran under on [network], and how many channels it had then.
+     *
+     * A channel backup can be exported while the node is stopped - the store is on disk and
+     * still the thing worth saving - and the live state has no node id or channel list at that
+     * moment. A manifest with neither would name no wallet (so the same file could be restored
+     * into a different one) and would read as an empty set. Only the id and a count are kept:
+     * both are already public, and neither says anything about a payment. Kept per chain, so a
+     * snapshot never carries the other chain's node id.
+     */
+    fun lastNodeId(network: ChainNetwork): String =
+        prefs.getString(KEY_LAST_NODE_ID + network.id, null).orEmpty()
+
+    fun lastKnownChannelCount(network: ChainNetwork): Int =
+        prefs.getInt(KEY_LAST_CHANNEL_COUNT + network.id, 0)
+
+    /** Records what the node reported. A negative [channelCount] leaves the count as it was. */
+    fun recordNodeIdentity(network: ChainNetwork, nodeId: String, channelCount: Int) {
+        val editor = prefs.edit()
+        if (nodeId.isNotBlank()) editor.putString(KEY_LAST_NODE_ID + network.id, nodeId)
+        if (channelCount >= 0) editor.putInt(KEY_LAST_CHANNEL_COUNT + network.id, channelCount)
+        editor.apply()
+    }
+
+    /** A new phrase is a different wallet: the identity of the old one does not carry over. */
+    fun forgetNodeIdentity() {
+        val editor = prefs.edit()
+        ChainNetwork.entries.forEach { network ->
+            editor.remove(KEY_LAST_NODE_ID + network.id)
+            editor.remove(KEY_LAST_CHANNEL_COUNT + network.id)
+        }
+        editor.apply()
     }
 
     /**
@@ -230,6 +266,9 @@ class Prefs internal constructor(
         KEY_CACHE_PAYMENTS + network.id
     )
 
+    /** The keys that hold sealed values; [KEY_CACHE_SAVED] is a timestamp this class writes. */
+    private fun valueKeys(network: ChainNetwork): List<String> = cacheKeys(network).drop(1)
+
     /**
      * One-time cleanup for the 1.1.4 default.
      *
@@ -248,6 +287,43 @@ class Prefs internal constructor(
             prefs.edit().remove(key).apply()
         }
         prefs.edit().putBoolean(KEY_ESPLORA_MIGRATED, true).apply()
+    }
+
+    /**
+     * Re-seals the snapshot values an older build wrote in plain text, once.
+     *
+     * Up to 1.1.10 the balance and height were stored as plain numbers; the values that follow
+     * them are sealed strings. Reading plain values is allowed only until this has run: they
+     * are the user's own history during the upgrade, and afterwards a value this app did not
+     * seal is not something to put on the wallet's screen. A value that cannot be sealed right
+     * now leaves the marker unwritten, so the next start tries again instead of dropping the
+     * history.
+     */
+    fun migratePlainTextValues() {
+        if (prefs.getBoolean(KEY_PLAIN_TEXT_MIGRATED, false)) return
+        val editor = prefs.edit()
+        var clean = true
+        ChainNetwork.entries.forEach { network ->
+            valueKeys(network).forEach { recordKey ->
+                val raw = runCatching { prefs.all[recordKey] }.getOrNull() ?: return@forEach
+                val text = when (raw) {
+                    is String -> raw
+                    is Long -> raw.toString()
+                    is Int -> raw.toString()
+                    else -> {
+                        // Not a value this class ever wrote; a snapshot without it would read
+                        // as zero anyway, so it goes rather than being kept as a mystery.
+                        editor.remove(recordKey)
+                        return@forEach
+                    }
+                }
+                if (SecretStore.isSealed(text)) return@forEach
+                val resealed = seal(text)
+                if (resealed != null) editor.putString(recordKey, resealed) else clean = false
+            }
+        }
+        if (clean) editor.putBoolean(KEY_PLAIN_TEXT_MIGRATED, true)
+        editor.apply()
     }
 
     fun clear() {
@@ -269,7 +345,7 @@ class Prefs internal constructor(
             is Int -> raw.toString()
             else -> null
         } ?: return null
-        return unseal(stored)
+        return unseal(stored, !prefs.getBoolean(KEY_PLAIN_TEXT_MIGRATED, false))
     }
 
     companion object {
@@ -284,9 +360,12 @@ class Prefs internal constructor(
         private const val KEY_CHANNEL_BACKUP_AT = "channel_backup_at"
         private const val KEY_CHANNEL_BACKUP_CHANNELS = "channel_backup_channels"
         private const val KEY_NODE_STOPPED = "node_stopped_by_user"
+        private const val KEY_LAST_NODE_ID = "last_node_id"
+        private const val KEY_LAST_CHANNEL_COUNT = "last_channel_count"
         private const val KEY_ESPLORA = "esplora_url_"
         private const val KEY_ESPLORA_WORKING = "esplora_working_"
         private const val KEY_ESPLORA_MIGRATED = "esplora_default_migrated_1_1_5"
+        private const val KEY_PLAIN_TEXT_MIGRATED = "plain_values_migrated_1_1_18"
         private const val KEY_CACHE_SAVED = "cache_saved_at_"
         private const val KEY_CACHE_ONCHAIN = "cache_onchain_"
         private const val KEY_CACHE_SPENDABLE = "cache_spendable_"

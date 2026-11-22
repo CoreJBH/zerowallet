@@ -233,6 +233,9 @@ object PaymentInputParser {
     /** Decimals in one bitcoin: a satoshi is the smallest amount an invoice can name. */
     private const val SATS_DECIMALS = 8
 
+    /** The BIP-21 prefix for a parameter a wallet has to understand to pay at all. */
+    private const val REQUIRED_PREFIX = "req-"
+
     /**
      * Shortest string this wallet treats as BOLT12. A real offer carries a 33-byte signing
      * key, a description and a signature, so it is several hundred characters; this is only
@@ -250,6 +253,7 @@ object PaymentInputParser {
         var message: String? = null
         var lightning: String? = null
         var amountSeen = false
+        var lightningSeen = false
 
         if (query.isNotEmpty()) {
             for (pair in query.split('&')) {
@@ -272,7 +276,22 @@ object PaymentInputParser {
                     }
                     "label" -> label = value.ifBlank { null }
                     "message" -> message = value.ifBlank { null }
-                    "lightning" -> lightning = value.ifBlank { null }
+                    "lightning" -> {
+                        // Same reasoning as the amount: two Lightning requests in one code is
+                        // not a request this wallet can pay without guessing which one the
+                        // receiver meant, and a wallet that guessed differently would settle
+                        // a different payment than the QR was read as.
+                        if (lightningSeen) return duplicateLightning(text)
+                        lightningSeen = true
+                        lightning = value.ifBlank { null }
+                    }
+                    else -> {
+                        // BIP-21 says a `req-` parameter is required: a wallet that does not
+                        // understand it must refuse the whole request rather than pay the
+                        // part it recognises. A future extension could change where the funds
+                        // go, so ignoring it would be paying a request that was not read.
+                        if (key.startsWith(REQUIRED_PREFIX)) return unsupportedRequirement(text, key)
+                    }
                 }
             }
         }
@@ -296,6 +315,26 @@ object PaymentInputParser {
         raw = text,
         rejection = "This payment request carries more than one amount. Wallets read that " +
             "differently, so it is not paid here. Ask for a new QR or a Lightning invoice."
+    )
+
+    private fun duplicateLightning(text: String) = PaymentInput(
+        kind = PaymentInputKind.UNKNOWN,
+        raw = text,
+        rejection = "This payment request carries more than one Lightning request. Wallets " +
+            "read that differently, so it is not paid here. Ask for a new QR code or a plain " +
+            "Lightning invoice."
+    )
+
+    /**
+     * A `req-` parameter this wallet does not implement. BIP-21 makes it a condition of paying,
+     * so the request is refused whole rather than paid with the extension dropped.
+     */
+    private fun unsupportedRequirement(text: String, key: String) = PaymentInput(
+        kind = PaymentInputKind.UNKNOWN,
+        raw = text,
+        rejection = "This payment request requires something this wallet does not support " +
+            "(${key.take(24)}). BIP-21 says such a request must not be paid without it, so it " +
+            "is refused here - ask for a plain address or a Lightning invoice."
     )
 
     /**

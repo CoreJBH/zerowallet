@@ -1,7 +1,10 @@
 package com.jbitmstr.purewallet
 
+import com.jbitmstr.purewallet.core.HeldRequest
 import com.jbitmstr.purewallet.core.LockFlow
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -86,5 +89,72 @@ class LockFlowTest {
         assertTrue(flow.showsSystemCredential)
         // A host stop between the two prompts must not cancel the credential screen.
         assertFalse(flow.onHostStopped())
+    }
+
+    // -------------------------------------------------- a request held for the next resume
+
+    /** One held request: what it was asked for, and whether it has been answered. */
+    private class Asked(val reason: String) {
+        var answered: Boolean? = null
+    }
+
+    @Test
+    fun aHeldRequestIsAnsweredWhenAnotherOneArrivesInFrontOfIt() {
+        // The tenth review: a second request used to overwrite the first, whose caller stayed
+        // busy waiting for a prompt that would never open.
+        val first = Asked("send")
+        val second = Asked("settings")
+        val held = HeldRequest<Asked>()
+
+        assertFalse(held.replace(first) { it.answered = false })
+        assertTrue(held.isWaiting)
+        assertTrue("the displaced request is told", held.replace(second) { it.answered = false })
+        assertEquals(false, first.answered)
+        assertNull("and the new one is still waiting for its turn", second.answered)
+    }
+
+    @Test
+    fun theRequestThatReachesTheResumeIsTheOneThatStarts() {
+        val first = Asked("send")
+        val held = HeldRequest<Asked>()
+        held.replace(first) { it.answered = false }
+
+        assertEquals(first, held.take())
+        assertFalse(held.isWaiting)
+        // Taking it answers nothing: it is about to be asked.
+        assertNull(first.answered)
+        assertNull(held.take())
+    }
+
+    @Test
+    fun disposingAnswersTheHeldRequestRatherThanDroppingIt() {
+        val held = Asked("send")
+        val queue = HeldRequest<Asked>()
+        queue.replace(held) { it.answered = false }
+
+        assertTrue(queue.clear { it.answered = false })
+        assertEquals(false, held.answered)
+        assertFalse(queue.clear { it.answered = false })
+    }
+
+    @Test
+    fun nothingHeldIsNotAnAnswer() {
+        val queue = HeldRequest<Asked>()
+        assertFalse(queue.isWaiting)
+        assertNull(queue.take())
+        assertFalse(queue.replace(Asked("send")) { })
+    }
+
+    @Test
+    fun aHeldRequestFromAnEarlierRoundIsAnsweredOnce() {
+        val first = Asked("send")
+        val second = Asked("settings")
+        val queue = HeldRequest<Asked>()
+        queue.replace(first) { it.answered = false }
+        queue.replace(second) { it.answered = false }
+        queue.clear { it.answered = false }
+
+        assertEquals(false, first.answered)
+        assertEquals(false, second.answered)
     }
 }

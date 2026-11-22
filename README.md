@@ -164,19 +164,26 @@ so a reinstall needs the previous build removed first.
   even with lock-on-open off; the prompt is the same one. A wallet written by 1.1.16 or
   earlier is opened with whichever key sealed it and moved onto this key the first time it is
   opened after an authentication.
-- **When the key cannot be bound, the wallet says so.** A phone with no screen lock, a
-  Keystore that refuses the bound key, or a wallet sealed before the lock existed leaves the
-  phrase sealed with a key that opens without the device lock. That state is read back from
-  the Keystore entry itself (not from a flag written at creation) and shown in Settings as
-  "Recovery phrase key: not bound to the screen lock", with what it means and what would fix
-  it. The same warning is on the home screen, where the wallet is actually opened, so the
-  state cannot pass unnoticed by anyone who never opens Settings. The screen-based checks on
-  sending, showing the phrase and wiping still apply, and this is now visible instead of
-  being a silent downgrade.
-- **A screen-lock change is reported, not hidden.** Removing or resetting the phone's lock
-  invalidates that key by design, and the ciphertext cannot be opened by anything on the
-  device afterwards. The wallet says exactly that and sends the user to restore with the
-  recovery phrase instead of showing a generic error or a blank setup screen.
+- **A phone without a screen lock is the only phone that gets an unbound key, and it is told
+  so.** With no lock there is nothing to bind to; the key is still generated inside the
+  Keystore, and the state is read back from the Keystore entry itself (not from a flag written
+  at creation) and shown in Settings as "Recovery phrase key: not bound to the screen lock",
+  with what it means and what would fix it. The same warning is on the home screen, where the
+  wallet is actually opened, so the state cannot pass unnoticed by anyone who never opens
+  Settings. A wallet sealed before the lock existed is reported the same way, and the
+  screen-based checks on sending, showing the phrase and wiping still apply.
+- **A phone that has a lock but refuses to bind the key does not get a weaker wallet.** Up to
+  1.1.17 that case fell back to an unbound key, which is a silent downgrade under a lock the
+  user believes is required. It now fails closed: no key is left behind, nothing is sealed,
+  and the setup screen says the phrase was not stored instead of storing it more weakly.
+- **A screen-lock change is reported, not hidden - and the dead key does not block a
+  restore.** Removing or resetting the phone's lock invalidates that key by design, and the
+  ciphertext cannot be opened by anything on the device afterwards. The wallet says exactly
+  that and sends the user to restore with the recovery phrase instead of showing a generic
+  error or a blank setup screen. The restore itself then replaces the invalidated key: a key
+  the old lock killed can never open anything again, so deleting it and generating a new one
+  costs nothing that was still readable, and a check that only ever answered "authenticate"
+  would have kept that phone from restoring a wallet at all.
 - **Optional lock on open.** Off by default, a switch in Settings makes the app ask every
   time it opens and after coming back from the background. The prompt is lifecycle-driven:
   it restarts cleanly on resume, so the Unlock button cannot go dead after backgrounding.
@@ -219,12 +226,19 @@ so a reinstall needs the previous build removed first.
   non-exportable Keystore key (`v1:` prefixed in the preferences file). That key is not bound
   to the lock: those records are needed the instant the wallet opens and can be rebuilt by
   syncing, so a lost key costs a sync rather than funds. A value written by an older build is
-  still read and is re-sealed on the next save. The sealing is fail-closed: a Keystore that
-  refuses to seal means the snapshot or the note is not written at all, rather than written
-  in plain text - the previous sealed snapshot stays, and the payment still goes through.
-- **A clipboard that does not show what it holds.** Copying an invoice, offer, address or
-  node id marks the clip with `EXTRA_IS_SENSITIVE` on Android 13+, so the system does not
-  draw it in the clipboard preview where anyone nearby can read it before it is pasted.
+  still read and is re-sealed on the next save; the app also runs that migration once at
+  start, and after it a value without the `v1:` marker is refused rather than shown - from
+  then on nothing this app writes lacks it, so a plain value is a tampered or corrupted file,
+  not history. The sealing is fail-closed: a Keystore that refuses to seal means the snapshot
+  or the note is not written at all, rather than written in plain text - the previous sealed
+  snapshot stays, and the payment still goes through.
+- **A clipboard that does not show what it holds, and does not keep it.** Copying an invoice,
+  offer, address or node id marks the clip with `EXTRA_IS_SENSITIVE` on Android 13+, so the
+  system does not draw it in the clipboard preview where anyone nearby can read it before it
+  is pasted. Two minutes later the app takes the copy back itself, on every version it
+  supports: a wallet address left on the clipboard is what a clipboard-swapping app changes
+  between the copy and the paste, and waiting for the platform's own clean-up is hours too
+  long. Something else the user copied in the meantime is left alone.
 - **HTTPS-only chain source, with one address that cannot be spoofed.** A custom Esplora
   endpoint must be `https://`; plain `http://` is accepted only for `127.0.0.1` and
   `localhost`, the two names the platform's network security config permits cleartext for.
@@ -343,8 +357,9 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
 - `core/AppLock.kt` wraps `BiometricPrompt` with the screen-lock fallback and exposes the
   availability check the UI uses to explain the setting on phones without a lock; without a
   lock the sensitive actions are refused rather than let through.
-- `core/SensitiveClipboard.kt` copies a request or address with `EXTRA_IS_SENSITIVE`, so the
-  system clipboard preview does not show it.
+- `core/SensitiveClipboard.kt` copies a request or address with `EXTRA_IS_SENSITIVE` so the
+  system clipboard preview does not show it, and clears that copy after two minutes; the
+  decision of whether the clip is still the app's own lives in `shouldClear`.
 - `core/ScreenSecurity.kt` applies `FLAG_SECURE` to the wallet window.
 - `core/EsploraUrl.kt` holds the endpoint rules; `core/Prefs.kt` refuses to store anything
   that fails them.
@@ -370,8 +385,12 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   safer to write: the store is the whole channel state or nothing, and a restore replaces it
   in place. The restore confirmation therefore opens the file first and shows the date it was
   made, how old that is, the chain, the channel count and the wallet's node id, refuses a file
-  from another chain or another wallet, and asks the user to acknowledge that an older state
-  force-closes the channels that moved before the Restore button becomes available. Settings
+  from another chain or another wallet, asks the user to acknowledge that an older state
+  force-closes the channels that moved before the Restore button becomes available, and names
+  a file written in an older backup format (v1 or v2, whose key is derived more cheaply) with
+  the advice to save a fresh backup once it has been restored. A restore interrupted between
+  moving the old store aside and putting the new one in place is put back on the next start,
+  so an interrupted import cannot leave a wallet that opens empty with its store on disk. Settings
   also shows how old the last backup from this phone is, because a snapshot nobody refreshed
   is the one that costs a force-close. Keep channel amounts small. Restoring a backup replaces the node data in place and
   keeps it: if the node cannot start afterwards because the chain source is unreachable, the
@@ -385,7 +404,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.17`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.18`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -420,7 +439,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 317 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate and unreadable BIP-21 amounts, the authorization gate that runs a privileged action only on a reported success, an abandoned prompt answering its caller, the per-chain RGS URL, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate, the recommended-fee parser refusing a reply with a missing or non-numeric field instead of inventing 1 sat/vB, the send sheet's fee read as a state that ends in Retry, the BIP-21 amount URI of the on-chain receive tab, the three generations of stored seed file and what each says about its protection, the rule that the seed key is generated in the Keystore rather than imported, and the restore confirmation's refusals and stale-backup warning |
+| Unit tests | `./gradlew testDebugUnitTest` | 367 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate and unreadable BIP-21 amounts, the authorization gate that runs a privileged action only on a reported success, an abandoned prompt answering its caller, the per-chain RGS URL, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate, the recommended-fee parser refusing a reply with a missing or non-numeric field instead of inventing 1 sat/vB, the send sheet's fee read as a state that ends in Retry, the BIP-21 amount URI of the on-chain receive tab, the three generations of stored seed file and what each says about its protection, the rule that the seed key is generated in the Keystore rather than imported, the restore confirmation's refusals and stale-backup warning, the refusal of a `req-` BIP-21 parameter and of a second `lightning=` key, exact millisatoshi agreement between the two halves of a QR, the folder names an interrupted channel-backup import leaves and which one comes back, the plain-record migration and its once-only marker, the displaced app-lock request being answered instead of dropped, the clipboard clear rule, and the restore review naming an older backup format |
 | Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
 | Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
