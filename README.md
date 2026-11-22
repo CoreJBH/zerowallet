@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/preview.jpg" width="340" alt="ZeroWallet home screen on an Android phone: Lightning and on-chain balances, Scan / Send / Receive / Channels, empty payment history">
+  <img src="docs/preview.jpg" width="340" alt="ZeroWallet home screen on an Android phone: Lightning and on-chain balances, Scan / Send / Receive / Channels, and recent payments">
 </p>
 
 ZeroWallet is a native Android wallet (Kotlin + Jetpack Compose) built around
