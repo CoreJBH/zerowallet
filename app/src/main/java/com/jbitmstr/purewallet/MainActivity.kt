@@ -50,7 +50,9 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
-        BackupTransfer.unbind(this)
+        // A rotation is not the end of the backup: the picker result comes back to the new
+        // instance, which needs the export that was prepared for it.
+        BackupTransfer.unbind(this, activityRecreating = isChangingConfigurations)
         super.onDestroy()
     }
 }

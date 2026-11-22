@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -54,6 +55,7 @@ import kotlinx.coroutines.launch
 fun ReceiveSheet(
     vm: WalletViewModel,
     state: WalletState,
+    backgrounded: Int,
     onBackup: () -> Unit,
     onClose: () -> Unit
 ) {
@@ -64,6 +66,17 @@ fun ReceiveSheet(
     var qrContent by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+
+    // A request that was on screen is not left there for the next person to hold the phone:
+    // leaving the app drops it, and it is one tap to make a new one.
+    LaunchedEffect(backgrounded) {
+        if (backgrounded == 0) return@LaunchedEffect
+        amountText = ""
+        description = ""
+        result = null
+        qrContent = null
+        error = null
+    }
 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -101,7 +114,18 @@ fun ReceiveSheet(
         SegmentedOptions(
             options = listOf("Lightning", "Offer", "On-chain"),
             selected = tab,
-            onSelect = { tab = it; reset() }
+            onSelect = { selected ->
+                if (selected != tab) {
+                    // A different tab is a different request. The amount and description
+                    // typed for an invoice used to stay in their fields while their inputs
+                    // were hidden, and an on-chain tab then packed that amount into the QR
+                    // (`?amount=`) without it being entered for that address at all.
+                    amountText = ""
+                    description = ""
+                }
+                tab = selected
+                reset()
+            }
         )
 
         Spacer(Modifier.height(20.dp))

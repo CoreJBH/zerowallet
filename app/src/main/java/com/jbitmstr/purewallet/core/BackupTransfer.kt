@@ -39,12 +39,31 @@ object BackupTransfer {
      */
     const val MAX_BACKUP_BYTES = ChannelBackup.MAX_BACKUP_BYTES
 
+    /**
+     * How long a prepared export waits for its picker result. Long enough for a person to
+     * choose a folder in Google Drive, short enough that an export whose result never came
+     * back does not sit in memory for the life of the process.
+     */
+    private const val PENDING_EXPORT_TTL_MS = 10L * 60L * 1000L
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var host: Activity? = null
     private var saveLauncher: ((String) -> Unit)? = null
     private var openLauncher: (() -> Unit)? = null
+
+    /**
+     * The seal a pending "save as" dialog will write, and when it was prepared.
+     *
+     * It outlives the activity on purpose: a rotation destroys and recreates the activity while
+     * the picker is open, and androidx hands the picker's result to the new instance. Dropping
+     * this in [unbind] left the save with nothing to write, so the file was never created and
+     * the user saw a cancelled dialog for a backup that had already been prepared. A sealed
+     * archive is not secret to the app, and it is dropped on a result, a cancel, or after
+     * [PENDING_EXPORT_TTL_MS].
+     */
     private var pendingExport: ChannelBackupExport? = null
+    private var pendingExportAt: Long = 0L
 
     private val _state = MutableStateFlow(BackupTransferState())
     val state: StateFlow<BackupTransferState> = _state.asStateFlow()
@@ -56,13 +75,21 @@ object BackupTransfer {
         openLauncher = open
     }
 
-    /** Called when that activity goes away, so nothing holds it. */
-    fun unbind(activity: Activity) {
-        if (host === activity) {
-            host = null
-            saveLauncher = null
-            openLauncher = null
+    /**
+     * Called when that activity goes away, so nothing holds it.
+     *
+     * @param activityRecreating the activity is being destroyed to be built again (a
+     * rotation, a display change). The prepared export is kept then, because the picker's
+     * result comes back to the new activity and needs it.
+     */
+    fun unbind(activity: Activity, activityRecreating: Boolean = false) {
+        if (host !== activity) return
+        host = null
+        saveLauncher = null
+        openLauncher = null
+        if (!activityRecreating) {
             pendingExport = null
+            pendingExportAt = 0L
         }
     }
 
@@ -70,6 +97,7 @@ object BackupTransfer {
     fun requestSave(export: ChannelBackupExport): Boolean {
         val launch = saveLauncher ?: return false
         pendingExport = export
+        pendingExportAt = System.currentTimeMillis()
         _state.value = BackupTransferState()
         launch(export.fileName)
         return true
@@ -85,8 +113,17 @@ object BackupTransfer {
 
     /** The user finished the "save as" dialog. */
     fun onSaveResult(context: Context, uri: Uri?) {
-        val export = pendingExport ?: return
+        val export = pendingExport
+        val prepared = System.currentTimeMillis() - pendingExportAt
         pendingExport = null
+        pendingExportAt = 0L
+        if (export == null || prepared > PENDING_EXPORT_TTL_MS) {
+            // Nothing was written, and only a real pick (not a cancel) is worth a message.
+            if (uri != null) {
+                publish("The prepared backup expired before it was saved. Run the backup again.", failed = true)
+            }
+            return
+        }
         if (uri == null) {
             publish("Backup cancelled", failed = false)
             return

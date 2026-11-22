@@ -60,6 +60,7 @@ fun SendSheet(
     vm: WalletViewModel,
     state: WalletState,
     initialText: String,
+    backgrounded: Int,
     onAuthorize: (String, () -> Unit) -> Unit,
     onClose: () -> Unit,
     onScan: () -> Unit
@@ -89,12 +90,32 @@ fun SendSheet(
         }
     }
 
+    // The app went to the background: a request that was pasted, scanned or just reviewed is
+    // a draft for one payment and does not stay on the screen for whoever picks the phone up
+    // next. A payment that is already running, and the id of one that went out, are left
+    // alone: the first must not be cancelled and the second is what the user came back for.
+    LaunchedEffect(backgrounded) {
+        if (backgrounded == 0) return@LaunchedEffect
+        if (busy || reference != null) return@LaunchedEffect
+        text = ""
+        target = null
+        amountText = ""
+        sendAll = false
+        viaLightning = true
+        error = null
+        highFee = null
+    }
+
     val lightningRoute = target?.lightning != null && viaLightning
     val onchain = target?.input?.kind == PaymentInputKind.ONCHAIN && !lightningRoute
     val needsAmount = target?.amountEditable == true
 
     LaunchedEffect(onchain, priority) {
         if (onchain) {
+            // Cleared first, on purpose. The rate for the previous priority must not be the
+            // one a send is judged by, and while there is no rate the send button stays
+            // disabled: without it the high-fee check cannot be asked at all.
+            feeRate = null
             feeRate = vm.estimateFeeRate(priority)
         }
     }
@@ -160,6 +181,13 @@ fun SendSheet(
      * amount to compare against, so only the rate rule can apply there.
      */
     fun sendPayment(current: ResolvedTarget, amount: Long?) {
+        // No rate means no way to tell a normal fee from a wrong one, and the payment would
+        // go out at the fallback rate with no confirmation shown. The button is disabled in
+        // this state as well; this is the check that the gate cannot be walked around.
+        if (FeeWarning.isWaitingForRate(onchain, feeRate)) {
+            error = "The fee estimate has not arrived yet. Wait a moment, then try again."
+            return
+        }
         if (onchain && !sendAll) {
             val rate = feeRate
             val outputs = 2
@@ -405,9 +433,14 @@ fun SendSheet(
                 val vBytes = OnchainFeeEstimate.vBytes(inputs = 1, outputs = outputs)
                 val estimate = feeRate?.let { OnchainFeeEstimate.feeSats(it, inputs = 1, outputs = outputs) }
                 Text(
-                    "Estimated fee: ${if (estimate != null) "${Fmt.sats(estimate)} sats" else "…"} " +
-                        "(${feeRate ?: "…"} sat/vB × ~$vBytes vB). The node sets the exact fee " +
-                        "from the transaction it signs.",
+                    if (estimate != null) {
+                        "Estimated fee: ${Fmt.sats(estimate)} sats " +
+                            "($feeRate sat/vB × ~$vBytes vB). The node sets the exact fee " +
+                            "from the transaction it signs."
+                    } else {
+                        "Reading the fee rate from the chain source. Sending stays disabled " +
+                            "until it arrives, because the high-fee check needs it."
+                    },
                     color = Pal.TextTertiary,
                     fontSize = 11.sp,
                     lineHeight = 15.sp
@@ -430,7 +463,7 @@ fun SendSheet(
                 text = if (onchain) "Send on-chain" else "Send payment",
                 onClick = { execute() },
                 loading = busy,
-                enabled = !state.starting
+                enabled = !state.starting && !FeeWarning.isWaitingForRate(onchain, feeRate)
             )
             Spacer(Modifier.height(10.dp))
             GhostButton(

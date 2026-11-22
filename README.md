@@ -123,17 +123,26 @@ so a reinstall needs the previous build removed first.
   security settings, and receiving keeps working. The same answer is given when the system
   reports it cannot authenticate right now. Whether a lock exists is re-read on every
   resume, so removing it outside the app is noticed at once rather than after a restart.
-- **The seed is bound to the phone's lock, in the Keystore itself.** On Android 11+ on a
-  phone with a screen lock, the key that decrypts the recovery phrase is created with
-  `setUserAuthenticationRequired(true)` and a 60-second validity window: the Keystore only
-  releases it shortly after the user authenticated, so a shell, a hooked callback or a
-  bypassed screen cannot read the phrase, and a process that has been sitting in the
-  background has to ask again. The same AES material is imported twice - an encrypt-only
-  alias with no such requirement (sealing a new or restored phrase asks nothing) and the
-  decrypt-only alias above - so nothing can read the phrase with the alias that writes it.
-  Opening the wallet after Android closed the app can therefore ask for the screen lock even
-  with lock-on-open off; the prompt is the same one. A wallet written by 1.1.10 or earlier is
-  moved onto this pair the first time it is opened.
+- **The seed is bound to the phone's lock, in the Keystore itself.** On Android 8 and later
+  (this app's minimum is API 26) on a phone with a screen lock, the key that decrypts the
+  recovery phrase is created with `setUserAuthenticationRequired(true)` and a 60-second
+  validity window: the Keystore only releases it shortly after the user authenticated, so a
+  shell, a hooked callback or a bypassed screen cannot read the phrase, and a process that
+  has been sitting in the background has to ask again. Android 11+ gets the window through
+  `setUserAuthenticationParameters` (device credential or a strong biometric), Android 8-10
+  through `setUserAuthenticationValidityDurationSeconds`. The same AES material is imported
+  twice - an encrypt-only alias with no such requirement (sealing a new or restored phrase
+  asks nothing) and the decrypt-only alias above - so nothing can read the phrase with the
+  alias that writes it. Opening the wallet after Android closed the app can therefore ask for
+  the screen lock even with lock-on-open off; the prompt is the same one. A wallet written by
+  1.1.10 or earlier is moved onto this pair the first time it is opened.
+- **When the key cannot be bound, the wallet says so.** A phone with no screen lock, a
+  Keystore that refuses the bound key, or a wallet sealed before the lock existed leaves the
+  phrase sealed with a key that opens without the device lock. That state is read back from
+  the Keystore entry itself (not from a flag written at creation) and shown in Settings as
+  "Recovery phrase key: not bound to the screen lock", with what it means and what would fix
+  it. The screen-based checks on sending, showing the phrase and wiping still apply, and this
+  is now visible instead of being a silent downgrade.
 - **A screen-lock change is reported, not hidden.** Removing or resetting the phone's lock
   invalidates that key by design, and the ciphertext cannot be opened by anything on the
   device afterwards. The wallet says exactly that and sends the user to restore with the
@@ -141,6 +150,13 @@ so a reinstall needs the previous build removed first.
 - **Optional lock on open.** Off by default, a switch in Settings makes the app ask every
   time it opens and after coming back from the background. The prompt is lifecycle-driven:
   it restarts cleanly on resume, so the Unlock button cannot go dead after backgrounding.
+  The gate is settled once per session from the saved setting and only closes again when the
+  app leaves the screen, so turning the switch on does not throw the user out of the sheet
+  they are in and turning it off does not count as a pass.
+- **The recovery phrase never outlives the screen.** The phrase dialog is dropped on pause
+  and on stop whether or not lock-on-open is on, and the Send and Receive sheets drop the
+  request they hold when the app goes to the background - a pasted address, a scanned
+  invoice or a freshly made one - while a payment already running is left to finish.
 - **No screenshots, no Recents thumbnail.** The window is `FLAG_SECURE`, so the wallet is
   blocked from screenshots and screen recording and blanked in the recent-apps list. The
   recovery phrase and the setup/restore screens force it on even if the setting is off.
@@ -173,7 +189,10 @@ so a reinstall needs the previous build removed first.
   so the number that leaves the balance is on screen next to the number it came from. A rate
   of 100 sat/vB or more, or a fee of more than 10% of a payment of 1,000 sats or more, stops
   the send behind its own confirmation with both numbers; such a reply means the endpoint is
-  wrong or reading a spike, not that the user meant to pay it.
+  wrong or reading a spike, not that the user meant to pay it. The rate is a precondition of
+  sending, not decoration: while the estimate is still loading the on-chain send button is
+  disabled, because a send with no rate would skip both rules and go out at the fallback rate
+  with no confirmation at all.
 - **Duplicate BIP-21 amounts are refused.** BIP-21 does not say which `amount` wins, so a QR
   with two of them can be read as a different payment by another wallet. The send screen
   refuses the request and says why instead of picking one of the numbers.
@@ -269,7 +288,11 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   nobody recovers it for them. Without such a file a lost phone loses the funds in open
   channels. A backup is a snapshot too, so a channel that changed after it was saved may close
   when restored. The app says so before showing the phrase and at the top of the channel
-  screen; keep channel amounts small.
+  screen; keep channel amounts small. Restoring a backup replaces the node data in place and
+  keeps it: if the node cannot start afterwards because the chain source is unreachable, the
+  restored data stays and the node is started again when the connection is back, rather than
+  the restore being rolled back over a network problem. Only a backup that cannot be read or
+  written, or that the node refuses to open, puts the previous data back.
 - Channel funds need an on-chain reserve (about 1% of channel size) plus funding fees, and
   closing a channel costs an on-chain transaction.
 - Testnet4 is not exposed by ldk-node 0.7.0, so Testnet3 is the test network offered.
@@ -277,7 +300,7 @@ Compose UI  ──  WalletViewModel  ──  NodeManager (singleton)
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.1.11`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.1.12`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -312,7 +335,7 @@ artifact on every push to `main` and on `v*` tags (the workflow keeps its origin
 | Check | Command | Result |
 | --- | --- | --- |
 | Kotlin + Compose compilation | `./gradlew assembleDebug` | builds `app-debug.apk` |
-| Unit tests | `./gradlew testDebugUnitTest` | 208 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate BIP-21 amount refusal, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle |
+| Unit tests | `./gradlew testDebugUnitTest` | 216 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate BIP-21 amount refusal, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate |
 | Android lint | `./gradlew lintDebug` | 0 errors, 21 warnings |
 | Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
 | English-only repository | `python3 verify-english.py` | no non-English characters |

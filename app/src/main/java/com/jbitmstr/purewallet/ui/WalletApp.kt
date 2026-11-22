@@ -14,6 +14,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -30,6 +31,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.jbitmstr.purewallet.WalletViewModel
 import com.jbitmstr.purewallet.core.AppLock
+import com.jbitmstr.purewallet.core.AppLockGate
 import com.jbitmstr.purewallet.core.DeviceLockSettings
 import com.jbitmstr.purewallet.core.ScreenSecurity
 import com.jbitmstr.purewallet.ui.screens.LockedScreen
@@ -66,7 +68,11 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     // Locking the app every time it opens is opt-in in Settings. Sending funds and showing
     // the recovery phrase authenticate on their own, whether or not that option is on.
     val openLockEnabled = state.lockOnOpen && lockAvailable && lockArmed
-    var unlocked by remember(openLockEnabled) { mutableStateOf(!openLockEnabled) }
+    // Whether the wallet is open, and whether that decision has been made for this session.
+    // It is NOT keyed on the option: see [AppLockGate] for why. `unlocked` starts closed so a
+    // wallet whose option is on never shows a frame of itself before the settings arrive.
+    var unlocked by remember { mutableStateOf(false) }
+    var gateStarted by remember { mutableStateOf(false) }
     var unlockError by remember { mutableStateOf<String?>(null) }
     // A wallet whose key is bound to the device lock cannot be read at all until the user
     // authenticates, so the lock screen comes up before anything of the wallet is shown.
@@ -82,6 +88,10 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     var peerPrefill by remember { mutableStateOf("") }
     var backupWords by remember { mutableStateOf<String?>(null) }
     var backupVerify by remember { mutableStateOf(false) }
+    // Bumped every time the app leaves the screen. The sheets that hold a draft watch it and
+    // drop what they hold; the counter keeps them composed, so nothing in flight (a payment
+    // waiting on its authentication, a backup waiting on the file picker) is cancelled by it.
+    var backgrounded by remember { mutableIntStateOf(0) }
 
     fun unlockWith(reason: String) {
         val lock = appLock
@@ -117,16 +127,47 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
         }
     }
 
+    // The gate is settled once, when the saved option is first read: a wallet that had
+    // lock-on-open on opens behind the lock screen, one that had it off opens straight away.
+    // After that the option can be toggled in Settings without throwing the user out or
+    // counting as a pass; leaving the screen is what closes it again.
+    LaunchedEffect(openLockEnabled, state.bootstrapped) {
+        if (!state.bootstrapped) return@LaunchedEffect
+        unlocked = if (!gateStarted) {
+            gateStarted = true
+            AppLockGate.afterStart(openLockEnabled)
+        } else {
+            AppLockGate.afterOptionChanged(unlocked, openLockEnabled)
+        }
+    }
+
     // Lock again whenever the app leaves the screen. The prompt itself keeps its own
     // lifecycle: it resets on stop and restarts on resume, so this cannot strand it.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, openLockEnabled) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_STOP -> if (openLockEnabled) {
-                    unlocked = false
-                    // Never leave the recovery phrase on screen behind a locked wallet.
+                // The recovery phrase is never left on screen for a backgrounded app, whether
+                // or not lock-on-open is on: the option decides whether returning asks for
+                // authentication, not whether the words stay up for anyone who picks the
+                // phone up next.
+                Lifecycle.Event.ON_PAUSE -> {
                     backupWords = null
+                    backupVerify = false
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    backupWords = null
+                    backupVerify = false
+                    // Pasted or scanned input is only needed at the moment its sheet opens, so
+                    // it is dropped here: a sheet opened after the app was away never starts
+                    // from something that was typed before it left the screen. The sheets that
+                    // are open do the same with their own drafts, under their own names.
+                    sendPrefill = ""
+                    peerPrefill = ""
+                    backgrounded += 1
+                    if (gateStarted) {
+                        unlocked = AppLockGate.afterLeavingScreen(unlocked, openLockEnabled)
+                    }
                 }
                 // Android can freeze or kill the node while the app is away, and a start
                 // that failed leaves nothing running. Coming back asks for it again. The
@@ -336,6 +377,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
             vm = vm,
             state = state,
             initialText = sendPrefill,
+            backgrounded = backgrounded,
             onAuthorize = authorize,
             onClose = { sheet = ActiveSheet.NONE },
             onScan = {
@@ -347,6 +389,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
         ActiveSheet.RECEIVE -> ReceiveSheet(
             vm = vm,
             state = state,
+            backgrounded = backgrounded,
             onBackup = {
                 authorize("Authenticate to view your recovery phrase.") {
                     backupWords = vm.revealSeed()

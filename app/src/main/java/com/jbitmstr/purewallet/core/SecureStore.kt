@@ -4,6 +4,7 @@ import android.app.KeyguardManager
 import android.content.Context
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.security.keystore.KeyProtection
@@ -14,6 +15,7 @@ import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
 
 /**
@@ -25,7 +27,7 @@ import javax.crypto.spec.GCMParameterSpec
  * - [ENC_ALIAS] may encrypt and nothing else. It is not bound to the user, so the wallet can
  *   be sealed with no prompt at all (creating a wallet, restoring one, upgrading an older
  *   install). Holding this alias is useless for reading the wallet back.
- * - [DEC_ALIAS] may decrypt and nothing else, and on Android 11 and later on a phone with a
+ * - [DEC_ALIAS] may decrypt and nothing else, and on Android 8 and later on a phone with a
  *   screen lock it is created with `setUserAuthenticationRequired(true)`. Reading the seed
  *   then needs the user to have authenticated on the device (screen unlock, or the prompt
  *   the wallet shows): knowing the app's code, or getting a shell into it, is not enough to
@@ -67,6 +69,24 @@ class SecureStore(context: Context) {
         /** The ciphertext is there but could not be opened for another reason. */
         data class Failed(val detail: String?) : SeedRead()
     }
+
+    /**
+     * How well the Keystore protects the key that opens the stored phrase, on this phone.
+     *
+     * [DEVICE_LOCK] is the strongest state this app can reach: the Keystore itself refuses to
+     * use the decrypt key until the user has unlocked the phone. [UNBOUND] means the phrase is
+     * still encrypted with a key that never leaves the Keystore, but that key can be used
+     * without the device lock; the screens' own checks still apply, and the app says so where
+     * the phrase is managed instead of leaving the user to assume the stronger state.
+     */
+    enum class SeedProtection {
+        DEVICE_LOCK,
+        UNBOUND,
+        NONE
+    }
+
+    /** [SeedProtection] plus the reason, in words, when the binding could not be applied. */
+    data class SeedProtectionStatus(val level: SeedProtection, val detail: String?)
 
     /** Seals [mnemonic] with a fresh IV. Never asks the user anything. */
     fun saveSeed(mnemonic: String) {
@@ -140,6 +160,50 @@ class SecureStore(context: Context) {
     fun hasSeed(): Boolean = prefs.contains(KEY_SEED)
 
     /**
+     * Reads what actually protects the stored phrase, from the Keystore entry itself rather
+     * than from a flag written when it was created: a wallet sealed by an older build, by the
+     * single-key fallback, or before this phone had a screen lock is reported as it is.
+     */
+    fun protectionStatus(): SeedProtectionStatus {
+        if (!hasSeed()) return SeedProtectionStatus(SeedProtection.NONE, null)
+        val bound = runCatching {
+            key(DEC_ALIAS)?.let { keyInfo(it).isUserAuthenticationRequired }
+        }.getOrNull()
+        return if (bound == true) {
+            SeedProtectionStatus(SeedProtection.DEVICE_LOCK, null)
+        } else {
+            SeedProtectionStatus(SeedProtection.UNBOUND, unboundDetail())
+        }
+    }
+
+    private fun keyInfo(key: SecretKey): KeyInfo =
+        SecretKeyFactory.getInstance(key.algorithm, KEYSTORE).getKeySpec(key, KeyInfo::class.java) as KeyInfo
+
+    /**
+     * Why the key is not bound, in the words the user is shown. A phone that has gained a
+     * screen lock since the wallet was sealed cannot be bound retroactively - the Keystore key
+     * exists already - so that case says what would fix it instead of pretending it is fine.
+     */
+    private fun unboundDetail(): String = when (prefs.getString(KEY_UNBOUND_REASON, null)) {
+        REASON_IMPORT_REFUSED ->
+            "This phone's Keystore would not keep the wallet key bound to the screen lock, so " +
+                "the key opens without one. Sending, showing the phrase and wiping still ask " +
+                "for your fingerprint or screen lock first."
+        REASON_NO_SCREEN_LOCK -> if (isDeviceSecure()) {
+            "This wallet was sealed before this phone had a screen lock, so its key is not " +
+                "bound to one. Restoring the wallet with your recovery phrase on this phone " +
+                "seals it again, now bound to the screen lock."
+        } else {
+            "This phone has no screen lock, so the wallet key cannot be bound to one. Set a " +
+                "PIN, pattern or password in Android settings; restoring the wallet afterwards " +
+                "seals it again, bound to the lock."
+        }
+        else ->
+            "The wallet key is held in the Android Keystore but is not bound to the screen " +
+                "lock. Sending, showing the phrase and wiping still ask for it first."
+    }
+
+    /**
      * Forgets the seed and the keys that sealed it.
      *
      * Removing the ciphertext alone would leave the AES keys in the Android Keystore, where
@@ -147,7 +211,7 @@ class SecureStore(context: Context) {
      * old backup of the preferences, for instance). The keys are deleted with the seed.
      */
     fun clear() {
-        prefs.edit().remove(KEY_SEED).remove(KEY_KEYS_INVALIDATED).apply()
+        prefs.edit().remove(KEY_SEED).remove(KEY_KEYS_INVALIDATED).remove(KEY_UNBOUND_REASON).apply()
         val keyStore = runCatching { keyStore() }.getOrNull() ?: return
         listOf(LEGACY_ALIAS, ENC_ALIAS, DEC_ALIAS).forEach { alias ->
             runCatching { keyStore.deleteEntry(alias) }
@@ -201,7 +265,8 @@ class SecureStore(context: Context) {
      * If the device refuses the imported pair at all, a single non-auth key is generated
      * instead. That is the protection level the wallet had before 1.1.11, and it keeps a
      * wallet working on a device whose Keystore cannot do better; the screen-based checks
-     * still apply, and the failure is logged rather than hidden.
+     * still apply. It is not silent any more: the reason is stored and [protectionStatus]
+     * reports the wallet as unbound, which is what the Settings sheet shows.
      */
     private fun ensureKeyPair() {
         val keyStore = keyStore()
@@ -211,6 +276,8 @@ class SecureStore(context: Context) {
         listOf(LEGACY_ALIAS, ENC_ALIAS, DEC_ALIAS).forEach { alias ->
             runCatching { keyStore.deleteEntry(alias) }
         }
+        // What the previous pair could not do says nothing about this one.
+        prefs.edit().remove(KEY_UNBOUND_REASON).apply()
 
         val imported = runCatching {
             // The material is generated in software once so it can be imported under both
@@ -237,6 +304,9 @@ class SecureStore(context: Context) {
 
         if (imported.isFailure) {
             Log.w(TAG, "This device refused the split keys; using one non-auth key", imported.exceptionOrNull())
+            // Not silent: the status the Settings sheet reads says this wallet's key is not
+            // bound to the screen lock, and why.
+            prefs.edit().putString(KEY_UNBOUND_REASON, REASON_IMPORT_REFUSED).apply()
             runCatching { keyStore.deleteEntry(ENC_ALIAS) }
             val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE)
             val spec = KeyGenParameterSpec.Builder(
@@ -259,17 +329,34 @@ class SecureStore(context: Context) {
         key(ENC_ALIAS) ?: key(DEC_ALIAS) ?: throw IllegalStateException("no key to seal the seed with")
 
     /**
-     * Puts the device-lock requirement on the decrypt key. The version check lives here, not
-     * in a helper, so it is obvious at the call site that the API 30 call is guarded.
+     * Puts the device-lock requirement on the decrypt key, on every API this app supports.
+     *
+     * Android 11 (API 30) added [KeyProtection.Builder.setUserAuthenticationParameters], which
+     * takes the allowed authenticators as well as the window; before it the same window is set
+     * with [KeyProtection.Builder.setUserAuthenticationValidityDurationSeconds]. Returning
+     * early below API 30, as an earlier build did, left every Android 8-10 phone with a key
+     * that never asked for the device lock at all.
+     *
+     * If the phone has no screen lock there is nothing to bind to; that is recorded so the
+     * status can say so, and the window is left unset.
      */
     private fun bindToDeviceLock(builder: KeyProtection.Builder) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-        if (!isDeviceSecure()) return
+        // A phone without a screen lock has nothing to bind to; the reason is recorded so the
+        // status can say so, and the window is left unset.
+        if (!isDeviceSecure()) {
+            prefs.edit().putString(KEY_UNBOUND_REASON, REASON_NO_SCREEN_LOCK).apply()
+            return
+        }
         builder.setUserAuthenticationRequired(true)
-        builder.setUserAuthenticationParameters(
-            AUTH_WINDOW_SECONDS,
-            KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG
-        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.setUserAuthenticationParameters(
+                AUTH_WINDOW_SECONDS,
+                KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            builder.setUserAuthenticationValidityDurationSeconds(AUTH_WINDOW_SECONDS)
+        }
     }
 
     private fun isDeviceSecure(): Boolean {
@@ -282,6 +369,11 @@ class SecureStore(context: Context) {
         private const val NAME = "purewallet_secrets"
         private const val KEY_SEED = "seed_ciphertext"
         private const val KEY_KEYS_INVALIDATED = "seed_keys_invalidated"
+
+        /** Why the wallet key is not bound to the screen lock, when it is not. */
+        private const val KEY_UNBOUND_REASON = "seed_key_unbound_reason"
+        private const val REASON_NO_SCREEN_LOCK = "no_screen_lock"
+        private const val REASON_IMPORT_REFUSED = "import_refused"
         private const val KEYSTORE = "AndroidKeyStore"
 
         /** The single key of builds up to 1.1.10; read once during an upgrade. */

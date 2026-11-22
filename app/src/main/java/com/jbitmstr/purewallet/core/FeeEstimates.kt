@@ -116,6 +116,17 @@ object FeeWarning {
         if (amountSats == null || amountSats <= 0L) return null
         return ((feeSats * 100L + amountSats / 2L) / amountSats).toInt()
     }
+
+    /**
+     * True when an on-chain send has to wait for the rate.
+     *
+     * The send screen used to dispatch while its estimate was still loading. With no rate,
+     * [isExcessive] could not be asked and both rules were skipped, so the payment went out at
+     * the fallback rate with no confirmation at all. The rate therefore gates the send rather
+     * than decorating it: no rate, no send.
+     */
+    fun isWaitingForRate(onchain: Boolean, rateSatPerVb: Long?): Boolean =
+        onchain && rateSatPerVb == null
 }
 
 /**

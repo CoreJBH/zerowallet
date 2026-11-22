@@ -166,4 +166,14 @@ class FeeEstimatesTest {
         assertNull(FeeWarning.percentOfAmount(2_256L, null))
         assertNull(FeeWarning.percentOfAmount(2_256L, 0L))
     }
+
+    @Test
+    fun anOnchainSendWaitsUntilTheRateHasArrived() {
+        // The regression: with no rate both rules were skipped, so pressing send while the
+        // estimate was still loading paid at the fallback rate with no confirmation at all.
+        assertTrue(FeeWarning.isWaitingForRate(onchain = true, rateSatPerVb = null))
+        assertFalse(FeeWarning.isWaitingForRate(onchain = true, rateSatPerVb = 900L))
+        // A Lightning payment is not judged by an on-chain rate.
+        assertFalse(FeeWarning.isWaitingForRate(onchain = false, rateSatPerVb = null))
+    }
 }

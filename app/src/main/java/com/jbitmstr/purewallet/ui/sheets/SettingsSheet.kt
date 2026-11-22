@@ -49,6 +49,7 @@ import com.jbitmstr.purewallet.core.ChainNetwork
 import com.jbitmstr.purewallet.core.DeviceLockSettings
 import com.jbitmstr.purewallet.core.Fmt
 import com.jbitmstr.purewallet.core.SensitiveClipboard
+import com.jbitmstr.purewallet.core.SecureStore
 import com.jbitmstr.purewallet.core.WalletState
 import com.jbitmstr.purewallet.ui.components.Banner
 import com.jbitmstr.purewallet.ui.components.GhostButton
@@ -387,6 +388,42 @@ fun SettingsSheet(
                 onClick = { DeviceLockSettings.open(context) },
                 modifier = Modifier.fillMaxWidth()
             )
+        }
+        // What the Keystore actually did with the key, read from the key itself. A wallet
+        // sealed before this phone had a screen lock, or on a phone whose Keystore refused the
+        // bound key, says so here instead of leaving the stronger state to be assumed.
+        val protection = state.seedProtection
+        if (protection != null && protection.level != SecureStore.SeedProtection.NONE) {
+            val bound = protection.level == SecureStore.SeedProtection.DEVICE_LOCK
+            Spacer(Modifier.height(12.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Pal.Surface)
+                    .border(1.dp, Pal.Border, RoundedCornerShape(16.dp))
+                    .padding(14.dp)
+            ) {
+                Text(
+                    if (bound) {
+                        "Recovery phrase key: bound to the screen lock"
+                    } else {
+                        "Recovery phrase key: not bound to the screen lock"
+                    },
+                    color = if (bound) Pal.Positive else Pal.Warning,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                if (protection.detail != null) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        protection.detail,
+                        color = Pal.TextTertiary,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp
+                    )
+                }
+            }
         }
         Spacer(Modifier.height(10.dp))
         SwitchRow(

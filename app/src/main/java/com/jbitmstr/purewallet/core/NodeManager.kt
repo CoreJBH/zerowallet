@@ -97,6 +97,13 @@ data class WalletState(
     val screenProtection: Boolean = true,
     val bootstrapped: Boolean = false,
     val seedPresent: Boolean = false,
+    /**
+     * What the Keystore reports about the key that opens the stored phrase. Null until the
+     * wallet has been read; [SecureStore.SeedProtection.UNBOUND] is shown in Settings because
+     * a key that opens without the screen lock is worth knowing about rather than assuming
+     * away.
+     */
+    val seedProtection: SecureStore.SeedProtectionStatus? = null,
     val backedUp: Boolean = false,
     val setupRequired: Boolean = true,
     val unlockError: Boolean = false,
@@ -205,6 +212,14 @@ class NodeManager(context: Context) {
     private var activeEsploraUrl: String? = null
 
     /**
+     * What the Keystore says about the stored phrase's key, or null when it cannot be read.
+     * Read from the key itself, so a wallet sealed by an older build, by the single-key
+     * fallback or before this phone had a screen lock is reported as it actually is.
+     */
+    private fun protectionStatus(): SecureStore.SeedProtectionStatus? =
+        runCatching { secureStore.protectionStatus() }.getOrNull()
+
+    /**
      * Serialises every start and stop. Building a node takes seconds, and a restart, a
      * settings change or a return to the foreground can all ask for one in that window; the
      * lock makes them queue instead of racing or being silently dropped.
@@ -291,6 +306,7 @@ class NodeManager(context: Context) {
                             seedLocked = false,
                             seedPresent = true,
                             setupRequired = false,
+                            seedProtection = protectionStatus(),
                             error = null
                         )
                     }
@@ -370,7 +386,8 @@ class NodeManager(context: Context) {
                             seedPresent = true,
                             setupRequired = false,
                             seedLocked = true,
-                            backedUp = prefs.seedBackedUp
+                            backedUp = prefs.seedBackedUp,
+                            seedProtection = protectionStatus()
                         )
                     }
                 }
@@ -389,6 +406,7 @@ class NodeManager(context: Context) {
                             seedPresent = false,
                             setupRequired = true,
                             unlockError = true,
+                            seedProtection = protectionStatus(),
                             error = "The stored recovery phrase could not be unlocked on this device."
                         )
                     }
@@ -408,7 +426,8 @@ class NodeManager(context: Context) {
                 bootstrapped = true,
                 seedPresent = seed != null,
                 backedUp = prefs.seedBackedUp,
-                setupRequired = seed == null
+                setupRequired = seed == null,
+                seedProtection = protectionStatus()
             )
         }
         if (seed != null) {
@@ -434,7 +453,12 @@ class NodeManager(context: Context) {
         // A new wallet starts with nothing; an older snapshot must not show through.
         prefs.clearCachedWallet(prefs.network)
         _state.update {
-            it.copy(seedPresent = true, backedUp = false, setupRequired = false)
+            it.copy(
+                seedPresent = true,
+                backedUp = false,
+                setupRequired = false,
+                seedProtection = protectionStatus()
+            )
         }
         startNode(mnemonic)
         mnemonic
@@ -476,10 +500,13 @@ class NodeManager(context: Context) {
                         backedUp = true,
                         setupRequired = false,
                         seedLocked = false,
-                        unlockError = false
+                        unlockError = false,
+                        seedProtection = protectionStatus()
                     )
                 }
                 startNodeLocked(normalized)
+                // The wallet is restored even if the start failed; its error is on the state.
+                Unit
             }
         }
     }
@@ -567,7 +594,15 @@ class NodeManager(context: Context) {
      *
      * The file is opened with the recovery phrase already on this device, so a backup made
      * from a different phrase fails here before anything is touched. The old store is moved
-     * aside rather than deleted and is put back if the node cannot start from the backup.
+     * aside rather than deleted.
+     *
+     * Restoring the data and starting a node on it are two steps, and only the first decides
+     * whether the old store comes back. A backup that could not be read, or could not be
+     * written in place, is rolled back before anything is committed. Once the restored data
+     * is in place it stays: a start that failed because the Esplora endpoint timed out, the
+     * phone is offline or the Lightning port is taken says nothing about the backup, and
+     * throwing a good restore away for it used to leave the user with neither the backup nor
+     * the store it replaced. The node is simply started again when the network is back.
      */
     suspend fun importChannelBackup(bytes: ByteArray): Result<BackupManifest> = withContext(Dispatchers.IO) {
         runCatching {
@@ -602,6 +637,7 @@ class NodeManager(context: Context) {
                 try {
                     try {
                         ChannelBackup.writeFiles(incoming, payload.files)
+                        // The files are on disk, so the archive's copy is no longer needed.
                     } finally {
                         payload.files.forEach { it.bytes.fill(0) }
                     }
@@ -612,14 +648,27 @@ class NodeManager(context: Context) {
                         throw IllegalStateException("The backup could not be put in place")
                     }
                 } catch (t: Throwable) {
+                    // Nothing was committed: the backup itself could not be written over the
+                    // store that was here, so put that store back.
                     incoming.deleteRecursively()
                     if (!dir.exists() && previous.exists()) previous.renameTo(dir)
                     throw t
                 }
 
-                startNodeLocked(mnemonic)
-                if (!_state.value.running) {
-                    // The backup did not come up. Put the store that was here back and restart.
+                // From here the restored data is the wallet's store. Only a failure that
+                // points at that data itself puts the previous store back.
+                val startFailure = startNodeLocked(mnemonic)
+                if (startFailure != null) {
+                    if (EsploraFallback.isChainSourceFailure(startFailure)) {
+                        previous.deleteRecursively()
+                        throw IllegalStateException(
+                            "The channel backup was restored, but the node could not start yet: " +
+                                "${describe(startFailure)} Your restored data is in place - start the " +
+                                "node again when the connection is back."
+                        )
+                    }
+                    // The node refused the store the backup carried: keep the one that was
+                    // here rather than leaving a wallet that cannot open its own data.
                     stopNodeLocked(keepState = false)
                     dir.deleteRecursively()
                     if (previous.exists()) previous.renameTo(dir)
@@ -644,8 +693,13 @@ class NodeManager(context: Context) {
      *
      * Always a full replace: an existing node is stopped first, so a restart and a first
      * start take the same path. Callers already holding [nodeMutex] call this directly.
+     *
+     * @return null when the node runs, otherwise the failure it ended with. The caller that
+     * restores a channel backup needs it: whether the data it just put in place is kept or
+     * rolled back depends on whether the start failed because the chain source is unreachable
+     * or because the store itself could not be read.
      */
-    private suspend fun startNodeLocked(mnemonic: String) {
+    private suspend fun startNodeLocked(mnemonic: String): Throwable? {
         try {
             stopNodeLocked(keepState = true, nextStarting = true)
             _state.update { it.copy(starting = true, busy = "Starting node", error = null) }
@@ -695,6 +749,7 @@ class NodeManager(context: Context) {
             // Already under [nodeMutex] here: the refreshing variant that takes it would
             // deadlock against this very start.
             refreshLocked(userInitiated = false)
+            return null
         } catch (c: CancellationException) {
             throw c
         } catch (t: Throwable) {
@@ -715,6 +770,7 @@ class NodeManager(context: Context) {
                     error = describe(t)
                 )
             }
+            return t
         } finally {
             // The node either runs or carries an error by now; never leave the UI stuck on
             // "Starting".
@@ -998,6 +1054,7 @@ class NodeManager(context: Context) {
                     setupRequired = true,
                     seedPresent = false,
                     bootstrapped = true,
+                    seedProtection = protectionStatus(),
                     lockOnOpen = prefs.lockOnOpen,
                     screenProtection = prefs.screenProtection
                 )
