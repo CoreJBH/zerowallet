@@ -1,0 +1,1 @@
+Self-custody Bitcoin and Lightning wallet that runs its node on the phone

@@ -468,10 +468,14 @@ a developer runs under a debugger, and nothing publishes it: the release page, t
 and the README all carry the signed release APK. A release build is signed only with a real
 release key, passed as Gradle properties or environment variables: `ZEROWALLET_KEYSTORE`,
 `ZEROWALLET_KEYSTORE_PASSWORD`, `ZEROWALLET_KEY_ALIAS` and `ZEROWALLET_KEY_PASSWORD`. With none
-of them set, `./gradlew assembleRelease` produces an unsigned APK rather than silently signing
-with the debug key; with only some of them set, the build stops with a message saying what is
-missing, and a keystore path that does not exist fails the build instead of producing an
-artifact.
+of them set, `./gradlew assembleRelease` stops with a message naming what is missing rather than
+writing an unsigned artifact that cannot install over the app, and it never signs with the debug
+key. A builder that signs the artifact with its own key - F-Droid builds a checkout with no
+keystore, then signs the APK with the F-Droid key - asks for `app-release-unsigned.apk` with
+`-Pzerowallet.unsignedRelease=true`. The flag is the only way the release build runs without
+signing material; tests, lint and `assembleDebug` need none. With only some of the four values
+set the build stops with a message saying what is missing, and a keystore path that does not
+exist fails the build instead of producing an artifact.
 
 **CI.** `.github/workflows/apk.yml` runs on every push to `main` and on `v*` tags: it pins every
 action to a commit SHA, runs the unit tests, builds `assembleRelease` with the release key from
@@ -490,7 +494,7 @@ does not fall back to a debug key. The same workflow is kept as a plain file at
 | Unit tests | `./gradlew testDebugUnitTest` | 374 tests: BIP-39 vectors, word suggestions and the restore-word grid (auto-completion, jumps, paste), exact BTC amount parsing against the 21 million cap, duplicate and unreadable BIP-21 amounts, the authorization gate that runs a privileged action only on a reported success, an abandoned prompt answering its caller, the per-chain RGS URL, backup encryption round trip, format 3 (PBKDF2 with salt), format 2 (HKDF) and format 1 compatibility, archive entry limits and refusals, endpoint rules including the cleartext allowlist compared against `network_security_config.xml` and the mainnet default, address-prefix chain matching, BOLT12 shape and chain-hash checks, the BIP-21 `lightning=` hand-off, random backup confirmation words, Esplora fee JSON with quoted numbers and the 1..1000 clamp, estimated total fee, the high-fee warning rules and the wait for a rate, restart-on-endpoint-change, multi-Esplora fallback order and dedup, chain-source failure detection, cached balance hydration and history round trip, the fail-closed sealing of that cache and of the payment notes, clearing every chain's cache on a new or restored wallet, what the send screen calls a payment reference and its fee line, the send draft across a leave, a running payment and the device-lock prompt, node start/stop rules (foreground recovery, quiet resync, manual stop, port 9735 fallback), log rotation, lock lifecycle and the open-lock gate, the recommended-fee parser refusing a reply with a missing or non-numeric field instead of inventing 1 sat/vB, the send sheet's fee read as a state that ends in Retry, the BIP-21 amount URI of the on-chain receive tab, the three generations of stored seed file and what each says about its protection, the rule that the seed key is generated in the Keystore rather than imported, the restore confirmation's refusals and stale-backup warning, the refusal of a `req-` BIP-21 parameter and of a second `lightning=` key, exact millisatoshi agreement between the two halves of a QR, the folder names an interrupted channel-backup import leaves and which one comes back, a plain record being refused rather than read (balance cache and payment notes alike), a streamed backup going out and back file for file including a 3 MiB store, a crafted archive whose entry escapes the restore directory, an entry that expands past the limit, a streamed file sealed with another phrase opening nothing, the displaced app-lock request being answered instead of dropped, the clipboard clear rule, the open-lock gate reading the availability the wallet session re-reads at every resume, and the restore review naming an older backup format |
 | Android lint | `./gradlew lintDebug` | 0 errors, 25 warnings |
 | Instrumented tests | `./gradlew connectedDebugAndroidTest` | Keystore seal/read/wipe on the real Android Keystore, BiometricManager answers against this phone's screen lock, FileProvider sharing `cache/backups` and nothing else |
-| Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
+| Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; signed when the key is configured, `app-release-unsigned.apk` only with `-Pzerowallet.unsignedRelease=true`, and the build stops when neither is the case |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
 | Package / label | `aapt2 dump badging app-release.apk` | `com.corejbh.zerowallet`, label `ZeroWallet` |
 

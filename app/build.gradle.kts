@@ -23,13 +23,20 @@ plugins {
  * app keeps its own key. Gradle properties and environment variables win over the file, so CI
  * passes them as secrets and a developer's checkout keeps them on disk.
 
- * With none of them set, `assembleRelease` produces an unsigned APK: it cannot be installed
- * over an existing app, so nobody mistakes it for a shippable artifact. It is deliberately
- * never signed with the debug key, which would make a build look installable while the
- * update fails on every phone that already has the app (or, worse, gets accepted from a
- * laptop instead of the release process). With only some of them set, the build stops here
- * instead of quietly producing something that only looks right: a half-configured release
- * key is a mistake to fix, not a state to build in.
+ * With none of them set, a build that would write a release artifact stops here instead of
+ * writing one unsigned: nobody should mistake an artifact for something shippable that
+ * cannot install over the app. It is deliberately never signed with the debug key, which
+ * would make a build look installable while the update fails on every phone that already has
+ * the app (or, worse, gets accepted from a laptop instead of the release process). With only
+ * some of them set, the build also stops instead of quietly producing something that only
+ * looks right: a half-configured release key is a mistake to fix, not a state to build in.
+ *
+ * A builder that signs the artifact with its own key - F-Droid builds `assembleRelease` in a
+ * checkout that has no keystore and signs the APK afterwards with the F-Droid key - asks for
+ * an unsigned release artifact explicitly with `-Pzerowallet.unsignedRelease=true`. The flag
+ * is the only way the release build runs without signing material, and it is never inferred.
+ * Code checks (unit tests, lint, dependency reports) run without any signing material, and
+ * `assembleDebug` is unaffected - only a task that packages a release needs this decision.
  */
 val keystorePropertiesFile = rootProject.file("keystore/keystore.properties")
 val keystoreProperties = Properties().apply {
@@ -66,16 +73,57 @@ val releaseKeystoreFile: File? = releaseKeystorePath?.let { raw ->
 val releaseSigningValues =
     listOf(releaseKeystorePath, releaseKeystorePassword, releaseKeyAlias, releaseKeyPassword)
 val releaseSigningConfigured = releaseSigningValues.all { it != null }
-if (!releaseSigningConfigured && releaseSigningValues.any { it != null }) {
-    throw GradleException(
-        "Release signing is half configured. Set all of ZEROWALLET_KEYSTORE, " +
-            "ZEROWALLET_KEYSTORE_PASSWORD, ZEROWALLET_KEY_ALIAS and ZEROWALLET_KEY_PASSWORD " +
-            "(Gradle property or environment variable), or none of them for an unsigned build."
+
+// A builder that signs the artifact with its own key (F-Droid does: it builds in a checkout
+// with no keystore and signs the APK afterwards with the F-Droid key) asks for an unsigned
+// release artifact explicitly. Nothing infers it: without the flag a release build that
+// cannot be signed stops, and the debug key is never used for a release.
+val unsignedReleaseRequested =
+    providers.gradleProperty("zerowallet.unsignedRelease").orNull
+        ?.equals("true", ignoreCase = true) == true
+
+if (!unsignedReleaseRequested) {
+    if (!releaseSigningConfigured && releaseSigningValues.any { it != null }) {
+        throw GradleException(
+            "Release signing is half configured. Set all of ZEROWALLET_KEYSTORE, " +
+                "ZEROWALLET_KEYSTORE_PASSWORD, ZEROWALLET_KEY_ALIAS and ZEROWALLET_KEY_PASSWORD " +
+                "(Gradle property or environment variable), or none of them and pass " +
+                "-Pzerowallet.unsignedRelease=true for an unsigned build."
+        )
+    }
+    if (releaseSigningConfigured && releaseKeystoreFile?.exists() != true) {
+        throw GradleException("ZEROWALLET_KEYSTORE points at ${releaseKeystorePath}, which does not exist.")
+    }
+}
+
+// Tasks that write a release artifact, and therefore need the signature (or an explicit
+// request for an unsigned one). Lint, unit tests and dependency reports only read the code
+// and sign nothing, so they keep running in a checkout without a key.
+fun taskNeedsReleaseSignature(request: String): Boolean {
+    val task = request.substringAfterLast(':').lowercase()
+    val codeCheck = task.startsWith("lint") || task.startsWith("test") ||
+        task.startsWith("connected") || task.startsWith("dependencies") ||
+        task.startsWith("dependency") || task == "tasks" || task == "help"
+    if (codeCheck) return false
+    return task.contains("release") || task in setOf(
+        "assemble", "bundle", "build", "install", "publish", "package", "sign"
     )
 }
-if (releaseSigningConfigured && releaseKeystoreFile?.exists() != true) {
-    throw GradleException("ZEROWALLET_KEYSTORE points at ${releaseKeystorePath}, which does not exist.")
+
+if (!releaseSigningConfigured && !unsignedReleaseRequested &&
+    gradle.startParameter.taskNames.any { taskNeedsReleaseSignature(it) }
+) {
+    throw GradleException(
+        "Release signing is not configured (none of ZEROWALLET_KEYSTORE, " +
+            "ZEROWALLET_KEYSTORE_PASSWORD, ZEROWALLET_KEY_ALIAS and ZEROWALLET_KEY_PASSWORD is set, " +
+            "and keystore/keystore.properties is absent). A release build is not produced unsigned, " +
+            "and never with the debug key; a builder that signs the artifact with its own key " +
+            "passes -Pzerowallet.unsignedRelease=true, and a signed build sets the four values."
+    )
 }
+
+// Signing is used only when the key is fully configured and no unsigned artifact was asked for.
+val signedRelease = releaseSigningConfigured && !unsignedReleaseRequested
 
 android {
     // The package is the publisher's own name, carried over from the GitHub handle the project
@@ -113,7 +161,7 @@ android {
     }
 
     signingConfigs {
-        if (releaseSigningConfigured) {
+        if (signedRelease) {
             create("release") {
                 storeFile = releaseKeystoreFile
                 storePassword = releaseKeystorePassword
@@ -143,9 +191,9 @@ android {
             //   which is where a wallet's channel state actually lives.
             isDebuggable = false
             isJniDebuggable = false
-            // Null when no release key is configured, which leaves the APK unsigned rather
-            // than falling back to the debug key.
-            signingConfig = signingConfigs.findByName("release")
+            // Null when the build was asked for an unsigned artifact (F-Droid), which leaves
+            // the APK unsigned rather than falling back to the debug key.
+            signingConfig = if (signedRelease) signingConfigs.getByName("release") else null
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

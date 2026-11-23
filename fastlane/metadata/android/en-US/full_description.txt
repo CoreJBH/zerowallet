@@ -1,0 +1,25 @@
+ZeroWallet is a self-custody Bitcoin and Lightning wallet that runs the Lightning node on your phone. There is no account, no server, no LSP and no custodian anywhere in the payment path: the keys, the on-chain wallet and the channels live in the app, and nothing of yours is registered anywhere.
+
+THE WALLET
+- On-chain Bitcoin: receive to a freshly derived address, send with a normal or fast fee priority, or sweep the whole balance.
+- Lightning: create BOLT11 invoices and BOLT12 offers, pay BOLT11 invoices, BOLT12 offers and BOLT12 invoices, and use unified BIP-21 / Lightning QR requests.
+- Channels are opened peer to peer with a pubkey@host:port, and the sealed channel backup can be exported and restored.
+- One screen shows the Lightning and on-chain balances together with the payment history; the rate shown for a payment is the rate it was signed with.
+
+PRIVACY
+- No sign-up, no analytics, no ads, no crash reporting and no Google Play Services.
+- No foreground service and no ongoing notification: the node runs while the wallet is on screen and reconnects when you come back.
+- The window is marked secure, so the wallet stays out of screenshots, screen recording and the recent-apps list.
+- Cloud backup and device-to-device transfer are switched off for the app's data.
+
+SECURITY
+- The seed is sealed with a key generated in the Android Keystore, and the recovery phrase is revealed only when you ask for it.
+- Optional app lock with biometrics, falling back to the device screen lock.
+- A release build is not debuggable and runs without the filesystem log the debug build keeps.
+
+WHAT IT NEEDS
+- Android 8.0 (API 26) or newer on an ARM phone (arm64-v8a or armeabi-v7a).
+- A network connection for the chain source (Blockstream Esplora by default, with mempool.space fallbacks) and for Lightning peers.
+- Inbound Lightning needs a reachable address: a phone behind carrier NAT can pay and receive over existing channels, but cannot accept a new inbound connection without port forwarding.
+
+ZeroWallet is the design rule: zero LSPs, zero servers, zero telemetry. The source is at https://github.com/CoreJBH/zerowallet under the MIT license.
