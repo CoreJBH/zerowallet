@@ -78,20 +78,29 @@ if (releaseSigningConfigured && releaseKeystoreFile?.exists() != true) {
 }
 
 android {
-    // The package stays at the app's original name. It is the identity Android uses for an
-    // update: a new applicationId would be a different app, unable to install over an existing
-    // wallet and unable to read its data. The Keystore aliases and preference file names are
-    // frozen for the same reason (see SecureStore.KEY_ALIAS); the name on the screen is
-    // ZeroWallet.
-    namespace = "com.jbitmstr.purewallet"
+    // The package is the publisher's own name, carried over from the GitHub handle the project
+    // moved to. It became this app's identity before the first store release, which is the only
+    // moment it can still change: applicationId is what Android uses to recognize an update, so
+    // from the first published build on it is fixed for good. A build with a different
+    // applicationId is a different app to the system - it installs beside an older wallet
+    // instead of over it, starts with an empty data directory, and the way back to the funds in
+    // the old install is the recovery phrase or a `.zwbackup` export (the backup's key comes
+    // from the phrase alone, so it opens here unchanged).
+    //
+    // The Kotlin package, the namespace and the applicationId now all read the same, so
+    // BuildConfig, R, the tests and ProGuard cannot drift apart. The Keystore aliases and
+    // preference file names inside the app are not part of this rename and are frozen at what
+    // earlier builds wrote (see SecureStore.KEY_ALIAS): they address this app's own stored
+    // ciphertext, and a new name for them would buy nothing.
+    namespace = "com.corejbh.zerowallet"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.jbitmstr.purewallet"
+        applicationId = "com.corejbh.zerowallet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 22
-        versionName = "1.2.1"
+        versionCode = 23
+        versionName = "1.2.2"
 
         // Instrumented tests (Keystore, BiometricPrompt, FileProvider) run on a device with
         // `connectedDebugAndroidTest`; they are not part of CI, which has no device.

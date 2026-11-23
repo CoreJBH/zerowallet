@@ -17,7 +17,7 @@
         android:required="false" />
 
     <application
-        android:name=".PureWalletApp"
+        android:name=".ZeroWalletApp"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"

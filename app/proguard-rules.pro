@@ -21,9 +21,9 @@
 
 # The wallet's own data holders are only used directly, but keeping them makes a
 # minified crash report readable and costs a few hundred bytes.
--keep class com.jbitmstr.purewallet.core.BackupManifest { *; }
--keep class com.jbitmstr.purewallet.core.ChannelBackupExport { *; }
--keep class com.jbitmstr.purewallet.core.WalletState { *; }
+-keep class com.corejbh.zerowallet.core.BackupManifest { *; }
+-keep class com.corejbh.zerowallet.core.ChannelBackupExport { *; }
+-keep class com.corejbh.zerowallet.core.WalletState { *; }
 
 # Optional dependencies of JNA and the Kotlin runtime that are not on the classpath.
 -dontwarn java.awt.**

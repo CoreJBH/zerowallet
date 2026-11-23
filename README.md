@@ -40,6 +40,14 @@ on the release page. Release signing started with 1.2.0, so a phone still carryi
 build from 1.1.x has to remove that app first - write the recovery phrase down before it goes,
 because uninstalling deletes the only copy on the phone.
 
+From 1.2.2 the app's package is `com.corejbh.zerowallet`, the publisher's own name, chosen
+before the first store release because that is the last moment it can change. The package is
+the identity Android recognizes an update by, so 1.2.2 does not install over a wallet built
+from an older source: it appears as a second app, and the wallet in the old one stays where it
+is. What carries across is the wallet itself - open 1.2.2 and restore with the recovery phrase
+or a `.zwbackup` file exported from the old app; the backup's key is derived from the phrase
+alone, so the same file opens in either app. Once restored, the old app can be uninstalled.
+
 ---
 
 ## What it does
@@ -432,7 +440,7 @@ Compose UI  ──  WalletViewModel (lock state machine)  ──  NodeManager (f
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.2.1`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.2.2`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -484,12 +492,12 @@ does not fall back to a debug key. The same workflow is kept as a plain file at
 | Instrumented tests | `./gradlew connectedDebugAndroidTest` | Keystore seal/read/wipe on the real Android Keystore, BiometricManager answers against this phone's screen lock, FileProvider sharing `cache/backups` and nothing else |
 | Release build (R8) | `./gradlew assembleRelease` | minified and shrunk, LDK/JNI kept by `proguard-rules.pro`; unsigned when no release key is configured, and the build stops on a half-configured key |
 | English-only repository | `python3 verify-english.py` | no non-English characters |
-| Package / label | `aapt2 dump badging app-release.apk` | `com.jbitmstr.purewallet`, label `ZeroWallet` |
+| Package / label | `aapt2 dump badging app-release.apk` | `com.corejbh.zerowallet`, label `ZeroWallet` |
 
 ## Repository layout
 
 ```
-app/src/main/java/com/jbitmstr/purewallet/
+app/src/main/java/com/corejbh/zerowallet/
   MainActivity.kt            single activity host, screenshot blocking, file-picker results
   PureWalletApp.kt           application graph
   WalletViewModel.kt         UI bridge and the wallet's lock state machine
@@ -512,12 +520,16 @@ docs/at-rest.md              what is on disk in plain text, what protects it, an
 verify-english.py            English-only guard
 ```
 
-The Kotlin package and `applicationId` stay `com.jbitmstr.purewallet` so an install over an
-older build keeps the same app data. The seed's Keystore key changed shape twice: 1.1.11
-split the material into an encrypt/decrypt pair, and 1.1.17 replaced that pair with a single
-key generated inside the Keystore. Both older shapes are still read - a stored seed is tried
-with its own key first, and the first successful open after an authentication re-seals it
-onto the current key and deletes the old ones, so an upgrade never asks for the phrase.
+The Kotlin package, `namespace` and `applicationId` are all `com.corejbh.zerowallet`: one name
+for the code, the resources and the identity Android uses. It changed in 1.2.2, before the
+first store release and for no later version, because an install recognizes its own updates by
+it - a wallet from an older package installs beside this one instead of over it, and reaches
+its funds through the recovery phrase or a `.zwbackup`. The seed's Keystore key changed shape
+twice: 1.1.11 split the material into an encrypt/decrypt pair, and 1.1.17 replaced that pair
+with a single key generated inside the Keystore. Both older shapes are still read - a stored
+seed is tried with its own key first, and the first successful open after an authentication
+re-seals it onto the current key and deletes the old ones, so an upgrade never asks for the
+phrase.
 
 ## Contributors
 
