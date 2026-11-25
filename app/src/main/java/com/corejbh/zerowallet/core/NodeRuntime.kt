@@ -632,7 +632,12 @@ internal class NodeRuntime(
                                 error = core.describe(recovered.error ?: syncError)
                             )
                         }
-                        if (userInitiated) core.say("Sync problem: ${core.describe(syncError)}")
+                        if (userInitiated) {
+                            core.say(
+                                "Sync problem: " +
+                                    core.describe(recovered.error ?: syncError)
+                            )
+                        }
                         return
                     }
                     else -> {
@@ -793,7 +798,7 @@ internal class NodeRuntime(
         if (restored.isSuccess) {
             WalletCore.warn(TAG, "No endpoint served the sync; node back on $running", lastFailure)
             adoptStartedNodeLocked(restored.getOrThrow(), network, announceSwitch = false)
-            return SyncOutcome(core.node, failure)
+            return SyncOutcome(restored.getOrThrow().node, failure)
         }
         WalletCore.warn(TAG, "Sync recovery failed and the node did not come back", lastFailure)
         core.activeEsploraUrl = null
