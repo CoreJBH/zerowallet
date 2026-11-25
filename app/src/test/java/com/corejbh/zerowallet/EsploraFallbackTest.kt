@@ -214,4 +214,74 @@ class EsploraFallbackTest {
         )
         assertTrue(message, message.contains("127.0.0.1"))
     }
+
+    // ------------------------------------------------------------- sync failures
+
+    @Test
+    fun aFailedSyncMovesToTheOtherPublicEndpointsOnly() {
+        // v1.2.3: a sync that failed on the endpoint the node is running on used to leave the
+        // wallet showing "Sync problem" while another public server was a second away.
+        val candidates = EsploraFallback.recoveryCandidates(
+            failed = mainnet.defaultEsploraUrl,
+            fallbacks = mainnet.publicEsploraUrls,
+            allowFallbacks = true
+        )
+        assertEquals(
+            listOf("https://mempool.space/api", "https://mempool.emzy.de/api"),
+            candidates
+        )
+    }
+
+    @Test
+    fun aFailedFallbackLeadsBackToTheOtherEndpoints() {
+        // The node had already moved to mempool.space; the saved Blockstream endpoint is an
+        // endpoint it can try again.
+        val candidates = EsploraFallback.recoveryCandidates(
+            failed = "https://mempool.space/api/",
+            fallbacks = mainnet.publicEsploraUrls,
+            allowFallbacks = true
+        )
+        assertEquals(listOf("https://blockstream.info/api", "https://mempool.emzy.de/api"), candidates)
+    }
+
+    @Test
+    fun aSyncOnAnEndpointTheUserEnteredIsNeverMoved() {
+        val candidates = EsploraFallback.recoveryCandidates(
+            failed = "http://127.0.0.1:3002",
+            fallbacks = mainnet.publicEsploraUrls,
+            allowFallbacks = false
+        )
+        assertEquals(emptyList<String>(), candidates)
+    }
+
+    @Test
+    fun aWalletOperationFailureIsWorthAnotherEndpoint() {
+        // What `syncWallets()` throws when the endpoint behind it will not answer names
+        // neither the Esplora nor the timeout, so it used to be dismissed as not a chain
+        // source failure and no fallback ever ran.
+        assertTrue(EsploraFallback.isSyncRecoverable(WalletOperationFailed()))
+    }
+
+    @Test
+    fun anEsploraFailureIsWorthAnotherEndpoint() {
+        assertTrue(EsploraFallback.isSyncRecoverable(RuntimeException("HTTP 429 Too Many Requests")))
+        assertTrue(
+            EsploraFallback.isSyncRecoverable(
+                RuntimeException("Updating fee rate estimates timed out.")
+            )
+        )
+    }
+
+    @Test
+    fun aLocalStoreFailureDoesNotCostTwoNodeStarts() {
+        assertFalse(
+            EsploraFallback.isSyncRecoverable(
+                IllegalStateException("The channel monitor could not be read from disk")
+            )
+        )
+    }
 }
+
+/** ldk-node's own name for a wallet operation that failed, which a sync surfaces. */
+private class WalletOperationFailed :
+    RuntimeException("Failed to conduct wallet operation.")

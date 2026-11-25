@@ -54,6 +54,33 @@ internal object EsploraFallback {
     }
 
     /**
+     * Endpoints to move a node that is already running onto after `syncWallets()` failed on
+     * [failed].
+     *
+     * A node's chain source is fixed when it is built, so the only way off an endpoint that
+     * will not serve a sync is to start the node again on another one. These are the chain's
+     * public endpoints in their own order, without the one that just failed and without
+     * repeats: one refresh therefore never spends two starts on the same server.
+     *
+     * Empty when [allowFallbacks] is false, which is how an endpoint the user entered
+     * themselves stays the only one tried - the sync failure is reported instead of sending
+     * the wallet's addresses to a server its owner did not choose.
+     */
+    fun recoveryCandidates(
+        failed: String,
+        fallbacks: List<String>,
+        allowFallbacks: Boolean
+    ): List<String> {
+        if (!allowFallbacks) return emptyList()
+        val skip = key(failed)
+        val seen = mutableSetOf<String>()
+        return fallbacks.filter { url ->
+            val candidate = key(url)
+            candidate.isNotEmpty() && candidate != skip && seen.add(candidate)
+        }
+    }
+
+    /**
      * True when a failed start came from the chain source rather than the phone's Lightning
      * port: a feerate timeout, an Esplora error, a connection that never opened, an HTTP
      * refusal. Those are worth another endpoint; dropping the listening address is not what
@@ -111,7 +138,47 @@ internal object EsploraFallback {
         }
     }
 
+    /**
+     * True when a failed `syncWallets()` is worth another endpoint.
+     *
+     * `syncWallets()` reports a chain source that will not answer as `WalletOperationFailed`
+     * ("Failed to conduct wallet operation.") - an exception whose name names neither the
+     * Esplora nor the timeout that caused it. Checking [isChainSourceFailure] alone therefore
+     * skipped exactly the failure the wallet kept showing as "Sync problem" while another
+     * public server was a second away. Those failures count here.
+     *
+     * A failure that names nothing about the chain source is not retried: it is the local
+     * store's or the node's, restarting elsewhere does not fix it, and two node starts per
+     * sync would be a battery cost for nothing.
+     */
+    fun isSyncRecoverable(t: Throwable): Boolean {
+        if (isChainSourceFailure(t)) return true
+        var current: Throwable? = t
+        var depth = 0
+        while (current != null && depth < 6) {
+            val text = buildString {
+                append(current::class.java.simpleName)
+                append(' ')
+                append(current.message.orEmpty())
+            }.lowercase()
+            if (WALLET_OPERATION_MARKERS.any { text.contains(it) }) return true
+            current = current.cause
+            depth++
+        }
+        return false
+    }
+
     private fun key(url: String): String = url.trim().trimEnd('/').lowercase()
+
+    /**
+     * What ldk-node wraps an Esplora failure in when it surfaces from `syncWallets()` rather
+     * than from a start. The class name and the message are both matched, because the message
+     * is what a nested cause carries when the class name is not in the chain.
+     */
+    private val WALLET_OPERATION_MARKERS = listOf(
+        "walletoperation",
+        "failed to conduct wallet operation"
+    )
 
     private val CHAIN_SOURCE_MARKERS = listOf(
         "feerateestimation",

@@ -165,7 +165,18 @@ internal class WalletCore(context: Context) {
      * prompts first) does not turn a failed read into a "wallet locked" screen it will
      * overwrite a line later.
      */
-    fun seedAfterAuthentication(): String? = (secureStore.readSeed() as? SecureStore.SeedRead.Ok)?.mnemonic
+    fun seedAfterAuthentication(): String? = seedIfAvailable()
+
+    /**
+     * The phrase when the Keystore answers without asking the user, otherwise null.
+     *
+     * For work the user did not ask for - a sync quietly trying another endpoint, a scheduled
+     * check - [seedOrNull] would put the wallet on its lock screen when the key is bound to
+     * the device lock. That is the right answer to something the user did; it is not the right
+     * answer to a background retry, which simply has nothing to do until they are back. A null
+     * here says only "not now" and leaves the wallet's state untouched.
+     */
+    fun seedIfAvailable(): String? = (secureStore.readSeed() as? SecureStore.SeedRead.Ok)?.mnemonic
 
     /**
      * The Keystore key died with the phone's previous screen lock, and the ciphertext cannot

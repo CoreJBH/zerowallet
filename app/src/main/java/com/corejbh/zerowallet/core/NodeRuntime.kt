@@ -165,7 +165,6 @@ internal class NodeRuntime(
             core.update { it.copy(starting = true, busy = "Starting node", error = null) }
 
             val network = core.prefs.network
-            val savedEsplora = core.prefs.esploraUrl(network)
             // Before anything is built: a store left one rename away by an interrupted import
             // is put back, and the fragments of an import that never reached the swap are
             // cleared. Creating an empty directory here would hide the real store from the
@@ -183,44 +182,17 @@ internal class NodeRuntime(
             }
 
             val started = startWithFallback(mnemonic, network, dir, logFile)
-            val built = started.node
-            core.node = built
-            core.activeEsploraUrl = started.esploraUrl
-            core.prefs.setLastWorkingEsplora(network, started.esploraUrl)
-
-            val status = runCatching { built.status() }.getOrNull()
-            val listening = runCatching { built.listeningAddresses() }.getOrNull()
-            // Kept for a channel backup exported while this node is stopped (see
-            // [BackupLayer.backupIdentity]).
-            core.prefs.recordNodeIdentity(
-                network,
-                runCatching { built.nodeId() }.getOrDefault(""),
-                -1
-            )
-            core.update {
-                it.copy(
-                    network = network,
-                    esploraUrl = savedEsplora,
-                    activeEsploraUrl = started.esploraUrl,
-                    running = true,
-                    starting = false,
-                    busy = null,
-                    error = null,
-                    nodeId = runCatching { built.nodeId() }.getOrDefault(""),
-                    alias = runCatching { built.nodeAlias() }.getOrNull() ?: NODE_ALIAS,
-                    listeningAddresses = listening ?: emptyList(),
-                    bestHeight = status?.currentBestBlock?.height?.toInt()
-                        ?.takeIf { height -> height > 0 } ?: it.bestHeight
-                )
-            }
-            if (started.esploraUrl != savedEsplora) {
-                core.say(EsploraFallback.switchedMessage(savedEsplora, started.esploraUrl))
-            }
-            startEventLoop(built)
-            market.startLoop()
+            adoptStartedNodeLocked(started, network)
+            // The node's own background sync (`BackgroundSyncConfig`, every 30 seconds) starts
+            // with its first pass the moment the node comes up. A sync from here at the same
+            // instant lands on the wallet's lock while that pass holds it and comes back as a
+            // wallet-operation failure, so this one waits for the background pass to land
+            // first - the wallet's numbers are a moment later, not wrong.
+            delay(SYNC_SETTLE_AFTER_START_MILLIS)
             // Already under the node lock here: the refreshing variant that takes it would
-            // deadlock against this very start.
-            refreshLocked(userInitiated = false)
+            // deadlock against this very start. And the start above already walked every
+            // endpoint, so a sync failure here is not allowed to restart the node again.
+            refreshLocked(userInitiated = false, allowChainSourceRecovery = false)
             return null
         } catch (c: CancellationException) {
             throw c
@@ -248,6 +220,59 @@ internal class NodeRuntime(
             // "Starting".
             if (core.snapshot.starting) core.update { it.copy(starting = false) }
         }
+    }
+
+    /**
+     * Makes [started] the wallet's node: what runs, what it reads the chain from, what the
+     * screen shows, and its event loop.
+     *
+     * Used by every path that brings a node up - a start, a network switch, a sync that moved
+     * to another endpoint - so the snapshot is filled the same way whichever one it was.
+     *
+     * @param announceSwitch whether a move to a public fallback is said out loud. A node put
+     * back on the endpoint it already had is not a move.
+     */
+    private fun adoptStartedNodeLocked(
+        started: StartedNode,
+        network: ChainNetwork,
+        announceSwitch: Boolean = true
+    ) {
+        val built = started.node
+        val savedEsplora = core.prefs.esploraUrl(network)
+        core.node = built
+        core.activeEsploraUrl = started.esploraUrl
+        core.prefs.setLastWorkingEsplora(network, started.esploraUrl)
+
+        val status = runCatching { built.status() }.getOrNull()
+        val listening = runCatching { built.listeningAddresses() }.getOrNull()
+        // Kept for a channel backup exported while this node is stopped (see
+        // [BackupLayer.backupIdentity]).
+        core.prefs.recordNodeIdentity(
+            network,
+            runCatching { built.nodeId() }.getOrDefault(""),
+            -1
+        )
+        core.update {
+            it.copy(
+                network = network,
+                esploraUrl = savedEsplora,
+                activeEsploraUrl = started.esploraUrl,
+                running = true,
+                starting = false,
+                busy = null,
+                error = null,
+                nodeId = runCatching { built.nodeId() }.getOrDefault(""),
+                alias = runCatching { built.nodeAlias() }.getOrNull() ?: NODE_ALIAS,
+                listeningAddresses = listening ?: emptyList(),
+                bestHeight = status?.currentBestBlock?.height?.toInt()
+                    ?.takeIf { height -> height > 0 } ?: it.bestHeight
+            )
+        }
+        if (announceSwitch && started.esploraUrl != savedEsplora) {
+            core.say(EsploraFallback.switchedMessage(savedEsplora, started.esploraUrl))
+        }
+        startEventLoop(built)
+        market.startLoop()
     }
 
     /**
@@ -289,10 +314,7 @@ internal class NodeRuntime(
                     val built = buildAndStart(mnemonic, network, dir, logFile, address, esploraUrl)
                     if (index > 0) {
                         WalletCore.warn(TAG, "Node started without a listening address")
-                        core.say(
-                            "Port 9735 is not available, so the node is running without a public " +
-                                "listening address. Sending and receiving over open channels still work."
-                        )
+                        sayStartedWithoutPort()
                     }
                     return StartedNode(built, esploraUrl)
                 } catch (c: CancellationException) {
@@ -377,6 +399,51 @@ internal class NodeRuntime(
             throw t
         }
         return built
+    }
+
+    /** What the user is told when the node came up without the Lightning listening port. */
+    private fun sayStartedWithoutPort() = core.say(
+        "Port 9735 is not available, so the node is running without a public listening " +
+            "address. Sending and receiving over open channels still work."
+    )
+
+    /**
+     * Builds and starts one node on [esploraUrl], with the same listening-port fallback a
+     * start has: the port first, then without it.
+     *
+     * A restart for a sync that moved to another endpoint (see [recoverSyncLocked]) uses this
+     * instead of [startWithFallback]: the endpoints to try are already decided there, and the
+     * one that just failed must not be the first thing tried again.
+     */
+    private fun startOnEndpointLocked(
+        mnemonic: String,
+        network: ChainNetwork,
+        dir: File,
+        logFile: File,
+        esploraUrl: String
+    ): Result<StartedNode> {
+        var lastFailure: Throwable? = null
+        for ((index, address) in core.lifecycle.startAttempts().withIndex()) {
+            try {
+                val built = buildAndStart(mnemonic, network, dir, logFile, address, esploraUrl)
+                if (index > 0) {
+                    WalletCore.warn(TAG, "Node restarted without a listening address")
+                    sayStartedWithoutPort()
+                }
+                return Result.success(StartedNode(built, esploraUrl))
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                lastFailure = t
+                WalletCore.warn(
+                    TAG,
+                    "Node restart on $esploraUrl (${address ?: "no listening address"}) failed",
+                    t
+                )
+                if (!core.lifecycle.shouldRetryWithoutListening(address)) break
+            }
+        }
+        return Result.failure(lastFailure ?: IllegalStateException("The node could not be started"))
     }
 
     // ------------------------------------------------------------------- stop
@@ -482,6 +549,17 @@ internal class NodeRuntime(
      */
     private var pendingRefresh: Job? = null
 
+    /** When this process last finished a `syncWallets()` that worked. */
+    private var lastSyncSuccessMillis = 0L
+
+    /**
+     * When a moving-to-another-endpoint recovery may be tried again.
+     *
+     * A recovery that failed leaves the node on the endpoint it had, still failing to sync;
+     * without this the next refresh would try the same two restarts, and every one after that.
+     */
+    private var syncRecoveryNotBeforeMillis = 0L
+
     private fun scheduleRefresh() {
         pendingRefresh?.cancel()
         pendingRefresh = core.scope.launch {
@@ -509,14 +587,62 @@ internal class NodeRuntime(
         core.nodeMutex.withLock { refreshLocked(userInitiated) }
     }
 
-    /** The body of a refresh; callers already hold [WalletCore.nodeMutex]. */
-    suspend fun refreshLocked(userInitiated: Boolean) {
-        val n = core.node ?: return
+    /**
+     * The body of a refresh; callers already hold [WalletCore.nodeMutex].
+     *
+     * @param allowChainSourceRecovery whether a failed `syncWallets()` may move the node to
+     * another public endpoint. False for the refresh at the end of [startNodeLocked], whose
+     * start already walked every endpoint that could be tried.
+     */
+    suspend fun refreshLocked(userInitiated: Boolean, allowChainSourceRecovery: Boolean = true) {
+        var n = core.node ?: return
         if (core.snapshot.syncing) return
         core.update { it.copy(syncing = true) }
         val network = core.prefs.network
         try {
-            val syncError = runCatching { n.syncWallets() }.exceptionOrNull()
+            var syncError = syncLocked(n)
+            if (syncError != null && recentSyncSuccess()) {
+                // A sync that worked a moment ago says the endpoint is answering, so this
+                // failure is the two syncs meeting: the node's own background pass
+                // (`BackgroundSyncConfig`: the on-chain wallet every 30 s, fee rates every
+                // 300 s) and this call wait on the same wallet lock, and an endpoint that
+                // rate-limits two scans at once answers 429. One more try after the pause
+                // settles it without moving the wallet to another server at all.
+                WalletCore.warn(TAG, "Sync failed right after a good one; retrying", syncError)
+                delay(SYNC_CONTENTION_RETRY_MILLIS)
+                syncError = syncLocked(n)
+            }
+            // A chain source that will not serve the sync is left for another public one by
+            // rebuilding the node there; when that works the wallet is read from the new
+            // node and there is no "Sync problem" left to show.
+            if (syncError != null && allowChainSourceRecovery) {
+                val recovered = recoverSyncLocked(network, syncError, userInitiated)
+                when {
+                    recovered == null -> Unit
+                    recovered.node == null -> {
+                        // Every endpoint refused and the node it had could not be brought
+                        // back: nothing is running to read the wallet from.
+                        core.update {
+                            it.copy(
+                                syncing = false,
+                                running = false,
+                                starting = false,
+                                busy = null,
+                                activeEsploraUrl = null,
+                                error = core.describe(recovered.error ?: syncError)
+                            )
+                        }
+                        if (userInitiated) core.say("Sync problem: ${core.describe(syncError)}")
+                        return
+                    }
+                    else -> {
+                        n = recovered.node
+                        syncError = recovered.error
+                        // A restart left "syncing" off; this refresh is still one.
+                        core.update { it.copy(syncing = true) }
+                    }
+                }
+            }
             if (syncError != null && userInitiated) {
                 core.say("Sync problem: ${core.describe(syncError)}")
             }
@@ -566,6 +692,115 @@ internal class NodeRuntime(
         } finally {
             core.update { it.copy(syncing = false) }
         }
+    }
+
+    /**
+     * One `syncWallets()`; null when it worked.
+     *
+     * The moment of a good sync is kept because it is what tells a dead endpoint from two
+     * syncs colliding on the wallet's lock (see [recentSyncSuccess]).
+     */
+    private fun syncLocked(node: Node): Throwable? {
+        val failure = runCatching { node.syncWallets() }.exceptionOrNull()
+        if (failure == null) lastSyncSuccessMillis = System.currentTimeMillis()
+        return failure
+    }
+
+    /**
+     * True when a sync worked within the last [SYNC_CONTENTION_WINDOW_MILLIS].
+     *
+     * An endpoint that answered that recently is not one that has gone away: a failure right
+     * after it is far more likely the node's own background sync holding the wallet lock, or
+     * the server limiting two scans in a row. Those are settled by trying once more on the
+     * same node; only what survives that is treated as the endpoint's fault.
+     */
+    private fun recentSyncSuccess(): Boolean =
+        lastSyncSuccessMillis > 0L &&
+            System.currentTimeMillis() - lastSyncSuccessMillis < SYNC_CONTENTION_WINDOW_MILLIS
+
+    /**
+     * Moves a running node to another public endpoint after `syncWallets()` failed there, or
+     * puts it back where it was when nothing answered.
+     *
+     * A node's chain source is fixed when it is built, so the only way off an endpoint that
+     * will not serve a sync is to start the node again on another one. Returns null when the
+     * node was left exactly as it was, and otherwise the node the wallet should now be read
+     * from - which is null when every endpoint refused and the node it had could not be
+     * brought back either.
+     *
+     * Nothing is attempted when:
+     * - the endpoint in use, or the one the user saved, is not a built-in public one. Their
+     *   own server is their choice, and a wallet's addresses do not go to a public server
+     *   because that one was slow;
+     * - the failure does not name the chain source at all ([EsploraFallback.isSyncRecoverable]);
+     * - there is no other endpoint to try, or the Keystore will not open the phrase without
+     *   the user, so no node can be rebuilt;
+     * - a recovery ran less than [SYNC_RECOVERY_COOLDOWN_MILLIS] ago: a failed recovery would
+     *   otherwise be repeated by every refresh that follows it, two node starts each time.
+     */
+    private suspend fun recoverSyncLocked(
+        network: ChainNetwork,
+        failure: Throwable,
+        userInitiated: Boolean
+    ): SyncOutcome? {
+        if (System.currentTimeMillis() < syncRecoveryNotBeforeMillis) return null
+        val saved = core.prefs.esploraUrl(network)
+        val running = core.activeEsploraUrl ?: saved
+        if (!EsploraFallback.isPublicEndpoint(saved, network.publicEsploraUrls)) return null
+        if (!EsploraFallback.isPublicEndpoint(running, network.publicEsploraUrls)) return null
+        if (!EsploraFallback.isSyncRecoverable(failure)) return null
+        val candidates = EsploraFallback.recoveryCandidates(
+            failed = running,
+            fallbacks = network.publicEsploraUrls,
+            allowFallbacks = true
+        )
+        if (candidates.isEmpty()) return null
+        // A refresh the user asked for may open the phrase like any other of their actions; a
+        // background one may not turn a Keystore that wants the device lock into the wallet's
+        // lock screen over a sync nobody asked for.
+        val mnemonic = (
+            if (userInitiated) core.seedOrNull() else core.seedIfAvailable()
+        ) ?: return null
+
+        val dir = core.networkDir(network)
+        val logFile = NodeLog.file(core.appContext)
+        WalletCore.warn(TAG, "Sync failed on $running; trying ${candidates.size} other public endpoints", failure)
+        // One storage directory holds one node: the old one goes before another is built.
+        stopNodeLocked(keepState = true, nextStarting = true)
+        var lastFailure: Throwable = failure
+        for (url in candidates) {
+            val started = startOnEndpointLocked(mnemonic, network, dir, logFile, url)
+                .getOrElse { startFailure ->
+                    lastFailure = startFailure
+                    null
+                } ?: continue
+            adoptStartedNodeLocked(started, network)
+            val retry = syncLocked(started.node)
+            if (retry == null) {
+                WalletCore.warn(TAG, "Sync recovered on $url")
+                return SyncOutcome(started.node, null)
+            }
+            WalletCore.warn(TAG, "Sync on $url did not work either", retry)
+            lastFailure = retry
+            stopNodeLocked(keepState = true, nextStarting = true)
+        }
+
+        // Nothing answered. Put the node back on the endpoint it had, so a sync that failed
+        // does not cost the user their running node as well - unless that will not start
+        // either, which is a stopped node and has to be said.
+        syncRecoveryNotBeforeMillis = System.currentTimeMillis() + SYNC_RECOVERY_COOLDOWN_MILLIS
+        val restored = startOnEndpointLocked(mnemonic, network, dir, logFile, running)
+        if (restored.isSuccess) {
+            WalletCore.warn(TAG, "No endpoint served the sync; node back on $running", lastFailure)
+            adoptStartedNodeLocked(restored.getOrThrow(), network, announceSwitch = false)
+            return SyncOutcome(core.node, failure)
+        }
+        WalletCore.warn(TAG, "Sync recovery failed and the node did not come back", lastFailure)
+        core.activeEsploraUrl = null
+        core.update {
+            it.copy(running = false, starting = false, busy = null, activeEsploraUrl = null)
+        }
+        return SyncOutcome(null, lastFailure)
     }
 
     /** The endpoint fee estimates are read from: the one the node runs on, or the saved one. */
@@ -740,8 +975,33 @@ internal class NodeRuntime(
 
         /** How long a burst of node events is given to settle before one refresh runs. */
         private const val REFRESH_SETTLE_MILLIS = 1_500L
+
+        /**
+         * How long after a start the first sync waits: the node's background sync runs its own
+         * first pass as it comes up, and two syncs on one wallet lock are what comes back as a
+         * wallet-operation failure.
+         */
+        private const val SYNC_SETTLE_AFTER_START_MILLIS = 2_000L
+
+        /** How long to wait before trying the same node's sync once more after it failed. */
+        private const val SYNC_CONTENTION_RETRY_MILLIS = 1_500L
+
+        /** How recent a good sync has to be for a failure to look like contention, not a dead endpoint. */
+        private const val SYNC_CONTENTION_WINDOW_MILLIS = 120_000L
+
+        /** How long after a recovery that found nothing another one is not attempted. */
+        private const val SYNC_RECOVERY_COOLDOWN_MILLIS = 60_000L
     }
 }
 
 /** A node that came up, and the chain source it came up on. */
 internal class StartedNode(val node: Node, val esploraUrl: String)
+
+/**
+ * What a sync-time fallback left for the refresh that asked for it: the node to read the
+ * wallet from, and the sync error still standing.
+ *
+ * [node] is null when nothing is running any more, which the refresh reports instead of
+ * reading a node that is gone.
+ */
+internal class SyncOutcome(val node: Node?, val error: Throwable?)
