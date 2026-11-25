@@ -28,8 +28,6 @@ object Fmt {
         return if (text.isEmpty()) "0" else text
     }
 
-    fun krw(value: Long): String = "₩" + String.format(Locale.US, "%,d", value)
-
     fun usd(value: Long): String = "$" + String.format(Locale.US, "%,d", value)
 
     /** Converts satoshis to fiat using a BTC price in the fiat currency. */

@@ -83,7 +83,7 @@ alone, so the same file opens in either app. Once restored, the old app can be u
   channel service, no channel-opening fee to a third party.
 - **QR everywhere.** Camera scanning for invoices, offers, BIP-21 URIs and peer addresses;
   QR rendering for everything the wallet hands out.
-- **Live fiat value.** BTC/KRW (with a USD fallback) from public price endpoints, and a
+- **Live fiat value.** BTC/USD from public price endpoints, and a
   graceful dash instead of a stale number when the phone is offline.
 - **Gossip from peers, or a snapshot of this chain.** The node learns the channel graph from
   its peers by default. Rapid Gossip Sync can be switched on in Settings, and the snapshot

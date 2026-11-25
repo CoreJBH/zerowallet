@@ -8,8 +8,7 @@ import java.net.URL
 
 /** Live BTC price, used to show fiat equivalents in the balance card. */
 data class FiatQuote(
-    val krwPerBtc: Double,
-    val usdPerBtc: Double?,
+    val usdPerBtc: Double,
     val source: String,
     val fetchedAtEpochSecs: Long
 )
@@ -37,7 +36,7 @@ object Market {
     const val MAX_BODY_BYTES = 256 * 1024
 
     suspend fun fetchFiat(): FiatQuote? = withContext(Dispatchers.IO) {
-        coingecko() ?: upbit() ?: mempoolUsd()
+        coingecko() ?: mempoolUsd()
     }
 
     /**
@@ -94,30 +93,14 @@ object Market {
 
     private fun coingecko(): FiatQuote? {
         val body = httpGet(
-            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=krw,usd"
+            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
         ) ?: return null
         return runCatching {
             val bitcoin = JSONObject(body).getJSONObject("bitcoin")
-            val krw = bitcoin.getDouble("krw")
-            val usd = if (bitcoin.has("usd")) bitcoin.getDouble("usd") else null
-            if (krw <= 0.0) null else FiatQuote(
-                krwPerBtc = krw,
+            val usd = bitcoin.getDouble("usd")
+            if (usd <= 0.0) null else FiatQuote(
                 usdPerBtc = usd,
                 source = "CoinGecko",
-                fetchedAtEpochSecs = System.currentTimeMillis() / 1000L
-            )
-        }.getOrNull()
-    }
-
-    private fun upbit(): FiatQuote? {
-        val body = httpGet("https://api.upbit.com/v1/ticker?markets=KRW-BTC") ?: return null
-        return runCatching {
-            val array = org.json.JSONArray(body)
-            val price = array.getJSONObject(0).getDouble("trade_price")
-            if (price <= 0.0) null else FiatQuote(
-                krwPerBtc = price,
-                usdPerBtc = null,
-                source = "Upbit",
                 fetchedAtEpochSecs = System.currentTimeMillis() / 1000L
             )
         }.getOrNull()
@@ -129,7 +112,6 @@ object Market {
             val json = JSONObject(body)
             val usd = json.getDouble("USD")
             if (usd <= 0.0) null else FiatQuote(
-                krwPerBtc = 0.0,
                 usdPerBtc = usd,
                 source = "mempool.space",
                 fetchedAtEpochSecs = System.currentTimeMillis() / 1000L

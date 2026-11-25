@@ -49,15 +49,10 @@ import com.corejbh.zerowallet.core.FiatQuote
 import com.corejbh.zerowallet.core.Fmt
 import com.corejbh.zerowallet.ui.theme.Pal
 
-/** Fiat string for the balance card and rows, falling back to USD or a dash when offline. */
+/** Fiat string for the balance card and rows, falling back to a dash when offline. */
 fun fiatText(sats: Long, quote: FiatQuote?): String {
     if (quote == null) return "—"
-    return if (quote.krwPerBtc > 0.0) {
-        Fmt.krw(Fmt.fiatFromSats(sats, quote.krwPerBtc))
-    } else {
-        val usd = quote.usdPerBtc ?: return "—"
-        Fmt.usd(Fmt.fiatFromSats(sats, usd))
-    }
+    return Fmt.usd(Fmt.fiatFromSats(sats, quote.usdPerBtc))
 }
 
 @Composable
