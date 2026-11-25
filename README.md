@@ -58,8 +58,12 @@ alone, so the same file opens in either app. Once restored, the old app can be u
   starts on `https://blockstream.info/api`. That endpoint can time out from a phone network,
   and ldk-node then fails the whole start with `FeerateEstimationUpdateTimeout`: so when the
   saved endpoint does not answer, the same start is retried on `https://mempool.space/api`
-  and then `https://mempool.emzy.de/api`, and the node says which server it is reading. The
-  endpoint that came up last is remembered and tried ahead of the remaining fallbacks. An
+  and then `https://mempool.emzy.de/api`, and the node says which server it is reading. A
+  node that is already running and cannot sync is moved the same way, endpoint by endpoint,
+  instead of sitting on "Sync problem" until the user restarts it by hand; only when every
+  public endpoint has refused does the message appear, and then the node is put back on the
+  endpoint it had so the recovery cannot cost a running node. The endpoint that came up last
+  is remembered and tried ahead of the remaining fallbacks. An
   endpoint typed into Settings is the user's own choice and is never swapped for a public
   one. A different Esplora endpoint can be typed into Settings, and saving it restarts the
   node so the new source is in use right away instead of waiting for the next start.
@@ -83,8 +87,9 @@ alone, so the same file opens in either app. Once restored, the old app can be u
   channel service, no channel-opening fee to a third party.
 - **QR everywhere.** Camera scanning for invoices, offers, BIP-21 URIs and peer addresses;
   QR rendering for everything the wallet hands out.
-- **Live fiat value.** BTC/USD from public price endpoints, and a
-  graceful dash instead of a stale number when the phone is offline.
+- **Live fiat value, in one currency.** One figure per balance, in USD, from a BTC/USD price
+  (CoinGecko, then mempool.space), and a graceful dash instead of a stale number when the
+  phone is offline.
 - **Gossip from peers, or a snapshot of this chain.** The node learns the channel graph from
   its peers by default. Rapid Gossip Sync can be switched on in Settings, and the snapshot
   server is chosen per chain: the mainnet URL on mainnet, the testnet URL on Testnet3, and
@@ -440,7 +445,7 @@ Compose UI  ──  WalletViewModel (lock state machine)  ──  NodeManager (f
   for the two ARM ABIs.
 - BOLT12 and inbound Lightning need network reachability; a phone behind carrier NAT cannot
   accept inbound connections without port forwarding.
-- This is a self-custody wallet at `1.2.2`: keep amounts you are willing to lose while the
+- This is a self-custody wallet at `1.2.3`: keep amounts you are willing to lose while the
   peer-to-peer flows get real-world mileage.
 
 ## Build
@@ -522,6 +527,7 @@ docs/at-rest.md              what is on disk in plain text, what protects it, an
 .github/workflows/apk.yml    CI: SHA-pinned actions, signed release build
 .github/ci/apk-release.yml   the same workflow as a reviewable file
 verify-english.py            English-only guard
+tools/make_store_screenshots.py  rebuilds docs/preview.jpg and the store screenshot from the last capture, in USD
 ```
 
 The Kotlin package, `namespace` and `applicationId` are all `com.corejbh.zerowallet`: one name
